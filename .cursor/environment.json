@@ -5,7 +5,7 @@
     {
       "name": "elasticsearch",
       "command": "JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ./gradlew run --console=plain",
-      "description": "Runs a single-node Elasticsearch dev cluster. HTTP API is served on http://localhost:9200 (basic license, security disabled by default)."
+      "description": "Runs a single-node Elasticsearch dev cluster. HTTP API is served on http://localhost:9200 with security enabled; authenticate with elastic-admin:elastic-password (e.g. curl -u elastic-admin:elastic-password http://localhost:9200/)."
     }
   ],
   "ports": [
