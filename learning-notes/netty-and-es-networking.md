@@ -550,6 +550,208 @@ work."
 
 ---
 
+## Transport (port 9300)
+
+The other network. HTTP is the door for external clients; transport is node-to-node, a
+custom binary protocol over TCP. Same Netty underneath — same event loops, same buffers,
+same futures — but a different connection model.
+
+### Vocabulary, because one word is overloaded
+
+| term | what it is |
+| --- | --- |
+| socket | the OS object, one endpoint of one TCP connection. What `lsof` lists. |
+| `TcpChannel` | one socket, wrapped. Backed by a Netty `Channel`, pinned to one event loop. |
+| `Transport.Connection` | **not** a socket. A *unidirectional* logical link to one peer, holding 13 channels. |
+
+The trap: "TCP connection" in networking means one socket pair, while `Connection` in ES
+means thirteen of them. ES's own `ConnectionProfile.getNumConnections()` returns 13 —
+it counts channels, not Connections. The architecture guide inherits the same collision
+when it says "each channel is a non-blocking TCP connection".
+
+`Transport.Connection` is an interface (`Transport.java:102`, javadoc: "A unidirectional
+connection to a `DiscoveryNode`"); the implementation is `TcpTransport.NodeChannels`,
+holding a `List<TcpChannel>` plus a map from traffic type to a slice of that list.
+
+### The pool: 13 channels, role-dependent
+
+Defaults in `TransportSettings.java:186-217`: 6 REG, 3 BULK, 2 RECOVERY, 1 STATE, 1 PING.
+But `ConnectionProfile.buildDefaultConnectionProfile` (lines 71-94) makes two of them
+conditional on the **local** node's roles — RECOVERY only if it can hold data, STATE only
+if master-eligible. So 13 is the master+data case; a coordinating-only node opens 10.
+
+**Why partition at all?** A channel carries one message at a time, whole (see framing
+below). A big message blocks everything queued behind it *on that channel*. The concrete
+disaster this prevents: `RemoteRecoveryTargetHandler` sends shard file chunks on
+`Type.RECOVERY`, while `LeaderChecker.java:100` and `FollowersChecker.java:110` send
+liveness checks on `Type.PING`. Share a lane and a big file transfer delays a liveness
+check, the cluster declares a healthy node dead, and reallocates its shards — generating
+*more* recovery traffic.
+
+**Channels are handed out round-robin** within each type's slice
+(`ConnectionProfile.java:371-381`), so three concurrent REG requests land on three
+different sockets and go out genuinely in parallel. You need more than six concurrent REG
+requests before any two even share a channel.
+
+### Verified against the OS
+
+Two default nodes, both master+data:
+
+```bash
+lsof -nP -iTCP -sTCP:ESTABLISHED | grep -E '930[01]' | awk '{print $2}' | sort | uniq -c
+#   26 4460
+#   26 4534
+```
+
+2 Connections (one per direction) x 13 channels = **26 sockets**, but **52 `lsof` lines**
+— `lsof` lists file descriptors, and both endpoints are on one laptop. The directions are
+visible in contiguous ephemeral port ranges (63040-63052 outbound, 63054-63066 inbound),
+contiguous because `TcpTransport.java:393-395` opens all thirteen in one tight loop.
+
+### Framing: TCP has no messages
+
+TCP is a byte stream with no message boundaries. Framing comes from the header:
+
+```text
+ offset  size  field
+   0      2    'E' 'S'                marker
+   2      4    message length (int)   <- the 2 GB ceiling lives here
+   6      8    request ID (long)
+  14      1    status (bit flags)
+  15      4    transport version (int)
+  19      4    variable header size (int)
+  23      -    variable header (thread-context headers, action name), then body
+```
+
+`TcpHeader.writeHeader` lines 51-57. Read `ES` + 4 bytes and you know how many more bytes
+belong to this message. **This is why messages cannot interleave**: once the header says
+"104 bytes follow", the next 104 bytes on that channel must be this message's, or the
+receiver mis-frames everything after.
+
+The 2 GB cap is not policy — it's `writeInt`. The 30%-of-heap cap *is* policy, checked at
+`TcpTransport.java:901-909`, and violating it **closes the connection** rather than
+rejecting the message.
+
+Status is four bit flags (`TransportStatus.java:14-17`): request/response, error,
+compressed, handshake. Note `isRequest()` is *bit clear*. And a remote exception is a
+normal response with the error bit set, not a transport failure.
+
+### Correlation is by request ID
+
+```java
+// Transport.java:174-216
+private final Map<Long, ResponseContext<?>> handlers = ...;
+private final AtomicLong requestIdGenerator = new AtomicLong();
+```
+
+Sending allocates a monotonic `long`, stores handler + connection + action under that key,
+and puts the ID in the header. Responses are matched by ID, never by arrival order — which
+is what allows many requests to be outstanding on one channel at once. The counter is
+**per node**, not global; observed IDs were ~3720 on node 0 and ~4330 on node 1.
+
+Contrast: HTTP/1.1 *requires* responses in request order, which is why the same codebase
+needs `Netty4HttpPipeliningHandler` to buffer and reorder. The 8-byte request ID makes
+that problem vanish on transport.
+
+Three properties worth keeping apart: on the wire messages are **serialized**; in flight
+they are **concurrent**; in completion they are **unordered**.
+
+### Failure semantics: why no timeouts and no retries
+
+**One channel dying takes all thirteen.** Every channel gets a close listener that closes
+the whole `NodeChannels` (`TcpTransport.java:1135-1148`), which closes the rest, guarded by
+`isClosing.compareAndSet` so the cascade doesn't recurse (lines 290-295). There is no
+partially healthy `Connection`.
+
+**Closing a connection completes every outstanding handler.** `onConnectionClosed`
+(`TransportService.java:1522-1539`) prunes every entry whose connection just died and
+invokes its handler with `NodeDisconnectedException`. Node shutdown catches stragglers with
+`NodeClosedException` (`doStop`, lines 412-437).
+
+So an entry leaves the handlers map by exactly three doors: response arrives, connection
+closes, node stops. There is no fourth door where it lingers — **that** is the guarantee
+that makes transport timeouts unnecessary.
+
+**Caveat worth remembering:** the guarantee covers a peer that *dies*. A peer that is alive
+and healthy while its handler simply never responds breaks nothing, so nothing prunes
+anything, and that request hangs forever. That's a bug in the action; a timeout would only
+disguise it as a transient failure.
+
+**Retries live one layer up** — `RetryableAction`, `TransportMasterNodeAction` — because
+transport can't know whether re-sending is safe.
+
+### Who detects what
+
+| what happened | what transport sees | who notices, how fast |
+| --- | --- | --- |
+| process killed | RST/FIN, socket closes | transport, immediately |
+| node restarts | RST/FIN, then rejoins | transport, then `NodeConnectionsService` |
+| silent partition | nothing at all | fault detection, ~30s |
+| congestion | nothing at all | nobody, by design |
+
+Transport reports facts (socket open or not). Fault detection makes judgements (alive or
+dead). `NodeConnectionsService` reconciles connections with the cluster state, re-checking
+every 10s (`CLUSTER_NODE_RECONNECT_INTERVAL_SETTING`), and its javadoc (lines 48-52) is
+explicit that it is *not* responsible for removing nodes — "this is the job of the master's
+fault detection components".
+
+Silent partitions are detected by `LeaderChecker` / `FollowersChecker`: interval 1s, timeout
+10s, retry count 3 (`LeaderChecker.java:66-87`). Transport-level keepalive pings are
+**disabled by default** (`DEFAULT_PING_SCHEDULE = TimeValue.MINUS_ONE`), so this really is
+the coordination layer doing the work.
+
+**And here is the pattern the guide is actually recommending.** `LeaderChecker` sends with
+`PING_REQUEST_OPTIONS`, whose timeout is `null`, then wraps its *listener* in
+`ActionListener.addTimeout(...)` (lines 330-336). Not "never use deadlines" — the most
+safety-critical loop in the cluster obviously needs one. It's "don't put the deadline in the
+transport request."
+
+### The tracer lab
+
+The single most useful debugging tool here. Both settings are dynamic:
+
+```bash
+curl -s -X PUT localhost:9200/_cluster/settings -H 'Content-Type: application/json' -d '{
+  "persistent": {
+    "logger.org.elasticsearch.transport.TransportService.tracer": "TRACE",
+    "transport.tracer.include": ["indices:data/write/*", "indices:admin/*"],
+    "transport.tracer.exclude": []
+  }
+}'
+```
+
+Clearing `exclude` is what reveals the fault-detection heartbeat; its default is
+`["internal:coordination/fault_detection/*"]`, otherwise the log drowns. Each request
+produces four lines sharing one ID: `sent to`, `received request`, `sent response`,
+`received response from`.
+
+What a single indexed document looked like on a 2-node cluster with one replica:
+
+```
+35,113  [runTask-0]  [3409] bulk[s][p]  sent to runTask-0 (itself)
+35,113  [runTask-0]  [3409] bulk[s][p]  received request
+35,116  [runTask-0]  [3410] bulk[s][r]  sent to runTask-1          <- new request, nested inside
+35,116  [runTask-1]  [3410] bulk[s][r]  received request
+35,164  [runTask-1]  [3410] bulk[s][r]  sent response
+35,164  [runTask-0]  [3410] bulk[s][r]  received response
+35,164  [runTask-0]  [3409] bulk[s][p]  sent response              <- only now does the primary answer
+35,165  [runTask-0]  [3409] bulk[s][p]  received response
+```
+
+Three things in that: the replica leg is a **separate** transport request with its own ID;
+the primary does not respond until the replica has (synchronous replication, with
+timestamps); and the primary leg never touched a socket, because the shard was local and
+`TransportService.getConnection` returns `localNodeConnection` for the local node
+(lines 983-993) — same abstraction, no wire.
+
+**Warning:** `kill -9` on a node under `./gradlew run` fails the whole Gradle task and tears
+down the surviving node, so you can't watch the pruning that way. The behaviour is asserted
+instead in `TransportServiceLifecycleTests.onConnectionClosedUsesHandlerExecutor`
+(lines 287-312) — send a request, close the connection, assert `NodeDisconnectedException`.
+General habit: when you can't reproduce something live, find the test that asserts it.
+
+---
+
 ## Counterintuitive findings worth rereading
 
 1. **The boss thread handles almost nothing.** It accepts a connection, registers the new
@@ -564,6 +766,16 @@ work."
 6. **Netty charges 96 bytes per queued message** on top of the payload.
 7. **The two HTTP settings are named on different axes:** `http.port` versus
    `transport.port` (`HttpTransportSettings.java:77` / `TransportSettings.java:57`).
+8. **`Connection` in ES is thirteen sockets, not one.** And `getNumConnections()` counts
+   channels, not Connections.
+9. **A node sends transport requests to itself** — with a request ID, tracer lines and all
+   — via `localNodeConnection`, never touching a socket.
+10. **Request IDs are per-node counters**, so the same ID exists on every node
+    simultaneously and means something different on each.
+11. **The most latency-critical loop in the cluster sets no transport timeout.** Fault
+    detection puts its 10s deadline on the listener instead.
+12. **Transport-level keepalive pings are off by default** (`PING_SCHEDULE` = -1). Silent
+    partitions are caught by fault detection, not by transport.
 
 ---
 
@@ -587,16 +799,22 @@ Everything referenced above, for jumping straight back in.
 | `server/.../index/IndexingPressure.java` | watermarks and limits |
 | `server/.../rest/RestController.java` | `dispatchRequest`, the HTTP/transport seam |
 | `test/framework/.../ESTestCase.java` | paranoid leak detection, line 464 |
+| `server/.../transport/Transport.java` | `Connection` interface, `ResponseHandlers` + request-ID map |
+| `server/.../transport/TcpTransport.java` | `NodeChannels`, channel open loop, size check, close cascade |
+| `server/.../transport/ConnectionProfile.java` | channel counts per role, round-robin selection |
+| `server/.../transport/TcpHeader.java` | the 23-byte wire header |
+| `server/.../transport/TransportStatus.java` | the four status bits |
+| `server/.../transport/TransportService.java` | tracer, `onConnectionClosed` pruning, `localNodeConnection` |
+| `server/.../cluster/NodeConnectionsService.java` | keeps connections matching cluster state |
+| `server/.../cluster/coordination/LeaderChecker.java` | fault detection intervals/timeouts; listener-side deadline |
 
 ---
 
 ## Not yet covered
 
-- **Transport (port 9300)** — the node-to-node binary protocol, `Connection` as a pool of
-  `Channel`s (~13, split into sub-pools by `ConnectionProfile`), no retries at the
-  transport layer, the 2 GB / 30%-of-heap message cap. This is the layer allocation,
-  replication, recovery, snapshots and CCR are all built on. Guide lines 105-153.
 - **Thread pools and when to fork** — the ES side of "never block the event loop".
+  `ThreadWatchdog`, which actions do a little work inline before dispatching, and the
+  same-pool deadlock risk. This is the last piece of the Network topic.
 - **Wire serialization** — `Writeable`, `StreamInput`/`StreamOutput`, `TransportVersion`
   gating. Guide lines 240+. Its own topic.
 - **The two empty guide stubs** at lines 236-238, `### Chunk Encoding` and
