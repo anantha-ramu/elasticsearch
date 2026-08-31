@@ -1,16 +1,32 @@
-# Netty fundamentals, and how Elasticsearch uses them
+# Elasticsearch networking: Netty, Transport, and threading
 
-Notes from a hands-on lab session, 30 Aug 2026. Every claim here was verified against
-source and most were demonstrated with a running program; the captured output is
-included so the evidence survives even if the reasoning is forgotten.
-
-Elasticsearch line references are against commit `cd4f46d0e292` on branch `es-learning`.
-Line numbers drift — if one looks wrong, grep for the quoted code instead.
-Netty references are against 4.1.135.Final.
-
-Context for why this exists: this was a detour from the **Network** topic of the
-ES-Distributed knowledge-sharing list. The guide section it supports is
+Notes from hands-on lab sessions, 30–31 Aug 2026. This covers the **Network** topic of the
+ES-Distributed knowledge-sharing list end to end, and supports
 `docs/internal/DistributedArchitectureGuide.md` lines 13–240.
+
+Every claim here was verified against source, and most were demonstrated with a running
+program or cluster. The captured output is included deliberately, so that if the reasoning
+has faded the evidence is still there to re-derive it from.
+
+Elasticsearch line references are against commit `cd4f46d0e292` on branch `es-learning`;
+Netty references are against 4.1.135.Final. Line numbers drift — if one looks wrong, grep
+for the quoted code instead of trusting the number.
+
+## How to use this if you've forgotten everything
+
+Read in this order depending on what you need:
+
+- **Just need a jog?** Jump to *Counterintuitive findings worth rereading* near the end —
+  seventeen one-liners covering everything that was genuinely surprising.
+- **Need to find code?** The *ES file index* maps every file mentioned to why you'd open it.
+- **Need to actually understand something again?** Sections 1–5 are the Netty fundamentals,
+  in dependency order, each with a runnable experiment. Then *Transport* and *Threading* are
+  the Elasticsearch-specific layers built on them.
+- **Want to redo the experiments?** Section 0 sets up the lab in about two minutes; the
+  appendix has complete source plus the per-lesson modifications.
+
+The one-sentence summaries at the end of each numbered lesson are the load-bearing ideas;
+if you only reread five things, reread those.
 
 ---
 
@@ -752,6 +768,150 @@ General habit: when you can't reproduce something live, find the test that asser
 
 ---
 
+## Threading: who actually runs the handler
+
+Netty gives you a small number of event loop threads that must never block (see Lesson 1).
+This section is the Elasticsearch side of that rule: where the real work goes instead, and
+what enforces it.
+
+### The fork decision is declarative, made once
+
+Every transport action names its executor when it registers:
+
+```java
+transportService.registerRequestHandler(ACTION_NAME, executor, RequestType::new, handler);
+```
+
+That second argument *is* the threading model. There is no scattered runtime "should I fork
+here?" logic — you declare where your handler runs and the transport layer dispatches
+accordingly. You can read a subsystem's intentions straight off its registrations: all of
+peer recovery goes to `GENERIC` (`PeerRecoveryTargetService.java:125-215`) because every one
+of those handlers touches disk; cluster join goes to `CLUSTER_COORDINATION`
+(`JoinHelper.java:132`).
+
+### Many pools, not one
+
+`ThreadPool.Names` lists them: `GENERIC`, `WRITE`, `SEARCH`, `GET`, `MANAGEMENT`, `FLUSH`,
+`REFRESH`, `SNAPSHOT`, `MERGE`, `CLUSTER_COORDINATION`, plus coordination variants like
+`SEARCH_COORDINATION` and `WRITE_COORDINATION`. Each is sized and queued separately, so a
+saturated search pool cannot starve cluster coordination. Same principle as the thirteen
+transport channels partitioned by traffic type, one layer up.
+
+**Fixed** pools bound both threads and queue and reject when the queue fills. They exist
+where concurrency itself must be capped to protect a scarce resource. **Scaling** pools grow
+and shrink on demand with an unbounded queue (`queue_size -1`); they suit I/O-bound bursty
+work whose threads mostly wait, where extra threads don't contend for CPU and refusing the
+work would be worse than doing it slowly.
+
+Observed on a 2-processor laptop via
+`curl -s 'localhost:9200/_cat/thread_pool?v&h=node_name,name,type,size,queue,queue_size,rejected&s=name'`:
+
+```
+search                 fixed     4   0   4000   0
+write                  fixed     2   0  10000   0     <- equals allocated_processors
+get                    fixed     4   0   1000   0
+cluster_coordination   fixed     1   0     -1   0     <- see below
+generic                scaling       0     -1   0
+flush / refresh / snapshot / merge / management / warmer   all scaling
+```
+
+`cluster_coordination` is the one to stare at: **one thread, unbounded queue, can never
+reject.** Cluster state work is deliberately serialised through a single thread — the master
+bottleneck — and dropping a coordination task because a queue filled would be catastrophic,
+so the queue simply has no limit.
+
+### `DIRECT_EXECUTOR_SERVICE` does not mean "this is cheap"
+
+It means *"don't fork for me, I'll handle it."* Two very different uses:
+
+The genuinely trivial case: `LeaderChecker` registers `DIRECT` (line 117) because answering
+"yes, I'm alive" is a few instructions and forking would cost more than the work.
+
+The case that looks like a bug: `SearchTransportService.java:603-612` registers
+`QUERY_ACTION_NAME` — the shard query phase, the heaviest thing ES does — as `DIRECT`. The
+resolution is inside the handler:
+
+```java
+// SearchService.executeQueryPhase, ~line 838
+// check if we can shortcut the query phase entirely.
+if (orig.canReturnNullResponseIfMatchNoDocs()) {
+    // ... canMatch(...) ...
+    if (canMatchResp.canMatch() == false) {
+        l.onResponse(QuerySearchResult.nullInstance());
+```
+
+A shard that cannot possibly match answers immediately on the transport thread, never
+entering the search pool. Only shards that might actually match pay for the fork. On a wide
+search across hundreds of shards mostly excluded by date range, that avoids hundreds of
+queue hops.
+
+**So the rule isn't "heavy work forks." It's "fork when you're about to do real work, not
+before you know whether you will."**
+
+### The transport worker pool is invisible to `_cat/thread_pool`
+
+Scan that output for `transport_worker`. It isn't there and never will be — it's a Netty
+`EventLoopGroup` created by `SharedGroupFactory`, not an ES `ThreadPool` executor, so it
+lives in a different registry entirely.
+
+Its size is `transport.netty.worker_count`, defaulting to allocated processors
+(`Netty4Plugin.java:63-68`). And `http.netty.worker_count` defaults to **0**, which per
+`SharedGroupFactory`'s javadoc (lines 29-33) means HTTP and transport **share one group**.
+
+So on a 2-CPU box: two threads per node carry every HTTP request and every transport
+message, both directions, across all thirteen channels to every peer. That is the resource
+every rule above exists to protect, and no REST API shows it. To count them:
+
+```bash
+jstack $(lsof -nP -iTCP:9300 -sTCP:LISTEN -t) | grep -c 'transport_worker'
+```
+
+The name prefix is `TcpTransport.java:92`.
+
+### `ThreadWatchdog`: enforcement, and a neat trick
+
+Settings: `network.thread.watchdog.interval` 5s, `network.thread.watchdog.quiet_time` 10m
+(`ThreadWatchdog.java:41-51`). When it finds a stuck thread it dumps hot threads.
+
+The instrumentation has to be nearly free on the hot path, so it is **one `AtomicLong` per
+thread whose parity is the state** — even is idle, odd is active (`isIdle`, line 163). Both
+`startActivity()` and `stopActivity()` are a single `getAndIncrement()`. No timestamps, no
+allocation.
+
+Detection never measures elapsed time:
+
+```java
+// isIdleOrMakingProgress(), lines 148-160
+final var value = get();
+if (isIdle(value)) return true;
+if (value == lastObservedValue) return false;   // no change since last check -> stuck
+lastObservedValue = value;                      // made progress
+return true;
+```
+
+Every five seconds it asks: is this thread active, *and* is the counter exactly where it was
+last time? A thread that started and finished a thousand activities is a thousand-ish higher;
+a thread stuck inside one hasn't moved.
+
+**Why this can't false-positive:** the counter only ever increments, so the sequence is
+`0,1,2,3,...` and never revisits a value. Aliasing is impossible. What alternates is only the
+parity. For `value == lastObservedValue` to hold, literally nothing can have happened since
+the last sample; combined with an odd value that means the thread entered an activity before
+the previous sample and is still in the same one. (`long` wraparound would take ~292 years at
+a billion increments per second.)
+
+**Its errors go the other way — false negatives.** A four-second stall between samples is
+invisible, as is one that starts just after a check and ends just before the next. Real
+detection latency is between five and ten seconds, never exactly five. Deliberately built to
+never cry wolf, since it responds by dumping every hot thread in the JVM into the log.
+
+One more detail explaining why it's affordable: `lastObservedValue` is a plain `long`, not
+`volatile`, because only the checker thread ever touches it. A watched transport thread's
+entire cost is two atomic increments per activity; all bookkeeping lives on the checker side,
+which runs once every five seconds.
+
+---
+
 ## Counterintuitive findings worth rereading
 
 1. **The boss thread handles almost nothing.** It accepts a connection, registers the new
@@ -776,6 +936,15 @@ General habit: when you can't reproduce something live, find the test that asser
     detection puts its 10s deadline on the listener instead.
 12. **Transport-level keepalive pings are off by default** (`PING_SCHEDULE` = -1). Silent
     partitions are caught by fault detection, not by transport.
+13. **The transport worker pool does not appear in `_cat/thread_pool`.** It's a Netty
+    `EventLoopGroup`, not an ES `ThreadPool`. Use `jstack | grep transport_worker`.
+14. **HTTP and transport share one event loop group by default**
+    (`http.netty.worker_count` = 0), sized to your CPU count.
+15. **`DIRECT_EXECUTOR_SERVICE` doesn't mean "cheap".** The shard query phase uses it, then
+    forks itself only once it knows there's real work to do.
+16. **`cluster_coordination` is one thread with an unbounded queue.** It can never reject.
+17. **The watchdog never measures time.** It samples a monotonic counter and asks whether
+    the value moved.
 
 ---
 
@@ -807,14 +976,25 @@ Everything referenced above, for jumping straight back in.
 | `server/.../transport/TransportService.java` | tracer, `onConnectionClosed` pruning, `localNodeConnection` |
 | `server/.../cluster/NodeConnectionsService.java` | keeps connections matching cluster state |
 | `server/.../cluster/coordination/LeaderChecker.java` | fault detection intervals/timeouts; listener-side deadline |
+| `server/.../threadpool/ThreadPool.java` | the pool names |
+| `server/.../common/network/ThreadWatchdog.java` | parity-counter activity tracking, stuck-thread detection |
+| `server/.../search/SearchService.java` | `executeQueryPhase`, the canMatch shortcut before forking |
+| `modules/transport-netty4/.../transport/netty4/Netty4Plugin.java` | `transport.netty.worker_count` |
+| `modules/transport-netty4/.../transport/netty4/SharedGroupFactory.java` | why HTTP and transport share event loops |
 
 ---
 
 ## Not yet covered
 
-- **Thread pools and when to fork** — the ES side of "never block the event loop".
-  `ThreadWatchdog`, which actions do a little work inline before dispatching, and the
-  same-pool deadlock risk. This is the last piece of the Network topic.
+**The Network topic itself is now covered** — HTTP server and its pipeline, Netty
+fundamentals, Transport, and threading. What remains is adjacent rather than missing:
+
+- **Wire serialization** — `Writeable`, `StreamInput`/`StreamOutput`, `TransportVersion`
+  gating. Guide lines 240+. Big enough to be its own topic.
+- **Other networking stacks** — snapshot repository clients (AWS/Azure/GCP SDKs), Watcher
+  HTTP action, reindex-from-remote. One paragraph of the guide; no lesson needed.
+- **Same-pool deadlock** — a handler on pool X blocking on work that must also run on pool
+  X. Mentioned but never demonstrated here.
 - **Wire serialization** — `Writeable`, `StreamInput`/`StreamOutput`, `TransportVersion`
   gating. Guide lines 240+. Its own topic.
 - **The two empty guide stubs** at lines 236-238, `### Chunk Encoding` and
