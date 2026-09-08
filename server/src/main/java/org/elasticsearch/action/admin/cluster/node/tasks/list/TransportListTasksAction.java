@@ -51,6 +51,7 @@ import org.elasticsearch.xcontent.XContentParser;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -170,8 +171,9 @@ public class TransportListTasksAction extends TransportTasksAction<Task, ListTas
         final ActionListener<ListTasksResponse> listener
     ) {
         super.doExecute(task, request, listener.delegateFailureAndWrap((l1, firstResponse) -> {
+            final ListTasksResponse firstPass = retainRelocationCandidates(firstResponse);
             super.doExecute(task, request, l1.delegateFailureAndWrap((l2, secondResponse) -> {
-                l2.onResponse(deduplicateAndMerge(firstResponse, secondResponse));
+                l2.onResponse(deduplicateAndMerge(firstPass, secondResponse));
             }));
         }));
     }
@@ -184,11 +186,42 @@ public class TransportListTasksAction extends TransportTasksAction<Task, ListTas
         final ActionListener<ListTasksResponse> listener
     ) {
         final ListTasksRequest firstPassRequest = copyWithoutWaitForCompletion(request);
-        super.doExecute(task, firstPassRequest, listener.delegateFailureAndWrap((l1, firstPass) -> {
+        super.doExecute(task, firstPassRequest, listener.delegateFailureAndWrap((l1, firstResponse) -> {
+            final ListTasksResponse firstPass = retainRelocationCandidates(firstResponse);
             super.doExecute(task, request, l1.delegateFailureAndWrap((l2, secondPass) -> {
                 reconcileMissedRelocations(task, firstPass, secondPass, l2);
             }));
         }));
+    }
+
+    /// Drops everything from a first-pass response that the reconciliation cannot use, before the second pass starts.
+    ///
+    /// The only tasks ever read back out of the first pass are relocatable parents that the second pass missed, and the children of
+    /// those parents; see [#findMissedRelocations]. Everything else is held for the length of a second full listing and then thrown
+    /// away. On a busy cluster that is nearly all of it: a search node ran out of memory holding a 311,825-task first pass while the
+    /// second pass had reached 140,703 tasks, and not one of them was a reindex.
+    ///
+    /// Narrowing the second pass itself would be better still, but the merge treats it as the authoritative snapshot, so that is a
+    /// larger change than this one.
+    static ListTasksResponse retainRelocationCandidates(final ListTasksResponse response) {
+        final Set<TaskId> parentTaskIds = new HashSet<>();
+        for (final TaskInfo t : response.getTasks()) {
+            if (t.parentTaskId().isSet() == false && RELOCATABLE_ACTIONS.contains(t.action())) {
+                parentTaskIds.add(t.taskId());
+            }
+        }
+
+        if (parentTaskIds.isEmpty()) { // the common case: no reindex running, so the second pass has nothing to reconcile against
+            return new ListTasksResponse(List.of(), response.getTaskFailures(), response.getNodeFailures());
+        }
+
+        final List<TaskInfo> candidates = new ArrayList<>(parentTaskIds.size());
+        for (final TaskInfo t : response.getTasks()) {
+            if (parentTaskIds.contains(t.taskId()) || parentTaskIds.contains(t.parentTaskId())) {
+                candidates.add(t);
+            }
+        }
+        return new ListTasksResponse(candidates, response.getTaskFailures(), response.getNodeFailures());
     }
 
     /// Finds reindex tasks that appeared in the first pass but are missing from the second pass, perhaps because the operation relocated

@@ -28,11 +28,14 @@ import org.elasticsearch.xcontent.XContentFactory;
 import org.elasticsearch.xcontent.XContentType;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.equalTo;
 
 public class TransportListTasksActionTests extends ESTestCase {
 
@@ -716,5 +719,79 @@ public class TransportListTasksActionTests extends ESTestCase {
         );
         assertThat(result.parents(), containsInAnyOrder(parent1, parent2));
         assertThat(result.children(), containsInAnyOrder(child1, child2));
+    }
+
+    // -- retainRelocationCandidates --
+
+    public void testRetainRelocationCandidatesKeepsReindexParentsAndTheirChildren() {
+        TaskId parentId = randomTaskId();
+        TaskInfo parent = randomTaskInfoWithTaskIdActionAndParent(parentId, ReindexAction.NAME, TaskId.EMPTY_TASK_ID);
+        TaskInfo child = randomTaskInfoWithTaskIdActionAndParent(randomTaskId(), randomAlphaOfLength(10), parentId);
+        TaskInfo unrelated = randomTaskInfoWithTaskIdActionAndParent(randomTaskId(), "indices:data/write/bulk[s]", TaskId.EMPTY_TASK_ID);
+        TaskOperationFailure taskFailure = taskFailureWithNodeAndTaskId(randomAlphaOfLength(5), randomNonNegativeLong());
+        FailedNodeException nodeFailure = nodeFailureWithNodeId(randomAlphaOfLength(5));
+
+        ListTasksResponse retained = TransportListTasksAction.retainRelocationCandidates(
+            new ListTasksResponse(List.of(parent, child, unrelated), List.of(taskFailure), List.of(nodeFailure))
+        );
+
+        assertThat(retained.getTasks(), containsInAnyOrder(parent, child));
+        // Failures are small and the merge still reads them, so they stay.
+        assertThat(retained.getTaskFailures(), containsInAnyOrder(taskFailure));
+        assertThat(retained.getNodeFailures(), containsInAnyOrder(nodeFailure));
+    }
+
+    public void testRetainRelocationCandidatesDropsEverythingWhenNoReindexIsRunning() {
+        List<TaskInfo> tasks = new ArrayList<>();
+        for (int i = 0; i < randomIntBetween(1, 20); i++) {
+            tasks.add(randomTaskInfoWithTaskIdActionAndParent(randomTaskId(), "indices:data/write/bulk[s]", TaskId.EMPTY_TASK_ID));
+        }
+
+        ListTasksResponse retained = TransportListTasksAction.retainRelocationCandidates(
+            new ListTasksResponse(tasks, List.of(), List.of())
+        );
+
+        assertThat(retained.getTasks(), empty());
+    }
+
+    /**
+     * The point of the reduction: the merge cannot tell the difference. Whatever is dropped here was never read back out of the
+     * first pass, so trimming it before the second pass starts only frees memory.
+     */
+    public void testRetainRelocationCandidatesDoesNotChangeTheMergedResult() {
+        TaskId missedParentId = randomTaskId();
+        TaskInfo missedParent = randomTaskInfoWithTaskIdActionAndParent(missedParentId, ReindexAction.NAME, TaskId.EMPTY_TASK_ID);
+        TaskInfo missedChild = randomTaskInfoWithTaskIdActionAndParent(randomTaskId(), randomAlphaOfLength(10), missedParentId);
+        TaskInfo seenParent = randomTaskInfoWithTaskIdActionAndParent(randomTaskId(), ReindexAction.NAME, TaskId.EMPTY_TASK_ID);
+
+        List<TaskInfo> firstPassTasks = new ArrayList<>(List.of(missedParent, missedChild, seenParent));
+        for (int i = 0; i < randomIntBetween(1, 50); i++) {
+            firstPassTasks.add(randomTaskInfoWithTaskIdActionAndParent(randomTaskId(), "indices:data/write/bulk[s]", TaskId.EMPTY_TASK_ID));
+        }
+
+        List<TaskInfo> secondPassTasks = new ArrayList<>(
+            List.of(randomTaskInfoWithTaskIdAndOriginalAndRunningTime(randomTaskId(), seenParent.originalTaskId(), randomNonNegativeLong()))
+        );
+        for (int i = 0; i < randomIntBetween(1, 50); i++) {
+            secondPassTasks.add(
+                randomTaskInfoWithTaskIdActionAndParent(randomTaskId(), "indices:data/write/bulk[s]", TaskId.EMPTY_TASK_ID)
+            );
+        }
+
+        List<TaskOperationFailure> taskFailures = List.of(taskFailureWithNodeAndTaskId(randomAlphaOfLength(5), randomNonNegativeLong()));
+        List<FailedNodeException> nodeFailures = List.of(nodeFailureWithNodeId(randomAlphaOfLength(5)));
+
+        ListTasksResponse firstPass = new ListTasksResponse(firstPassTasks, taskFailures, nodeFailures);
+        ListTasksResponse secondPass = new ListTasksResponse(secondPassTasks, List.of(), List.of());
+
+        ListTasksResponse mergedFromFullFirstPass = TransportListTasksAction.deduplicateAndMerge(firstPass, secondPass);
+        ListTasksResponse mergedFromRetainedFirstPass = TransportListTasksAction.deduplicateAndMerge(
+            TransportListTasksAction.retainRelocationCandidates(firstPass),
+            secondPass
+        );
+
+        assertThat(mergedFromRetainedFirstPass.getTasks(), equalTo(mergedFromFullFirstPass.getTasks()));
+        assertThat(mergedFromRetainedFirstPass.getTaskFailures(), equalTo(mergedFromFullFirstPass.getTaskFailures()));
+        assertThat(mergedFromRetainedFirstPass.getNodeFailures(), equalTo(mergedFromFullFirstPass.getNodeFailures()));
     }
 }
