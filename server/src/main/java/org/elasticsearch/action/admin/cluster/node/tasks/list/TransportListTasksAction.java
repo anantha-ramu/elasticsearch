@@ -24,6 +24,7 @@ import org.elasticsearch.action.support.tasks.TransportTasksAction;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.client.internal.OriginSettingClient;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
@@ -70,6 +71,24 @@ public class TransportListTasksAction extends TransportTasksAction<Task, ListTas
 
     public static final ActionType<ListTasksResponse> TYPE = new ActionType<>("cluster:monitor/tasks/lists");
 
+    /**
+     * The greatest number of tasks a single list-tasks response may hold.
+     *
+     * <p>Nothing in the request bounds this: an unfiltered {@code GET /_tasks} returns whatever the cluster happens to be
+     * doing, and every task is materialised on the coordinating node before any of it is written. A search node ran out of
+     * memory building one such response out of 586,403 tasks.
+     *
+     * <p>Dynamic, because the right number depends on the heap and on how the cluster is used, and because an operator who
+     * genuinely wants the whole list needs a way to ask for it.
+     */
+    public static final Setting<Integer> MAX_LISTED_TASKS_SETTING = Setting.intSetting(
+        "tasks.list.max_tasks",
+        10_000,
+        1,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
     public static long waitForCompletionTimeout(TimeValue timeout) {
         if (timeout == null) {
             timeout = DEFAULT_WAIT_FOR_COMPLETION_TIMEOUT;
@@ -81,6 +100,7 @@ public class TransportListTasksAction extends TransportTasksAction<Task, ListTas
 
     private final Client client;
     private final NamedXContentRegistry xContentRegistry;
+    private volatile int maxListedTasks;
 
     @Inject
     public TransportListTasksAction(
@@ -101,6 +121,12 @@ public class TransportListTasksAction extends TransportTasksAction<Task, ListTas
         );
         this.client = new OriginSettingClient(Objects.requireNonNull(client, "client"), TASKS_ORIGIN);
         this.xContentRegistry = Objects.requireNonNull(xContentRegistry, "xContentRegistry");
+        clusterService.getClusterSettings().initializeAndWatch(MAX_LISTED_TASKS_SETTING, value -> this.maxListedTasks = value);
+    }
+
+    @Override
+    protected int getMaxTaskResponses(ListTasksRequest request) {
+        return maxListedTasks;
     }
 
     @Override

@@ -9,6 +9,7 @@
 
 package org.elasticsearch.action.support.tasks;
 
+import org.elasticsearch.ElasticsearchStatusException;
 import org.elasticsearch.ResourceNotFoundException;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionListenerResponseHandler;
@@ -27,6 +28,7 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
+import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.tasks.CancellableTask;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.tasks.TaskId;
@@ -86,11 +88,17 @@ public abstract class TransportTasksAction<
         final var discoveryNodes = clusterService.state().nodes();
         final String[] nodeIds = resolveNodes(request, discoveryNodes);
 
+        final int maxTaskResponses = getMaxTaskResponses(request);
+
         new CancellableFanOut<String, NodeTasksResponse, TasksResponse>() {
             final ArrayList<TaskResponse> taskResponses = new ArrayList<>();
             final ArrayList<TaskOperationFailure> taskOperationFailures = new ArrayList<>();
             final ArrayList<FailedNodeException> failedNodeExceptions = new ArrayList<>();
             final TransportRequestOptions transportRequestOptions = TransportRequestOptions.timeout(request.getTimeout());
+
+            /** How many task responses the nodes have sent, which is more than we kept if we went over the limit. Guarded by
+             * {@code taskResponses}. */
+            int matchedTaskCount;
 
             @Override
             protected void sendItemRequest(String nodeId, ActionListener<NodeTasksResponse> listener) {
@@ -117,7 +125,19 @@ public abstract class TransportTasksAction<
 
             @Override
             protected void onItemResponse(String nodeId, NodeTasksResponse nodeTasksResponse) {
-                addAllSynchronized(taskResponses, nodeTasksResponse.results);
+                if (nodeTasksResponse.results.isEmpty() == false) {
+                    synchronized (taskResponses) {
+                        matchedTaskCount += nodeTasksResponse.results.size();
+                        if (matchedTaskCount > maxTaskResponses) {
+                            // Once we are over the limit the request can only fail, so drop what we have rather than carry
+                            // it while the remaining nodes report in. We keep counting so the failure can say how far over
+                            // the limit the caller was.
+                            taskResponses.clear();
+                        } else {
+                            taskResponses.addAll(nodeTasksResponse.results);
+                        }
+                    }
+                }
                 addAllSynchronized(taskOperationFailures, nodeTasksResponse.exceptions);
             }
 
@@ -141,6 +161,19 @@ public abstract class TransportTasksAction<
             @Override
             protected TasksResponse onCompletion() {
                 // ref releases all happen-before here so no need to be synchronized
+                if (matchedTaskCount > maxTaskResponses) {
+                    throw new ElasticsearchStatusException(
+                        "["
+                            + actionName
+                            + "] matched ["
+                            + matchedTaskCount
+                            + "] tasks, more than the ["
+                            + maxTaskResponses
+                            + "] a single response may hold. Narrow the request, or raise the limit if the response really is "
+                            + "wanted in full.",
+                        RestStatus.TOO_MANY_REQUESTS
+                    );
+                }
                 return newResponse(request, taskResponses, taskOperationFailures, failedNodeExceptions);
             }
 
@@ -195,6 +228,18 @@ public abstract class TransportTasksAction<
                 return transportNodeAction;
             }
         }.run(nodeTask, operationTasks.iterator(), listener);
+    }
+
+    /**
+     * The greatest number of task responses this action will collect on the coordinating node before it gives up and fails
+     * the request. Unlimited by default.
+     *
+     * <p>Every task response is held in memory until all nodes have reported, and nothing is written until then, so the
+     * request circuit breaker never sees them. An action whose response size is set by how busy the cluster happens to be,
+     * rather than by anything in the request, should bound this.
+     */
+    protected int getMaxTaskResponses(TasksRequest request) {
+        return Integer.MAX_VALUE;
     }
 
     protected String[] resolveNodes(TasksRequest request, DiscoveryNodes discoveryNodes) {

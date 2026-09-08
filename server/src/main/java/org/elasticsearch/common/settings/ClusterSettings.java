@@ -11,6 +11,7 @@ package org.elasticsearch.common.settings;
 import org.apache.logging.log4j.LogManager;
 import org.elasticsearch.action.admin.cluster.allocation.TransportGetAllocationStatsAction;
 import org.elasticsearch.action.admin.cluster.configuration.TransportAddVotingConfigExclusionsAction;
+import org.elasticsearch.action.admin.cluster.node.tasks.list.TransportListTasksAction;
 import org.elasticsearch.action.admin.indices.close.TransportCloseIndexAction;
 import org.elasticsearch.action.bulk.IncrementalBulkService;
 import org.elasticsearch.action.bulk.PreResolvedUpdates;
@@ -479,6 +480,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
         SearchTaskWatchdog.DATA_NODE_THRESHOLD,
         SearchTaskWatchdog.INTERVAL,
         SearchTaskWatchdog.COOLDOWN_PERIOD,
+        TransportListTasksAction.MAX_LISTED_TASKS_SETTING,
         IndexSettings.QUERY_STRING_ANALYZE_WILDCARD,
         IndexSettings.QUERY_STRING_ALLOW_LEADING_WILDCARD,
         ES95CodecClusterSettingProvider.TIME_SERIES_ES95_CODEC_CLUSTER_ENABLED_SETTING,
