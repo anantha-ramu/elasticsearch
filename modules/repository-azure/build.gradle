@@ -351,6 +351,26 @@ tasks.register("workloadIdentityYamlRestTest", RestIntegTestTask) {
   // omitting key and sas_token so that we use a bearer token from workload identity
 }
 
+// AzureUploadIntegrityTests needs the send queue to refill often, which only happens once a blob exceeds the
+// prefetch. The shipped default is 128 buffers and a unit test never gets near it, so this runs the test on its own
+// with a small prefetch. It is a separate task so the rest of the module keeps exercising the production value.
+tasks.register("azureUploadIntegrityTest", Test) {
+  SourceSetContainer sourceSets = project.getExtensions().getByType(SourceSetContainer.class)
+  SourceSet testSourceSet = sourceSets.getByName(SourceSet.TEST_SOURCE_SET_NAME)
+  setTestClassesDirs(testSourceSet.getOutput().getClassesDirs())
+  setClasspath(testSourceSet.getRuntimeClasspath())
+  include '**/AzureUploadIntegrityTests.class'
+  systemProperty 'reactor.netty.send.maxPrefetchSize', '4'
+}
+
+tasks.named("test").configure {
+  exclude '**/AzureUploadIntegrityTests.class'
+}
+
+tasks.named("check").configure {
+  dependsOn "azureUploadIntegrityTest"
+}
+
 tasks.register("azureThirdPartyUnitTest", Test) {
   SourceSetContainer sourceSets = project.getExtensions().getByType(SourceSetContainer.class);
   SourceSet internalTestSourceSet = sourceSets.getByName(InternalClusterTestPlugin.SOURCE_SET_NAME)
