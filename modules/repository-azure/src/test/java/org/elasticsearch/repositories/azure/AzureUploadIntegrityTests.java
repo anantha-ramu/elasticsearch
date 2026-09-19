@@ -129,7 +129,7 @@ public class AzureUploadIntegrityTests extends ESTestCase {
         httpServerExecutor = EsExecutors.newScaling(
             "azure-upload-integrity-fixture",
             0,
-            32,
+            64,
             60L,
             TimeUnit.SECONDS,
             true,
@@ -156,7 +156,7 @@ public class AzureUploadIntegrityTests extends ESTestCase {
      * so the plain path has to be checked and not only the retry path.
      */
     public void testConcurrentUploadsAreByteExact() throws Exception {
-        runConcurrentUploads("plain", iteration -> 0);
+        runConcurrentUploads("plain", iteration -> 0, ByteSizeValue.of(128, ByteSizeUnit.MB));
     }
 
     /**
@@ -164,13 +164,20 @@ public class AzureUploadIntegrityTests extends ESTestCase {
      * fresh stream while the previous subscription is being torn down.
      */
     public void testConcurrentUploadsAreByteExactAcrossRetries() throws Exception {
-        runConcurrentUploads("retried", iteration -> between(1, 3));
+        runConcurrentUploads("retried", iteration -> between(1, 3), ByteSizeValue.of(128, ByteSizeUnit.MB));
     }
 
-    private void runConcurrentUploads(String prefix, IntUnaryOperator failuresForIteration) throws Exception {
+    /**
+     * The same again with a block size below the blob size, so each upload is staged as several blocks and committed.
+     * Parts are staged concurrently, so a single blob has several subscriptions reading at once.
+     */
+    public void testConcurrentMultipartUploadsAreByteExact() throws Exception {
+        runConcurrentUploads("multipart", iteration -> 0, ByteSizeValue.of(8, ByteSizeUnit.MB));
+    }
+
+    private void runConcurrentUploads(String prefix, IntUnaryOperator failuresForIteration, ByteSizeValue blockSize) throws Exception {
         final Fixture fixture = new Fixture(randomHighEntropyBytes(BUFFERS_PER_BLOB * BUFFER_SIZE));
-        // single-part uploads: one PUT carries the whole blob
-        final BlobContainer container = createBlobContainer(fixture, ByteSizeValue.of(128, ByteSizeUnit.MB));
+        final BlobContainer container = createBlobContainer(fixture, blockSize);
 
         final int threads = 6;
         final CountDownLatch start = new CountDownLatch(1);
@@ -228,8 +235,11 @@ public class AzureUploadIntegrityTests extends ESTestCase {
         final Map<String, AtomicInteger> pendingFailures = new ConcurrentHashMap<>();
         /** The verdict for each blob once its upload has been accepted: empty means it matched. */
         final Map<String, String> verdicts = new ConcurrentHashMap<>();
-        /** Bytes actually received per blob, so an aborted upload cannot be mistaken for a clean one. */
-        final Map<String, Long> lengths = new ConcurrentHashMap<>();
+        /**
+         * Bytes actually received per blob, as base offset to length, so an aborted upload cannot be mistaken for a
+         * clean one. A single-part upload contributes one extent at zero; a multipart upload one per staged block.
+         */
+        final Map<String, Map<Long, Long>> extents = new ConcurrentHashMap<>();
         /** Anything thrown on a server thread, which the HttpServer would otherwise swallow as a dropped connection. */
         final List<Throwable> handlerFailures = new CopyOnWriteArrayList<>();
 
@@ -255,10 +265,25 @@ public class AzureUploadIntegrityTests extends ESTestCase {
             // a clean result has to mean the body arrived in full and matched, never that it never arrived
             final String verdict = verdicts.remove(name);
             assertNotNull("blob [" + name + "] was never accepted by the fixture", verdict);
-            assertEquals("blob [" + name + "] did not transfer in full", source.length, (long) lengths.getOrDefault(name, -1L));
+            assertBlobFullyCovered(name);
             if (verdict.isEmpty() == false) {
                 throw new AssertionError("blob [" + name + "] does not match what was uploaded" + verdict);
             }
+        }
+
+        /**
+         * Walks the received extents from zero and requires them to tile the blob exactly, so a blob is only clean if
+         * every byte of it arrived. Covers both shapes: one extent for a single part, one per block for a multipart.
+         */
+        private void assertBlobFullyCovered(String name) {
+            final Map<Long, Long> received = extents.getOrDefault(name, Map.of());
+            long position = 0;
+            while (position < source.length) {
+                final Long extent = received.get(position);
+                assertNotNull("blob [" + name + "] is missing the bytes at offset " + position, extent);
+                position += extent;
+            }
+            assertEquals("blob [" + name + "] transferred past its length", source.length, position);
         }
 
         void assertNoHandlerFailures() {
@@ -280,13 +305,18 @@ public class AzureUploadIntegrityTests extends ESTestCase {
          * <p>The pauses matter. Over loopback with a fixture that reads as fast as it can, the send queue never fills,
          * so the refill path, where demand crosses threads, is only ever taken with no writes outstanding.
          *
+         * <p>The body carries no indication of where in the blob it belongs, so the offset is recovered by matching
+         * the first buffer against {@code candidateBases}. The source is random, so at most one candidate can match.
+         * A single-part upload passes the one candidate zero and this degenerates to comparing from the start.
+         *
          * @return a description of the blocks that differ, or an empty string if the body matched
          */
-        String drainAndCompare(String blobName, InputStream in, int length) throws IOException {
+        String drainAndCompare(String blobName, InputStream in, int length, List<Long> candidateBases) throws IOException {
             final StringBuilder differences = new StringBuilder();
             final byte[] received = new byte[BUFFER_SIZE];
             int offset = 0;
             int sinceLastPause = 0;
+            long base = -1L;
             while (offset < length) {
                 final int expected = Math.min(BUFFER_SIZE, length - offset);
                 int filled = 0;
@@ -297,7 +327,14 @@ public class AzureUploadIntegrityTests extends ESTestCase {
                     }
                     filled += read;
                 }
-                describeIfDifferent(differences, offset, received, expected);
+                if (base < 0) {
+                    base = resolveBase(candidateBases, received, expected);
+                    if (base < 0) {
+                        discard(in);
+                        return differences.append("\n  the first block matches no part of the source").toString();
+                    }
+                }
+                describeIfDifferent(differences, Math.toIntExact(base) + offset, received, expected);
                 offset += expected;
                 sinceLastPause += expected;
                 if (sinceLastPause >= DRAIN_PAUSE_BYTES) {
@@ -305,8 +342,21 @@ public class AzureUploadIntegrityTests extends ESTestCase {
                     safeSleep(1);
                 }
             }
-            lengths.put(blobName, (long) offset);
+            extents.computeIfAbsent(blobName, ignored -> new ConcurrentHashMap<>()).put(base, (long) offset);
             return differences.toString();
+        }
+
+        /**
+         * @return the candidate offset whose source bytes match the buffer just read, or -1 if none does
+         */
+        private long resolveBase(List<Long> candidateBases, byte[] received, int length) {
+            for (long candidate : candidateBases) {
+                final int at = Math.toIntExact(candidate);
+                if (at + length <= source.length && Arrays.equals(source, at, at + length, received, 0, length)) {
+                    return candidate;
+                }
+            }
+            return -1L;
         }
 
         /**
@@ -334,6 +384,11 @@ public class AzureUploadIntegrityTests extends ESTestCase {
     }
 
     private BlobContainer createBlobContainer(Fixture fixture, ByteSizeValue blockSize) {
+        // where a body may begin in the blob: one offset per block, so a single-part upload has the single offset zero
+        final List<Long> candidateBases = new ArrayList<>();
+        for (long base = 0; base < fixture.source.length; base += blockSize.getBytes()) {
+            candidateBases.add(base);
+        }
         httpServer.createContext("/" + ACCOUNT + "/" + CONTAINER, exchange -> {
             try {
                 final String path = exchange.getRequestURI().getPath();
@@ -354,7 +409,16 @@ public class AzureUploadIntegrityTests extends ESTestCase {
                     return;
                 }
 
-                fixture.verdicts.put(blobName, fixture.drainAndCompare(blobName, exchange.getRequestBody(), fixture.source.length));
+                if ("blocklist".equals(params.get("comp"))) {
+                    // the commit carries block ids rather than blob bytes, and writeBlobAtomic only returns once it
+                    // has succeeded, so there is nothing here to compare
+                    discard(exchange.getRequestBody());
+                } else {
+                    // a staged block carries only part of the blob, so take the size from the request
+                    final int length = Integer.parseInt(exchange.getRequestHeaders().getFirst("Content-Length"));
+                    final String verdict = fixture.drainAndCompare(blobName, exchange.getRequestBody(), length, candidateBases);
+                    fixture.verdicts.merge(blobName, verdict, String::concat);
+                }
                 exchange.getResponseHeaders().add("x-ms-request-server-encrypted", "false");
                 exchange.sendResponseHeaders(RestStatus.CREATED.getStatus(), -1);
             } catch (Throwable t) {
