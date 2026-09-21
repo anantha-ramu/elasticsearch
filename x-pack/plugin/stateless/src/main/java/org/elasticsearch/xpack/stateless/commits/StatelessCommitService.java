@@ -206,6 +206,17 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
     );
 
     /**
+     * Maximum number of retries to attempt when an uploaded commit fails to read back intact, before failing the shard. A transient
+     * corruption clears on the next attempt; one that does not is ours, and retrying it forever would hold the translog it is protecting
+     * open for as long as the shard lives.
+     */
+    public static final Setting<Integer> STATELESS_UPLOAD_MAX_VERIFICATION_RETRIES = Setting.intSetting(
+        "stateless.upload.max_verification_retries",
+        3,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Log at INFO with upload phase timings when a batched compound commit upload exceeds this total wall-clock time.
      * Set to {@link TimeValue#ZERO} to disable.
      */
@@ -260,6 +271,7 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
     private final int bccMaxAmountOfCommits;
     private final long bccUploadMaxSizeInBytes;
     private final int bccUploadMaxIoRetries;
+    private final int bccUploadMaxVerificationRetries;
     private final long bccUploadSlowLogThresholdMillis;
     private final TimeValue releaseFilesAfterNotificationTimeout;
     private final boolean useInternalFilesReplicatedContent;
@@ -344,6 +356,7 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
             virtualBccUploadMaxAge.getStringRep()
         );
         this.bccUploadMaxIoRetries = STATELESS_UPLOAD_MAX_IO_ERROR_RETRIES.get(settings).intValue();
+        this.bccUploadMaxVerificationRetries = STATELESS_UPLOAD_MAX_VERIFICATION_RETRIES.get(settings).intValue();
         this.bccUploadSlowLogThresholdMillis = STATELESS_UPLOAD_SLOW_LOG_THRESHOLD.get(settings).millis();
         this.releaseFilesAfterNotificationTimeout = STATELESS_UPLOAD_RELEASE_FILES_AFTER_NOTIFICATION_TIMEOUT.get(settings);
         this.useInternalFilesReplicatedContent = STATELESS_COMMIT_USE_INTERNAL_FILES_REPLICATED_CONTENT.get(settings);
@@ -804,10 +817,12 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
         }
     }
 
-    // VBCC uploads are retried indefinitely unless the shard has been closed or it has experienced too many IO errors
+    // VBCC uploads are retried indefinitely unless the shard has been closed, or it has experienced too many IO errors, or the uploaded
+    // commit has failed to read back intact too many times
     private class UploadRetryDecider implements Predicate<Exception> {
         final ShardCommitState commitState;
         int localIOExceptions = 0;
+        int verificationFailures = 0;
 
         UploadRetryDecider(ShardCommitState commitState) {
             this.commitState = commitState;
@@ -822,7 +837,11 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
                 localIOExceptions++;
             }
 
-            return localIOExceptions < bccUploadMaxIoRetries;
+            if (e instanceof ObjectStoreService.UploadVerificationException) {
+                verificationFailures++;
+            }
+
+            return localIOExceptions < bccUploadMaxIoRetries && verificationFailures < bccUploadMaxVerificationRetries;
         }
     }
 
@@ -1062,11 +1081,18 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
                             ),
                             e
                         );
-                    } else if (e instanceof ObjectStoreService.LocalIOException) {
+                    } else if (causedBy(e, ObjectStoreService.LocalIOException.class)) {
+                        failShard(commitState.shardId, virtualBcc.getPrimaryTermAndGeneration().generation(), "IO error", e);
+                    } else if (causedBy(e, ObjectStoreService.UploadVerificationException.class)) {
+                        // The commit never reached the object store intact, so there is no durable copy of these operations other than
+                        // the translog. Fail the shard rather than carry on: uploads for a shard are released in generation order by
+                        // markBccUploaded, so abandoning this one silently would stop the shard uploading commits altogether and grow
+                        // its translog without bound. Recovery elsewhere replays that translog from the last commit that did verify.
                         failShard(
                             commitState.shardId,
                             virtualBcc.getPrimaryTermAndGeneration().generation(),
-                            (ObjectStoreService.LocalIOException) e
+                            "a commit that could not be read back intact",
+                            e
                         );
                     } else {
                         logger.warn(
@@ -1087,7 +1113,8 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
             private boolean assertClosedOrRejectionFailure(final Exception e) {
                 final var closed = commitState.isClosed();
                 assert closed
-                    || e instanceof ObjectStoreService.LocalIOException
+                    || causedBy(e, ObjectStoreService.LocalIOException.class)
+                    || causedBy(e, ObjectStoreService.UploadVerificationException.class)
                     || e instanceof EsRejectedExecutionException
                     || e instanceof IndexNotFoundException
                     || e instanceof ShardNotFoundException : closed + " vs " + e;
@@ -1123,14 +1150,23 @@ public class StatelessCommitService extends AbstractLifecycleComponent implement
         logger.info(message);
     }
 
-    void failShard(ShardId shardId, long generation, ObjectStoreService.LocalIOException error) {
+    /**
+     * Whether {@code e} is, or carries as a cause or a suppressed exception, an instance of {@code type}. A
+     * {@link org.elasticsearch.action.support.RetryableAction} that gives up reports the <em>first</em> exception it caught with the
+     * later ones suppressed, so the reason it stopped retrying is often not the exception on top.
+     */
+    private static boolean causedBy(Exception e, Class<? extends Exception> type) {
+        return ExceptionsHelper.unwrapCausesAndSuppressed(e, type::isInstance).isPresent();
+    }
+
+    void failShard(ShardId shardId, long generation, String reason, Exception error) {
         final var indexService = indicesService.indexService(shardId.getIndex());
         if (indexService == null) {
-            logger.info(format("%s index not found, cannot fail BCC [%s] for IO error", shardId, generation), error);
+            logger.info(format("%s index not found, cannot fail BCC [%s] for %s", shardId, generation, reason), error);
             return;
         }
         IndexShard shard = indexService.getShard(shardId.id());
-        shard.failShard(format("%s failed to upload BCC [%s] due to IO error", shardId, generation), error);
+        shard.failShard(format("%s failed to upload BCC [%s] due to %s", shardId, generation, reason), error);
     }
 
     public boolean hasBccUploadInProgress(ShardId shardId) {

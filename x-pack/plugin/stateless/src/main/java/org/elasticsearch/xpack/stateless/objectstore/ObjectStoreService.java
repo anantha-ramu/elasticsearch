@@ -82,6 +82,7 @@ import org.elasticsearch.xpack.stateless.engine.PrimaryTermAndGeneration;
 import org.elasticsearch.xpack.stateless.lucene.BlobStoreCacheDirectory;
 import org.elasticsearch.xpack.stateless.lucene.SearchDirectory;
 
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -112,6 +113,8 @@ import java.util.function.ObjLongConsumer;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.zip.CRC32C;
+import java.util.zip.Checksum;
 
 import static org.elasticsearch.core.Strings.format;
 import static org.elasticsearch.xpack.stateless.commits.BlobFileRanges.computeBlobFileRanges;
@@ -147,6 +150,7 @@ public class ObjectStoreService extends AbstractLifecycleComponent implements Cl
         Setting.Property.ProjectScope
     );
     public static final int DELETE_BATCH_SIZE = 100;
+    private static final int VERIFICATION_BUFFER_SIZE = 64 * 1024;
 
     public enum ObjectStoreType {
         FS("location") {
@@ -316,6 +320,22 @@ public class ObjectStoreService extends AbstractLifecycleComponent implements Cl
         true,
         Setting.Property.NodeScope
     );
+
+    /**
+     * Read a batched compound commit back from the object store after uploading it and compare it against the bytes we meant to write,
+     * failing the upload if they differ. Nothing else reads a commit blob until a shard recovers from it, which can be days later, and by
+     * then the translog holding the same operations is long gone. Verifying here keeps the translog until the durable copy is known good.
+     * <p>
+     * This costs one extra read of the whole blob per upload, so it is off by default until the object stores can be asked to validate a
+     * checksum we supply at write time instead.
+     */
+    public static final Setting<Boolean> OBJECT_STORE_VERIFY_COMMIT_UPLOADS = Setting.boolSetting(
+        "stateless.object_store.verify_commit_uploads",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     public static final Setting<Boolean> CACHE_SEARCH_RECOVERY_BCC_ENABLED_SETTING = Setting.boolSetting(
         "stateless.search.cache_recovery_bcc.enabled",
         true,
@@ -388,6 +408,7 @@ public class ObjectStoreService extends AbstractLifecycleComponent implements Cl
 
     private final boolean concurrentMultipartUploads;
     private final boolean cacheSearchRecoveryBcc;
+    private volatile boolean verifyCommitUploads;
 
     private final long slowTranslogUploadLogThresholdMillis;
 
@@ -421,6 +442,8 @@ public class ObjectStoreService extends AbstractLifecycleComponent implements Cl
         this.permits = new Semaphore(0);
         this.concurrentMultipartUploads = OBJECT_STORE_CONCURRENT_MULTIPART_UPLOADS.get(settings);
         this.cacheSearchRecoveryBcc = CACHE_SEARCH_RECOVERY_BCC_ENABLED_SETTING.get(settings);
+        clusterService.getClusterSettings()
+            .initializeAndWatchIfRegistered(OBJECT_STORE_VERIFY_COMMIT_UPLOADS, value -> this.verifyCommitUploads = value);
         this.slowTranslogUploadLogThresholdMillis = OBJECT_STORE_SLOW_TRANSLOG_UPLOAD_LOG_THRESHOLD_SETTING.get(settings).getMillis();
     }
 
@@ -1589,6 +1612,17 @@ public class ObjectStoreService extends AbstractLifecycleComponent implements Cl
         }
     }
 
+    /**
+     * Thrown when a batched compound commit read back from the object store does not match the bytes that were uploaded. Distinguished
+     * from the other upload failures because retrying is worthwhile only while the cause is transient: a corruption we reproduce on every
+     * attempt is our own, and spinning on it holds the translog open indefinitely.
+     */
+    public static class UploadVerificationException extends IOException {
+        public UploadVerificationException(String message) {
+            super(message);
+        }
+    }
+
     // A wrapper for an InputStream that wraps any thrown IOExceptions as LocalIOExceptions
     static class LocalIOInputStream extends InputStream {
         InputStream delegate;
@@ -1783,6 +1817,9 @@ public class ObjectStoreService extends AbstractLifecycleComponent implements Cl
                         virtualBatchedCompoundCommit.decRef();
                     }
                 }
+                if (verifyCommitUploads) {
+                    verifyUploadedBlob(totalSizeInBytes);
+                }
                 if (isDebugEnabled) {
                     final long uploadIoMs = TimeValue.nsecToMSec(threadPool.relativeTimeInNanos() - uploadIoStartNanos);
                     logger.debug(
@@ -1811,6 +1848,98 @@ public class ObjectStoreService extends AbstractLifecycleComponent implements Cl
                     listener.onResponse(new BccUploadObjectStoreTiming(objectStoreQueueWaitMs, uploadIoMs));
                 }
             }
+        }
+
+        /**
+         * Compares the blob just written against the bytes it was written from, and throws if they differ. The source is re-read through
+         * the same verifying streams the single-part upload uses, so a mismatch that comes from a bad local file is reported as a local
+         * IO failure rather than as a verification failure.
+         */
+        private void verifyUploadedBlob(long totalSizeInBytes) throws IOException {
+            final String blobName = virtualBatchedCompoundCommit.getBlobName();
+            final long startNanos = threadPool.relativeTimeInNanos();
+
+            final long expectedChecksum;
+            try (var sourceStream = new LocalIOInputStream(virtualBatchedCompoundCommit.getFrozenInputStreamForUpload())) {
+                expectedChecksum = checksum(sourceStream);
+            }
+
+            final long storedChecksum;
+            final long storedLength;
+            try (var storedStream = new CountingInputStream(blobContainer.readBlob(OperationPurpose.INDICES, blobName))) {
+                storedChecksum = checksum(storedStream);
+                storedLength = storedStream.bytesRead();
+            }
+
+            if (storedLength != totalSizeInBytes || storedChecksum != expectedChecksum) {
+                final String message = format(
+                    "%s batched compound commit [%s] read back from %s does not match what was uploaded "
+                        + "[expectedLength=%s, storedLength=%s, expectedChecksum=%s, storedChecksum=%s]",
+                    shardId,
+                    generation,
+                    blobContainer.path().add(blobName),
+                    totalSizeInBytes,
+                    storedLength,
+                    expectedChecksum,
+                    storedChecksum
+                );
+                logger.warn(message);
+                throw new UploadVerificationException(message);
+            }
+
+            logger.debug(
+                () -> format(
+                    "%s batched compound commit [%s] verified in [%s] ms",
+                    shardId,
+                    generation,
+                    TimeValue.nsecToMSec(threadPool.relativeTimeInNanos() - startNanos)
+                )
+            );
+        }
+
+        private long checksum(InputStream stream) throws IOException {
+            final Checksum checksum = new CRC32C();
+            final byte[] buffer = new byte[VERIFICATION_BUFFER_SIZE];
+            int read;
+            while ((read = stream.read(buffer)) != -1) {
+                checksum.update(buffer, 0, read);
+            }
+            return checksum.getValue();
+        }
+    }
+
+    /**
+     * Counts the bytes read so that the length of a blob can be established from the same pass that checksums it, rather than from the
+     * length the object store reports for it.
+     */
+    private static class CountingInputStream extends FilterInputStream {
+
+        private long bytesRead = 0;
+
+        CountingInputStream(InputStream in) {
+            super(in);
+        }
+
+        @Override
+        public int read() throws IOException {
+            final int read = super.read();
+            if (read != -1) {
+                bytesRead += 1;
+            }
+            return read;
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            final int read = super.read(b, off, len);
+            if (read != -1) {
+                bytesRead += read;
+            }
+            return read;
+        }
+
+        long bytesRead() {
+            return bytesRead;
         }
     }
 
