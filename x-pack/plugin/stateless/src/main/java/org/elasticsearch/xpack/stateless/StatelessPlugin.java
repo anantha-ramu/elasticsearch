@@ -52,6 +52,7 @@ import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.BlobStore;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.breaker.NoopCircuitBreaker;
+import org.elasticsearch.common.component.LifecycleListener;
 import org.elasticsearch.common.io.stream.NamedWriteableRegistry;
 import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.settings.ClusterSettings;
@@ -237,6 +238,7 @@ import org.elasticsearch.xpack.stateless.reshard.TransportReshardAction;
 import org.elasticsearch.xpack.stateless.reshard.TransportReshardSplitAction;
 import org.elasticsearch.xpack.stateless.reshard.TransportUpdateSplitSourceShardStateAction;
 import org.elasticsearch.xpack.stateless.reshard.TransportUpdateSplitTargetShardStateAction;
+import org.elasticsearch.xpack.stateless.snapshots.SnapshotBacklogTracker;
 import org.elasticsearch.xpack.stateless.snapshots.SnapshotsCommitService;
 import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings;
 import org.elasticsearch.xpack.stateless.snapshots.TransportGetShardSnapshotCommitInfoAction;
@@ -551,6 +553,7 @@ public class StatelessPlugin extends Plugin
     private final SetOnce<PITRelocationService> pitRelocationService = new SetOnce<>();
     private final SetOnce<List<StatelessExtensionProvider>> statelessServicesConsumerProviders = new SetOnce<>();
     private final SetOnce<SnapshotsCommitService> snapshotsCommitServiceRef = new SetOnce<>();
+    private final SetOnce<SnapshotBacklogTracker> snapshotBacklogTrackerRef = new SetOnce<>(); // only set on index nodes
     private final SetOnce<StatelessMemoryMetricsService> statelessMemoryMetricsService = new SetOnce<>();
     private final SetOnce<ShardsMappingSizeCollector> shardsMappingSizeCollector = new SetOnce<>();
     private final SetOnce<EstimatedHeapUsageRecoveryGate> estimatedHeapUsageRecoveryGate = new SetOnce<>();
@@ -595,6 +598,14 @@ public class StatelessPlugin extends Plugin
 
     public SnapshotsCommitService getSnapshotsCommitService() {
         return Objects.requireNonNull(this.snapshotsCommitServiceRef.get());
+    }
+
+    /**
+     * @return the tracker of the snapshot backlog, or {@code null} if this is not an index node
+     */
+    @Nullable
+    public SnapshotBacklogTracker getSnapshotBacklogTracker() {
+        return this.snapshotBacklogTrackerRef.get();
     }
 
     public Client getClient() {
@@ -916,6 +927,31 @@ public class StatelessPlugin extends Plugin
         );
         clusterService.addListener(snapshotsCommitService);
         components.add(snapshotsCommitService);
+
+        if (hasIndexRole) {
+            final var snapshotBacklogTracker = new SnapshotBacklogTracker(
+                clusterService,
+                indicesService,
+                commitService,
+                services.repositoriesService(),
+                threadPool,
+                meterRegistry
+            );
+            clusterService.addListener(snapshotBacklogTracker);
+            clusterService.addLifecycleListener(new LifecycleListener() {
+                @Override
+                public void afterStart() {
+                    snapshotBacklogTracker.start();
+                }
+
+                @Override
+                public void beforeStop() {
+                    snapshotBacklogTracker.stop();
+                }
+            });
+            this.snapshotBacklogTrackerRef.set(snapshotBacklogTracker);
+            components.add(snapshotBacklogTracker);
+        }
 
         var closedShardService = new ClosedShardService();
         components.add(closedShardService);
