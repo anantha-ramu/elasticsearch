@@ -935,7 +935,6 @@ public class StatelessPlugin extends Plugin
                 clusterService,
                 client,
                 indicesService,
-                commitService,
                 services.repositoriesService(),
                 threadPool,
                 meterRegistry
