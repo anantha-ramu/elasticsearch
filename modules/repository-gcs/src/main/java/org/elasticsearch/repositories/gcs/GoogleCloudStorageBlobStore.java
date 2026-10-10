@@ -611,7 +611,7 @@ class GoogleCloudStorageBlobStore implements BlobStore {
     /**
      * Uploads a blob using the "multipart upload" method (a single
      * 'multipart/related' request containing both data and metadata. The request is
-     * gziped), see:
+     * gzipped, except for {@link OperationPurpose#SNAPSHOT_DATA} which is already compressed), see:
      * https://cloud.google.com/storage/docs/json_api/v1/how-tos/multipart-upload
      * @param purpose the operation purpose
      * @param blobInfo the info for the blob to be uploaded
@@ -630,9 +630,14 @@ class GoogleCloudStorageBlobStore implements BlobStore {
     ) throws IOException {
         assert blobSize <= getLargeBlobThresholdInBytes() : "large blob uploads should use the resumable upload method";
         try {
-            final Storage.BlobTargetOption[] targetOptions = failIfAlreadyExists
-                ? new Storage.BlobTargetOption[] { Storage.BlobTargetOption.doesNotExist() }
-                : new Storage.BlobTargetOption[0];
+            final var options = new ArrayList<Storage.BlobTargetOption>(2);
+            if (failIfAlreadyExists) {
+                options.add(Storage.BlobTargetOption.doesNotExist());
+            }
+            if (purpose == OperationPurpose.SNAPSHOT_DATA) {
+                options.add(Storage.BlobTargetOption.disableGzipContent());
+            }
+            final Storage.BlobTargetOption[] targetOptions = options.toArray(new Storage.BlobTargetOption[0]);
             client().meteredCreate(purpose, blobInfo, buffer, offset, blobSize, targetOptions);
         } catch (final StorageException se) {
             if (failIfAlreadyExists && se.getCode() == HTTP_PRECON_FAILED) {

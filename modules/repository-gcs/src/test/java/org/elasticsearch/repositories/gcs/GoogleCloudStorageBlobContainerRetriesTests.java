@@ -370,6 +370,41 @@ public class GoogleCloudStorageBlobContainerRetriesTests extends AbstractBlobCon
         assertThat(countDown.isCountedDown(), is(true));
     }
 
+    public void testWriteBlobGzipDependsOnPurpose() throws Exception {
+        final BlobContainer blobContainer = blobContainerBuilder().build();
+        final byte[] bytes = randomBlobContent(0);
+        final var contentEncodings = new ConcurrentHashMap<String, String>();
+        httpServer.createContext("/upload/storage/v1/b/bucket/o", safeHandler(exchange -> {
+            assertThat(exchange.getRequestURI().getQuery(), containsString("uploadType=multipart"));
+            final var multipartUpload = MultipartUpload.parseBody(exchange, exchange.getRequestBody());
+            contentEncodings.put(multipartUpload.name(), String.valueOf(exchange.getRequestHeaders().getFirst("Content-Encoding")));
+            assertEquals(new BytesArray(bytes), multipartUpload.content());
+            final byte[] response = Strings.format("""
+                {"bucket":"bucket","name":"%s"}
+                """, multipartUpload.name()).getBytes(UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
+            exchange.getResponseBody().write(response);
+        }));
+
+        for (OperationPurpose purpose : OperationPurpose.values()) {
+            final String blobName = "write_blob_" + purpose.getKey();
+            final boolean failIfAlreadyExists = randomBoolean();
+            if (randomBoolean()) {
+                try (InputStream stream = new InputStreamIndexInput(new ByteArrayIndexInput("desc", bytes), bytes.length)) {
+                    blobContainer.writeBlob(purpose, blobName, stream, bytes.length, failIfAlreadyExists);
+                }
+            } else {
+                blobContainer.writeBlob(purpose, blobName, new BytesArray(bytes), failIfAlreadyExists);
+            }
+            assertEquals(
+                "unexpected Content-Encoding for " + purpose,
+                purpose == OperationPurpose.SNAPSHOT_DATA ? "null" : "gzip",
+                contentEncodings.get(blobContainer.path().buildAsString() + blobName)
+            );
+        }
+    }
+
     public void testWriteBlobWithReadTimeouts() {
         final byte[] bytes = randomByteArrayOfLength(randomIntBetween(10, 128));
         final TimeValue readTimeout = TimeValue.timeValueMillis(randomIntBetween(100, 500));
