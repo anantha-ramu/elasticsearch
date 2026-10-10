@@ -34,8 +34,8 @@ public record MultipartUpload(
     /**
      * Reads HTTP content of MultipartUpload. First part is always json metadata, followed by binary parts.
      */
-    public static MultipartUpload parseBody(HttpExchange exchange, InputStream gzipInput) throws IOException {
-        final var reader = MultipartContent.Reader.readGzipStream(exchange, gzipInput);
+    public static MultipartUpload parseBody(HttpExchange exchange, InputStream body) throws IOException {
+        final var reader = MultipartContent.Reader.readRequestBody(exchange, body);
 
         // read first body-part - blob metadata json
         final var firstPart = reader.next();
