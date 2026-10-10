@@ -116,12 +116,12 @@ public class MultipartContent {
             this.delimiter = delimiter;
         }
 
-        public static Reader readGzipStream(HttpExchange exchange, InputStream gzipInput) throws IOException {
-            return readGzipStream(getBoundary(exchange), gzipInput);
-        }
-
-        public static Reader readGzipStream(String boundary, InputStream gzipInput) throws IOException {
-            return readStream(boundary, new GZIPInputStream(gzipInput));
+        /**
+         * Reads a request body, decompressing it first if the request has {@code Content-Encoding: gzip}.
+         */
+        public static Reader readRequestBody(HttpExchange exchange, InputStream body) throws IOException {
+            final var contentEncoding = exchange.getRequestHeaders().getFirst("Content-Encoding");
+            return readStream(getBoundary(exchange), "gzip".equalsIgnoreCase(contentEncoding) ? new GZIPInputStream(body) : body);
         }
 
         public static String getBoundary(HttpExchange exchange) {

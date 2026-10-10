@@ -742,6 +742,7 @@ public class GoogleCloudStorageHttpHandlerTests extends ESTestCase {
         // multipart upload is required to provide boundary header
         var boundary = newMultipartBoundary();
         headers.put("Content-Type", List.of("multipart/related; boundary=" + boundary));
+        headers.put("Content-Encoding", List.of("gzip"));
         return handleRequest(
             handler,
             "POST",
