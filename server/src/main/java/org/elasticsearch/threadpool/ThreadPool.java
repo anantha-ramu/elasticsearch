@@ -745,6 +745,19 @@ public class ThreadPool implements ReportingService<ThreadPoolInfo>, Scheduler, 
         return getMaxSnapshotUploadThreadPoolSize(allocatedProcessors, maxHeapSize, OsProbe.getInstance().getTotalPhysicalMemorySize());
     }
 
+    /**
+     * Experimental: the size of the {@link Names#SNAPSHOT_UPLOAD} pool, which is big enough for the most that
+     * {@code indices.recovery.upload_concurrency.fixed} can ask for, {@link #XLARGE_NODE_SNAPSHOT_UPLOAD_CONCURRENCY}, on every node with
+     * enough heap for it, whatever its memory. Threads are only started when they are needed.
+     */
+    public static int getMaxSnapshotUploadThreadPoolSizeForFixedConcurrency(int allocatedProcessors) {
+        final int size = getMaxSnapshotUploadThreadPoolSize(allocatedProcessors);
+        final ByteSizeValue maxHeapSize = ByteSizeValue.ofBytes(Runtime.getRuntime().maxMemory());
+        return maxHeapSize.compareTo(ByteSizeValue.of(750, ByteSizeUnit.MB)) < 0
+            ? size
+            : Math.max(size, XLARGE_NODE_SNAPSHOT_UPLOAD_CONCURRENCY);
+    }
+
     static int getMaxSnapshotUploadThreadPoolSize(int allocatedProcessors, final ByteSizeValue maxHeapSize, long totalMemoryBytes) {
         final int snapshotPoolSize = getMaxSnapshotThreadPoolSize(allocatedProcessors, maxHeapSize);
         if (maxHeapSize.compareTo(ByteSizeValue.of(750, ByteSizeUnit.MB)) < 0) {

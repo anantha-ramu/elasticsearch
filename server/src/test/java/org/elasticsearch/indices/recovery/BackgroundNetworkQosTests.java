@@ -47,6 +47,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.elasticsearch.indices.recovery.BackgroundNetworkQos.ADAPTIVE_UPLOAD_CONCURRENCY_ENABLED_SETTING;
 import static org.elasticsearch.indices.recovery.BackgroundNetworkQos.BACKGROUND_QOS_ENABLED_SETTING;
 import static org.elasticsearch.indices.recovery.BackgroundNetworkQos.MIN_FLOOR_BYTES_PER_SEC;
+import static org.elasticsearch.indices.recovery.BackgroundNetworkQos.UPLOAD_CONCURRENCY_FIXED_SETTING;
 import static org.elasticsearch.indices.recovery.BackgroundNetworkQos.UPLOAD_CONCURRENCY_INTERVAL_TICKS;
 import static org.elasticsearch.indices.recovery.BackgroundNetworkQos.UPLOAD_CONCURRENCY_MAX_SETTING;
 import static org.elasticsearch.indices.recovery.BackgroundNetworkQos.applyOperatorMax;
@@ -1022,6 +1023,104 @@ public class BackgroundNetworkQosTests extends ESTestCase {
         } finally {
             terminate(largeThreadPool);
         }
+    }
+
+    public void testFixedUploadConcurrency() {
+        assertThat(UPLOAD_CONCURRENCY_FIXED_SETTING.get(Settings.EMPTY), equalTo(0));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> UPLOAD_CONCURRENCY_FIXED_SETTING.get(Settings.builder().put(UPLOAD_CONCURRENCY_FIXED_SETTING.getKey(), 41).build())
+        );
+
+        // a node with the target of a 64GiB node
+        final ThreadPool xlargeThreadPool = new TestThreadPool(
+            getTestName() + "-xlarge",
+            Settings.builder()
+                .put("thread_pool.snapshot.core", 1)
+                .put("thread_pool.snapshot.max", 10)
+                .put("thread_pool.snapshot_upload.core", 1)
+                .put("thread_pool.snapshot_upload.max", 40)
+                .build()
+        );
+        try {
+            final TestNode node = new TestNode(Settings.EMPTY, true, xlargeThreadPool);
+            final int fixed = randomIntBetween(11, 40);
+            // in one update, in either order of effect: the budget is the fixed number from the start
+            node.apply(
+                Settings.builder()
+                    .put(ADAPTIVE_UPLOAD_CONCURRENCY_ENABLED_SETTING.getKey(), true)
+                    .put(UPLOAD_CONCURRENCY_FIXED_SETTING.getKey(), fixed)
+                    .put(UPLOAD_CONCURRENCY_MAX_SETTING.getKey(), randomIntBetween(1, 40))
+                    .build()
+            );
+            assertThat(node.qos.getUploadBudget(), equalTo(fixed));
+            assertThat(node.qos.getUploadConcurrencyCeiling(), equalTo(40));
+
+            // no back-off for cpu pressure, throttling or errors, and nothing to recover from
+            node.probes.cpuPressure.set(new CgroupV2Probe.CpuPressure(2_000_000L));
+            node.probes.cpuThrottling.set(new CgroupV2Probe.CpuThrottling(1_000_000L, 1_000_000L));
+            node.qos.onUploadWriteError();
+            node.qos.onUploadReadError();
+            for (int i = 0; i < 4; i++) {
+                runUploadConcurrencyInterval(node);
+                assertThat(node.qos.getUploadBudget(), equalTo(fixed));
+            }
+            node.probes.cpuPressure.set(null);
+            runUploadConcurrencyInterval(node);
+            assertThat(node.qos.getUploadBudget(), equalTo(fixed));
+
+            // changed while on
+            node.apply(
+                Settings.builder()
+                    .put(ADAPTIVE_UPLOAD_CONCURRENCY_ENABLED_SETTING.getKey(), true)
+                    .put(UPLOAD_CONCURRENCY_FIXED_SETTING.getKey(), 10)
+                    .build()
+            );
+            assertThat(node.qos.getUploadBudget(), equalTo(10));
+            node.apply(
+                Settings.builder()
+                    .put(ADAPTIVE_UPLOAD_CONCURRENCY_ENABLED_SETTING.getKey(), true)
+                    .put(UPLOAD_CONCURRENCY_FIXED_SETTING.getKey(), 40)
+                    .build()
+            );
+            assertThat(node.qos.getUploadBudget(), equalTo(40));
+
+            // switched off and on again, and the adaptive setting applied after the fixed one
+            node.apply(Settings.builder().put(UPLOAD_CONCURRENCY_FIXED_SETTING.getKey(), 25).build());
+            node.apply(
+                Settings.builder()
+                    .put(UPLOAD_CONCURRENCY_FIXED_SETTING.getKey(), 25)
+                    .put(ADAPTIVE_UPLOAD_CONCURRENCY_ENABLED_SETTING.getKey(), true)
+                    .build()
+            );
+            assertThat(node.qos.getUploadBudget(), equalTo(25));
+
+            // 0 gives the controller back, which starts from today's concurrency
+            node.apply(adaptive(true));
+            assertThat(node.qos.getUploadBudget(), equalTo(10));
+            node.probes.cpuPressure.set(new CgroupV2Probe.CpuPressure(0L));
+            node.probes.cpuThrottling.set(new CgroupV2Probe.CpuThrottling(0L, 0L));
+            runUploadConcurrencyInterval(node);
+            runUploadConcurrencyInterval(node);
+            assertThat(node.qos.getUploadBudget(), equalTo(11));
+        } finally {
+            terminate(xlargeThreadPool);
+        }
+    }
+
+    public void testFixedUploadConcurrencyIsLimitedByThePool() {
+        final TestNode node = new TestNode(Settings.EMPTY);
+        final int nodeCeiling = Math.max(
+            threadPool.info(ThreadPool.Names.SNAPSHOT).getMax(),
+            threadPool.info(ThreadPool.Names.SNAPSHOT_UPLOAD).getMax()
+        );
+        node.apply(
+            Settings.builder()
+                .put(ADAPTIVE_UPLOAD_CONCURRENCY_ENABLED_SETTING.getKey(), true)
+                .put(UPLOAD_CONCURRENCY_FIXED_SETTING.getKey(), nodeCeiling + 1)
+                .build()
+        );
+        assertThat(node.qos.getUploadBudget(), equalTo(nodeCeiling));
     }
 
     private static void runUploadConcurrencyInterval(TestNode node) {

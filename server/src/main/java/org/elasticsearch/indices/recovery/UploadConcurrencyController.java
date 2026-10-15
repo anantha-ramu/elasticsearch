@@ -37,6 +37,9 @@ import java.util.OptionalLong;
  * cannot be observed stays at today's concurrency. How long write tasks queue is deliberately not a signal: it is available as the
  * {@code es.thread_pool.write.queue.latency.histogram} metric. Throughput is not a signal either. Not thread-safe: called from a single
  * periodic task.
+ * <p>
+ * A fixed target (experimental, see {@code indices.recovery.upload_concurrency.fixed}) switches all of that off: the target is that
+ * number, whatever the pressure, the errors or the ceiling.
  */
 class UploadConcurrencyController {
 
@@ -68,6 +71,8 @@ class UploadConcurrencyController {
     private final int floor;
     private int ceiling;
 
+    // 0 unless the target is fixed
+    private int fixedTarget;
     private int target;
     private int cooldownRemaining;
     private Decision lastDecision;
@@ -85,9 +90,26 @@ class UploadConcurrencyController {
      * Go back to the floor and forget any cooldown.
      */
     void reset() {
-        target = floor;
         cooldownRemaining = 0;
-        lastDecision = new Decision(floor, "reset", "start at floor");
+        if (fixedTarget > 0) {
+            target = fixedTarget;
+            lastDecision = new Decision(target, "fixed", "fixed upload concurrency " + target + ", no cpu back-off");
+        } else {
+            target = floor;
+            lastDecision = new Decision(floor, "reset", "start at floor");
+        }
+    }
+
+    /**
+     * Runs exactly this many uploads, with no back-off and no recovery, until set to 0, which goes back to the floor.
+     */
+    void setFixedTarget(int fixedTarget) {
+        this.fixedTarget = Math.max(0, fixedTarget);
+        reset();
+    }
+
+    int getFixedTarget() {
+        return fixedTarget;
     }
 
     int getTarget() {
@@ -118,6 +140,11 @@ class UploadConcurrencyController {
      * Decides the target for the next interval from what happened in the last one.
      */
     Decision onInterval(Signals signals) {
+        if (fixedTarget > 0) {
+            target = fixedTarget;
+            lastDecision = new Decision(target, "fixed", "fixed upload concurrency " + target + ", no cpu back-off");
+            return lastDecision;
+        }
         final boolean coolingDown = cooldownRemaining > 0;
         if (coolingDown) {
             cooldownRemaining--;

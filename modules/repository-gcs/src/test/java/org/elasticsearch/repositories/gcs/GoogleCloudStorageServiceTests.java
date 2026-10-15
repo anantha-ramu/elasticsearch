@@ -39,6 +39,7 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.util.Base64;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 
 import javax.net.ssl.SSLException;
@@ -142,7 +143,12 @@ public class GoogleCloudStorageServiceTests extends ESTestCase {
         final Settings settings2 = Settings.builder().setSecureSettings(secureSettings2).build();
         final var pluginServices = mock(Plugin.PluginServices.class);
         when(pluginServices.clusterService()).thenReturn(
-            ClusterServiceUtils.createClusterService(new DeterministicTaskQueue().getThreadPool())
+            ClusterServiceUtils.createClusterService(
+                new DeterministicTaskQueue().getThreadPool(),
+                ProjectId.DEFAULT,
+                Settings.EMPTY,
+                Set.of(GoogleCloudStorageService.SNAPSHOT_DATA_GZIP_ENABLED_SETTING)
+            )
         );
         when(pluginServices.projectResolver()).thenReturn(TestProjectResolvers.DEFAULT_PROJECT_ONLY);
         try (GoogleCloudStoragePlugin plugin = new GoogleCloudStoragePlugin(settings1)) {
@@ -186,7 +192,12 @@ public class GoogleCloudStorageServiceTests extends ESTestCase {
         final Settings settings = Settings.builder().setSecureSettings(secureSettings1).build();
         final var pluginServices = mock(Plugin.PluginServices.class);
         when(pluginServices.clusterService()).thenReturn(
-            ClusterServiceUtils.createClusterService(new DeterministicTaskQueue().getThreadPool())
+            ClusterServiceUtils.createClusterService(
+                new DeterministicTaskQueue().getThreadPool(),
+                ProjectId.DEFAULT,
+                Settings.EMPTY,
+                Set.of(GoogleCloudStorageService.SNAPSHOT_DATA_GZIP_ENABLED_SETTING)
+            )
         );
         when(pluginServices.projectResolver()).thenReturn(TestProjectResolvers.DEFAULT_PROJECT_ONLY);
         try (GoogleCloudStoragePlugin plugin = new GoogleCloudStoragePlugin(settings)) {

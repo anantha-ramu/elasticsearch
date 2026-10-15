@@ -611,7 +611,8 @@ class GoogleCloudStorageBlobStore implements BlobStore {
     /**
      * Uploads a blob using the "multipart upload" method (a single
      * 'multipart/related' request containing both data and metadata. The request is
-     * gzipped, except for {@link OperationPurpose#SNAPSHOT_DATA} which is already compressed), see:
+     * gzipped, except for {@link OperationPurpose#SNAPSHOT_DATA} while
+     * {@link GoogleCloudStorageService#SNAPSHOT_DATA_GZIP_ENABLED_SETTING} is off, as it is already compressed), see:
      * https://cloud.google.com/storage/docs/json_api/v1/how-tos/multipart-upload
      * @param purpose the operation purpose
      * @param blobInfo the info for the blob to be uploaded
@@ -634,7 +635,7 @@ class GoogleCloudStorageBlobStore implements BlobStore {
             if (failIfAlreadyExists) {
                 options.add(Storage.BlobTargetOption.doesNotExist());
             }
-            if (purpose == OperationPurpose.SNAPSHOT_DATA) {
+            if (purpose == OperationPurpose.SNAPSHOT_DATA && storageService.isSnapshotDataGzipEnabled() == false) {
                 options.add(Storage.BlobTargetOption.disableGzipContent());
             }
             final Storage.BlobTargetOption[] targetOptions = options.toArray(new Storage.BlobTargetOption[0]);

@@ -34,6 +34,7 @@ import org.elasticsearch.cluster.project.ProjectResolver;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.settings.ProjectSecrets;
+import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.Maps;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
@@ -66,9 +67,22 @@ import static org.elasticsearch.core.Strings.format;
 public class GoogleCloudStorageService {
 
     private static final Logger logger = LogManager.getLogger(GoogleCloudStorageService.class);
+
+    /**
+     * Whether the GCS client gzips snapshot data in multipart uploads, which are blobs of up to 5MiB. It is already compressed, so this
+     * only costs CPU. Read for every upload, so it applies to repositories that are already registered.
+     */
+    public static final Setting<Boolean> SNAPSHOT_DATA_GZIP_ENABLED_SETTING = Setting.boolSetting(
+        "repository.gcs.snapshot_data_gzip.enabled",
+        true,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
     private final GoogleCloudStorageClientsManager clientsManager;
 
     private final boolean isServerless;
+    private volatile boolean snapshotDataGzipEnabled = SNAPSHOT_DATA_GZIP_ENABLED_SETTING.getDefault(Settings.EMPTY);
 
     public GoogleCloudStorageService(ClusterService clusterService, ProjectResolver projectResolver) {
         final Settings nodeSettings = clusterService.getSettings();
@@ -81,6 +95,17 @@ public class GoogleCloudStorageService {
 
     public boolean isServerless() {
         return isServerless;
+    }
+
+    /**
+     * @return whether snapshot data in multipart uploads is gzipped, see {@link #SNAPSHOT_DATA_GZIP_ENABLED_SETTING}
+     */
+    public boolean isSnapshotDataGzipEnabled() {
+        return snapshotDataGzipEnabled;
+    }
+
+    void setSnapshotDataGzipEnabled(boolean enabled) {
+        this.snapshotDataGzipEnabled = enabled;
     }
 
     /**

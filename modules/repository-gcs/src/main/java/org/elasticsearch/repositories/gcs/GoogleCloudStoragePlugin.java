@@ -75,7 +75,10 @@ public class GoogleCloudStoragePlugin extends Plugin implements RepositoryPlugin
     @Override
     public Collection<?> createComponents(PluginServices services) {
         final ClusterService clusterService = services.clusterService();
-        storageService.set(createStorageService(clusterService, services.projectResolver()));
+        final GoogleCloudStorageService service = createStorageService(clusterService, services.projectResolver());
+        storageService.set(service);
+        clusterService.getClusterSettings()
+            .initializeAndWatch(GoogleCloudStorageService.SNAPSHOT_DATA_GZIP_ENABLED_SETTING, service::setSnapshotDataGzipEnabled);
         // eagerly load client settings so that secure settings are readable (not closed)
         reload(settings);
         return List.of(storageService.get());
@@ -97,7 +100,8 @@ public class GoogleCloudStoragePlugin extends Plugin implements RepositoryPlugin
             GoogleCloudStorageClientSettings.MAX_RETRIES_SETTING,
             GoogleCloudStorageClientSettings.MEGABYTES_COPIED_PER_CHUNK_SETTING,
             GoogleCloudStorageClientSettings.GCS_TENACIOUS_RETRIES_ENABLED_SETTING,
-            GoogleCloudStorageClientSettings.RESUMABLE_WRITE_BUFFER_SIZE_SETTING
+            GoogleCloudStorageClientSettings.RESUMABLE_WRITE_BUFFER_SIZE_SETTING,
+            GoogleCloudStorageService.SNAPSHOT_DATA_GZIP_ENABLED_SETTING
         );
     }
 
