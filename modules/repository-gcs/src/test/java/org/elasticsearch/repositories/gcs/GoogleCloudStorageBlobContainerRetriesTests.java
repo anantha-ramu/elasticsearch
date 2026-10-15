@@ -116,6 +116,7 @@ public class GoogleCloudStorageBlobContainerRetriesTests extends AbstractBlobCon
     private final ClusterService clusterService = ClusterServiceUtils.createClusterService(new DeterministicTaskQueue().getThreadPool());
     private final Map<String, AtomicInteger> requestCounters = new ConcurrentHashMap<>();
     private String endpointUrlOverride;
+    private boolean snapshotDataGzipEnabled = true;
 
     private String httpServerUrl() {
         assertThat(httpServer, notNullValue());
@@ -217,6 +218,7 @@ public class GoogleCloudStorageBlobContainerRetriesTests extends AbstractBlobCon
             }
         };
         service.refreshAndClearCache(GoogleCloudStorageClientSettings.load(clientSettings.build()));
+        service.setSnapshotDataGzipEnabled(snapshotDataGzipEnabled);
 
         httpServer.createContext("/token", new FakeOAuth2HttpHandler());
         final GoogleCloudStorageBlobStore blobStore = new GoogleCloudStorageBlobStore(
@@ -370,8 +372,15 @@ public class GoogleCloudStorageBlobContainerRetriesTests extends AbstractBlobCon
         assertThat(countDown.isCountedDown(), is(true));
     }
 
-    public void testWriteBlobGzipDependsOnPurpose() throws Exception {
-        final BlobContainer blobContainer = blobContainerBuilder().build();
+    public void testWriteBlobGzipDependsOnPurposeWhileSnapshotDataGzipIsOff() throws Exception {
+        assertWriteBlobGzip(false);
+    }
+
+    public void testWriteBlobGzipForAllPurposesWhileSnapshotDataGzipIsOn() throws Exception {
+        assertWriteBlobGzip(true);
+    }
+
+    private void assertWriteBlobGzip(boolean gzipEnabled) throws Exception {
         final byte[] bytes = randomBlobContent(0);
         final var contentEncodings = new ConcurrentHashMap<String, String>();
         httpServer.createContext("/upload/storage/v1/b/bucket/o", safeHandler(exchange -> {
@@ -387,6 +396,8 @@ public class GoogleCloudStorageBlobContainerRetriesTests extends AbstractBlobCon
             exchange.getResponseBody().write(response);
         }));
 
+        snapshotDataGzipEnabled = gzipEnabled;
+        final BlobContainer blobContainer = blobContainerBuilder().build();
         for (OperationPurpose purpose : OperationPurpose.values()) {
             final String blobName = "write_blob_" + purpose.getKey();
             final boolean failIfAlreadyExists = randomBoolean();
@@ -398,8 +409,8 @@ public class GoogleCloudStorageBlobContainerRetriesTests extends AbstractBlobCon
                 blobContainer.writeBlob(purpose, blobName, new BytesArray(bytes), failIfAlreadyExists);
             }
             assertEquals(
-                "unexpected Content-Encoding for " + purpose,
-                purpose == OperationPurpose.SNAPSHOT_DATA ? "null" : "gzip",
+                "unexpected Content-Encoding for " + purpose + " with snapshot data gzip " + gzipEnabled,
+                purpose == OperationPurpose.SNAPSHOT_DATA && gzipEnabled == false ? "null" : "gzip",
                 contentEncodings.get(blobContainer.path().buildAsString() + blobName)
             );
         }

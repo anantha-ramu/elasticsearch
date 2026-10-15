@@ -48,7 +48,8 @@ public class GoogleCloudStoragePluginTests extends ESTestCase {
                 "gcs.client.*.max_retries",
                 "gcs.client.*.megabytes_copied_per_chunk",
                 "gcs.client.*.tenacious_retries.enabled",
-                "gcs.client.*.resumable_write_buffer_size"
+                "gcs.client.*.resumable_write_buffer_size",
+                "repository.gcs.snapshot_data_gzip.enabled"
             ),
             settings.stream().map(Setting::getKey).toList()
         );

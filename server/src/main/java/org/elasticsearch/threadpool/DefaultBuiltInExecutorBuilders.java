@@ -163,7 +163,10 @@ public class DefaultBuiltInExecutorBuilders implements BuiltInExecutorBuilders {
                 1,
                 // never smaller than the SNAPSHOT pool, whose size an operator may have raised, as uploads run on it when adaptive
                 // concurrency is off and need as many threads here when it is on
-                Math.max(ThreadPool.getMaxSnapshotUploadThreadPoolSize(allocatedProcessors), snapshotBuilder.getMaxThreads(settings)),
+                Math.max(
+                    ThreadPool.getMaxSnapshotUploadThreadPoolSizeForFixedConcurrency(allocatedProcessors),
+                    snapshotBuilder.getMaxThreads(settings)
+                ),
                 TimeValue.timeValueMinutes(5),
                 false
             )

@@ -112,6 +112,22 @@ public class BackgroundNetworkQos extends AbstractLifecycleComponent {
         Setting.Property.NodeScope
     );
 
+    /**
+     * Experimental: run exactly this many shard snapshot uploads at once, with no back-off for CPU pressure, throttling or upload errors
+     * and no recovery, ignoring {@link #UPLOAD_CONCURRENCY_MAX_SETTING}. 0, the default, keeps the controller's behaviour. Only applies
+     * while {@link #ADAPTIVE_UPLOAD_CONCURRENCY_ENABLED_SETTING} is on, and is limited by the size of the
+     * {@link ThreadPool.Names#SNAPSHOT_UPLOAD} pool. Takes effect at once, whichever of the two settings is changed last. The effective
+     * number is the target in the status line.
+     */
+    public static final Setting<Integer> UPLOAD_CONCURRENCY_FIXED_SETTING = Setting.intSetting(
+        "indices.recovery.upload_concurrency.fixed",
+        0,
+        0,
+        40,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
     /** Today's minimum recovery rate, see {@link RecoverySettings}. */
     static final long MIN_FLOOR_BYTES_PER_SEC = ByteSizeValue.of(40, ByteSizeUnit.MB).getBytes();
     /** Today's fraction of the bandwidth given to recoveries, see {@link RecoverySettings}. */
@@ -173,6 +189,7 @@ public class BackgroundNetworkQos extends AbstractLifecycleComponent {
     private volatile boolean backgroundQosEnabled;
     private volatile boolean adaptiveUploadConcurrencyEnabled;
     private volatile int uploadConcurrencyMax;
+    private volatile int uploadConcurrencyFixed;
     private final int nodeUploadConcurrencyCeiling;
     // The node-wide budget: how many tasks the runners may run at once while adaptive upload concurrency is on, set by the controller
     private volatile int uploadBudget;
@@ -253,9 +270,43 @@ public class BackgroundNetworkQos extends AbstractLifecycleComponent {
         this.uploadConcurrencyController = new UploadConcurrencyController(floor, nodeUploadConcurrencyCeiling);
 
         clusterSettings.initializeAndWatch(UPLOAD_CONCURRENCY_MAX_SETTING, max -> this.uploadConcurrencyMax = max);
-        uploadConcurrencyController.setCeiling(Math.min(uploadConcurrencyMax, nodeUploadConcurrencyCeiling));
+        uploadConcurrencyController.setCeiling(uploadCeiling());
+        clusterSettings.initializeAndWatch(UPLOAD_CONCURRENCY_FIXED_SETTING, this::setUploadConcurrencyFixed);
         clusterSettings.initializeAndWatch(BACKGROUND_QOS_ENABLED_SETTING, this::setBackgroundQosEnabled);
         clusterSettings.initializeAndWatch(ADAPTIVE_UPLOAD_CONCURRENCY_ENABLED_SETTING, this::setAdaptiveUploadConcurrencyEnabled);
+    }
+
+    /**
+     * The most uploads the controller's target may reach: what the setting and the node's size allow, or, for a fixed number of uploads,
+     * what the node's size allows.
+     */
+    private int uploadCeiling() {
+        return uploadConcurrencyFixed > 0 ? nodeUploadConcurrencyCeiling : Math.min(uploadConcurrencyMax, nodeUploadConcurrencyCeiling);
+    }
+
+    private void setUploadConcurrencyFixed(int fixed) {
+        // serialized with the tick and with the switch, so that the budget is the fixed number of uploads whichever of the two settings
+        // is applied last, also when both change in one update
+        synchronized (lock) {
+            this.uploadConcurrencyFixed = fixed;
+            if (fixed > nodeUploadConcurrencyCeiling) {
+                logger.warn(
+                    "[{}] is [{}] but this node's snapshot upload pool only has [{}] threads, so it runs that many",
+                    UPLOAD_CONCURRENCY_FIXED_SETTING.getKey(),
+                    fixed,
+                    nodeUploadConcurrencyCeiling
+                );
+            }
+            uploadConcurrencyController.setFixedTarget(Math.min(fixed, nodeUploadConcurrencyCeiling));
+            final int previousCeiling = uploadConcurrencyController.getCeiling();
+            uploadConcurrencyController.setCeiling(uploadCeiling());
+            if (adaptiveUploadConcurrencyEnabled) {
+                if (uploadConcurrencyController.getCeiling() != previousCeiling) {
+                    applyUploadTaskRunnerCap();
+                }
+                setUploadBudget(uploadConcurrencyController.getTarget());
+            }
+        }
     }
 
     private void setBackgroundQosEnabled(boolean enabled) {
@@ -272,9 +323,10 @@ public class BackgroundNetworkQos extends AbstractLifecycleComponent {
             // off: do not leave the adaptive target in place until the next interval. On: start from today's concurrency.
             trackingInterval = false;
             uploadConcurrencyController.reset();
-            uploadBudget = uploadConcurrencyController.getFloor();
+            // the floor, or the fixed number of uploads if there is one
+            uploadBudget = uploadConcurrencyController.getTarget();
             // the setting may have changed while nothing was looking
-            uploadConcurrencyController.setCeiling(Math.min(uploadConcurrencyMax, nodeUploadConcurrencyCeiling));
+            uploadConcurrencyController.setCeiling(uploadCeiling());
             // what waited for the budget before is not waiting for this one: applying the caps makes the runners try, and wait again
             synchronized (waitingUploadTaskRunners) {
                 waitingUploadTaskRunners.clear();
@@ -686,7 +738,7 @@ public class BackgroundNetworkQos extends AbstractLifecycleComponent {
 
         // the setting may have changed
         final int previousCeiling = uploadConcurrencyController.getCeiling();
-        uploadConcurrencyController.setCeiling(Math.min(uploadConcurrencyMax, nodeUploadConcurrencyCeiling));
+        uploadConcurrencyController.setCeiling(uploadCeiling());
         if (uploadConcurrencyController.getCeiling() != previousCeiling) {
             applyUploadTaskRunnerCap();
         }

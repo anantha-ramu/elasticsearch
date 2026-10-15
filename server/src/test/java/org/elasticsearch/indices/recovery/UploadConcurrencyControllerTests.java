@@ -71,6 +71,37 @@ public class UploadConcurrencyControllerTests extends ESTestCase {
         expectThrows(IllegalArgumentException.class, () -> new UploadConcurrencyController(10, 9));
     }
 
+    public void testFixedTargetIgnoresEverythingButTheNumber() {
+        final int fixed = randomIntBetween(1, 2 * CEILING);
+        controller.setFixedTarget(fixed);
+        assertThat(controller.getFixedTarget(), equalTo(fixed));
+        assertThat(controller.getTarget(), equalTo(fixed));
+        assertThat(controller.getLastDecision().action(), equalTo("fixed"));
+        final Signals[] signals = {
+            quiet(),
+            contended(),
+            erroring(),
+            withCpu(quiet(), OptionalDouble.empty(), OptionalLong.empty()),
+            withCpu(quiet(), OptionalDouble.of(0.5), OptionalLong.of(TimeUnit.SECONDS.toMicros(5))) };
+        for (int i = 0; i < 20; i++) {
+            final Decision decision = controller.onInterval(randomFrom(signals));
+            assertThat(decision.action(), equalTo("fixed"));
+            assertThat(decision.target(), equalTo(fixed));
+            assertThat(controller.getTarget(), equalTo(fixed));
+        }
+        controller.setCeiling(FLOOR);
+        assertThat(controller.onInterval(quiet()).target(), equalTo(fixed));
+        controller.reset();
+        assertThat(controller.getTarget(), equalTo(fixed));
+
+        // 0 gives the controller back: it starts from the floor and climbs again
+        controller.setCeiling(CEILING);
+        controller.setFixedTarget(0);
+        assertThat(controller.getTarget(), equalTo(FLOOR));
+        assertThat(controller.onInterval(quiet()).action(), equalTo("raise"));
+        assertThat(controller.getTarget(), equalTo(FLOOR + 1));
+    }
+
     public void testClimbsToTheCeilingOneUploadPerInterval() {
         for (int expected = FLOOR + 1; expected <= CEILING; expected++) {
             final Decision decision = controller.onInterval(quiet());
