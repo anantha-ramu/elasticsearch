@@ -355,6 +355,13 @@ public class StatelessPlugin extends Plugin
     public static final String UPLOAD_PREWARM_THREAD_POOL = BlobStoreRepository.STATELESS_SHARD_UPLOAD_PREWARMING_THREAD_NAME;
     public static final String UPLOAD_PREWARM_THREAD_POOL_SETTING = "stateless." + UPLOAD_PREWARM_THREAD_POOL + "_thread_pool";
 
+    /**
+     * Experimental: runs the reads ahead of the files that a snapshot reads from the object store, see
+     * {@link org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings#SOURCE_READ_AHEAD_ENABLED_SETTING}. Never the snapshot
+     * pools, which run the uploads.
+     */
+    public static final String SNAPSHOT_READ_AHEAD_THREAD_POOL = "stateless_snapshot_read_ahead";
+    public static final String SNAPSHOT_READ_AHEAD_THREAD_POOL_SETTING = "stateless." + SNAPSHOT_READ_AHEAD_THREAD_POOL + "_thread_pool";
     public static final String BLOB_COPY_THREAD_POOL = BlobStoreRepository.STATELESS_BLOB_COPY_THREAD_NAME;
     public static final String BLOB_COPY_THREAD_POOL_SETTING = "stateless." + BLOB_COPY_THREAD_POOL + "_thread_pool";
 
@@ -510,6 +517,17 @@ public class StatelessPlugin extends Plugin
                 TimeValue.timeValueMinutes(5),
                 true,
                 BLOB_COPY_THREAD_POOL_SETTING
+            ),
+            // At most one read ahead runs per upload, so as many threads as the most uploads that can run at once. Threads are only
+            // started when there is something to read ahead, which needs the (default off) setting. It is also the number of threads
+            // that show in hot_threads as [stateless_snapshot_read_ahead].
+            new ScalingExecutorBuilder(
+                SNAPSHOT_READ_AHEAD_THREAD_POOL,
+                0,
+                ThreadPool.getMaxSnapshotUploadThreadPoolSizeForFixedConcurrency(processors),
+                TimeValue.timeValueMinutes(1),
+                true,
+                SNAPSHOT_READ_AHEAD_THREAD_POOL_SETTING
             ), };
     }
 
@@ -608,6 +626,14 @@ public class StatelessPlugin extends Plugin
     @Nullable
     public SnapshotBacklogTracker getSnapshotBacklogTracker() {
         return this.snapshotBacklogTrackerRef.get();
+    }
+
+    /**
+     * @return the thread pool, or {@code null} before the components are created
+     */
+    @Nullable
+    public ThreadPool getThreadPool() {
+        return this.threadPool.get();
     }
 
     public Client getClient() {
@@ -1560,6 +1586,8 @@ public class StatelessPlugin extends Plugin
             StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING,
             StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING,
             StatelessSnapshotSettings.STATELESS_SNAPSHOT_WAIT_FOR_ACTIVE_PRIMARY_TIMEOUT_SETTING,
+            StatelessSnapshotSettings.SOURCE_READ_AHEAD_ENABLED_SETTING,
+            StatelessSnapshotSettings.SOURCE_READ_AHEAD_BLOCK_SIZE_SETTING,
             StatelessShardRelocationOrder.PRIORITIZE_WRITE_SHARD_RELOCATIONS_SETTING,
             StatelessMemoryMetricsService.FIXED_SHARD_MEMORY_OVERHEAD_SETTING,
             StatelessMemoryMetricsService.INDEXING_OPERATIONS_MEMORY_REQUIREMENTS_ENABLED_SETTING,
