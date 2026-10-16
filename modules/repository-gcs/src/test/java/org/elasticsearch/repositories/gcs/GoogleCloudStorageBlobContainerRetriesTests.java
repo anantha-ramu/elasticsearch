@@ -463,6 +463,9 @@ public class GoogleCloudStorageBlobContainerRetriesTests extends AbstractBlobCon
         final AtomicInteger countInits = new AtomicInteger(nbErrors);
         final AtomicInteger countUploads = new AtomicInteger(nbErrors * totalChunks);
         final AtomicBoolean allow410Gone = new AtomicBoolean(randomBoolean());
+        // The handler returns without a response and safeHandler then closes the exchange, so the client sees a closed connection (a
+        // SocketException, which is retried) and not a read timeout. A real read timeout is in
+        // testWriteLargeBlobResumesAfterChunkReadTimeout.
         final AtomicBoolean allowReadTimeout = new AtomicBoolean(rarely());
         final AtomicInteger bytesReceived = new AtomicInteger();
         final int wrongChunk = randomIntBetween(1, totalChunks);
@@ -586,6 +589,116 @@ public class GoogleCloudStorageBlobContainerRetriesTests extends AbstractBlobCon
         assertThat(countInits.get(), equalTo(0));
         assertThat(countUploads.get(), equalTo(0));
         assertThat(allow410Gone.get(), is(false));
+    }
+
+    /**
+     * A chunk PUT that gets no response within the read timeout is not a failed upload: the SDK asks the server how much of the object it
+     * has and resumes from there. The server either has the chunk (the response was lost) or does not (the request was lost).
+     */
+    public void testWriteLargeBlobResumesAfterChunkReadTimeout() throws Exception {
+        final int chunkSize = GoogleCloudStorageBlobStore.SDK_DEFAULT_CHUNK_SIZE;
+        final int nbFullChunks = randomIntBetween(2, 3);
+        final byte[] data = randomBytes(chunkSize * nbFullChunks + randomIntBetween(1, chunkSize - 1));
+        final int totalChunks = nbFullChunks + 1;
+        // the chunk sent from write() for all but the last one, the final chunk is sent when the channel is closed
+        final int stalledChunk = randomIntBetween(0, totalChunks - 1);
+        final boolean serverKeepsStalledChunk = randomBoolean();
+        logger.debug("stalling chunk [{}] of [{}], server keeps it [{}]", stalledChunk, totalChunks, serverKeepsStalledChunk);
+
+        final byte[] stored = new byte[data.length];
+        final AtomicInteger committed = new AtomicInteger();
+        final AtomicBoolean stalled = new AtomicBoolean();
+        // the server handles one request at a time, so the stalled request is left open instead of blocking the server
+        final Queue<HttpExchange> stalledExchanges = new ConcurrentLinkedQueue<>();
+        final Map<Integer, AtomicInteger> chunkRequests = new ConcurrentHashMap<>();
+        final String sessionUploadId = UUIDs.randomBase64UUID();
+
+        final long retriedBefore = ResumableUploadChunks.getRetriedChunks();
+        final BlobContainer blobContainer = blobContainerBuilder().maxRetries(3).readTimeout(TimeValue.timeValueSeconds(1)).build();
+
+        final HttpHandler handler = exchange -> {
+            final BytesReference requestBody = Streams.readFully(exchange.getRequestBody());
+            final var params = RequestParams.fromQueryString(exchange.getRequestURI().getQuery());
+            assertThat(params.get("uploadType"), equalTo("resumable"));
+
+            if ("POST".equals(exchange.getRequestMethod())) {
+                final byte[] response = requestBody.utf8ToString().getBytes(UTF_8);
+                exchange.getResponseHeaders().add("Content-Type", "application/json");
+                exchange.getResponseHeaders()
+                    .add("Location", httpServerUrl() + "/upload/storage/v1/b/bucket/o?uploadType=resumable&upload_id=" + sessionUploadId);
+                exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
+                exchange.getResponseBody().write(response);
+                return;
+            }
+            assertThat(exchange.getRequestMethod(), equalTo("PUT"));
+            assertThat(params.get("upload_id"), equalTo(sessionUploadId));
+
+            final var contentRange = HttpHeaderParser.parseContentRangeHeader(exchange.getRequestHeaders().getFirst("Content-Range"));
+            assertNotNull(contentRange);
+            if (contentRange.hasRange() == false) {
+                // status query: the client has given up on the stalled request
+                exchange.getResponseHeaders().add("Content-Length", "0");
+                if (committed.get() == data.length) {
+                    exchange.getResponseHeaders().add("x-goog-stored-content-length", String.valueOf(data.length));
+                    exchange.sendResponseHeaders(RestStatus.OK.getStatus(), -1);
+                } else {
+                    if (committed.get() > 0) {
+                        exchange.getResponseHeaders().add("Range", Strings.format("bytes=0-%s", committed.get() - 1));
+                    }
+                    exchange.sendResponseHeaders(308 /* Resume Incomplete */, -1);
+                }
+                return;
+            }
+
+            final int start = Math.toIntExact(contentRange.start());
+            assertThat(start, equalTo(committed.get()));
+            assertThat(requestBody.length(), equalTo(Math.min(chunkSize, data.length - start)));
+            chunkRequests.computeIfAbsent(start / chunkSize, k -> new AtomicInteger()).incrementAndGet();
+            final boolean stallThisRequest = start / chunkSize == stalledChunk && stalled.compareAndSet(false, true);
+            if (stallThisRequest == false || serverKeepsStalledChunk) {
+                final byte[] body = BytesReference.toBytes(requestBody);
+                System.arraycopy(body, 0, stored, start, body.length);
+                committed.addAndGet(Math.toIntExact(requestBody.length()));
+            }
+            if (stallThisRequest) {
+                // no response: the client times out, then sends a status query on another connection
+                stalledExchanges.add(exchange);
+                return;
+            }
+            if (contentRange.size() != null) {
+                exchange.getResponseHeaders().add("x-goog-stored-content-length", String.valueOf(committed.get()));
+                exchange.sendResponseHeaders(RestStatus.OK.getStatus(), -1);
+            } else {
+                exchange.getResponseHeaders().add("Range", Strings.format("bytes=0-%s", committed.get() - 1));
+                exchange.getResponseHeaders().add("Content-Length", "0");
+                exchange.sendResponseHeaders(308 /* Resume Incomplete */, -1);
+            }
+        };
+        httpServer.createContext("/upload/storage/v1/b/bucket/o", exchange -> {
+            try {
+                ESMockAPIBasedRepositoryIntegTestCase.wrap(handler, logger).handle(exchange);
+            } finally {
+                if (stalledExchanges.contains(exchange) == false) {
+                    exchange.close();
+                }
+            }
+        });
+
+        try (InputStream stream = new InputStreamIndexInput(new ByteArrayIndexInput("desc", data), data.length)) {
+            blobContainer.writeBlob(randomPurpose(), "write_large_blob_with_stalled_chunk", stream, data.length, false);
+        } finally {
+            stalledExchanges.forEach(HttpExchange::close);
+        }
+
+        assertTrue(stalled.get());
+        assertThat(committed.get(), equalTo(data.length));
+        assertArrayEquals(data, stored);
+        assertThat(ResumableUploadChunks.getRetriedChunks(), greaterThanOrEqualTo(retriedBefore + 1));
+        // the chunk is only sent again if the server did not get it, every other chunk is sent once
+        for (int chunk = 0; chunk < totalChunks; chunk++) {
+            final int expectedRequests = chunk == stalledChunk && serverKeepsStalledChunk == false ? 2 : 1;
+            assertThat("requests for chunk " + chunk, chunkRequests.get(chunk).get(), greaterThanOrEqualTo(expectedRequests));
+        }
     }
 
     public void testDeleteBatchesAreSentIncrementally() throws Exception {

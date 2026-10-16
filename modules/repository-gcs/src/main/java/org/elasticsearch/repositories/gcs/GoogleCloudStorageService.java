@@ -293,6 +293,10 @@ public class GoogleCloudStorageService {
                 if (ExceptionsHelper.unwrap(prevThrowable, SocketException.class) != null) {
                     return true;
                 }
+                // Retry a chunk request of a resumable upload that timed out, the SDK resumes from the committed offset
+                if (ResumableUploadChunks.shouldRetry(prevThrowable)) {
+                    return true;
+                }
                 // TLS handshake failures are SSLExceptions, not SocketExceptions. S3 and Azure retry them too.
                 if (ExceptionsHelper.unwrap(prevThrowable, SSLException.class) != null) {
                     return true;
