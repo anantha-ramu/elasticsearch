@@ -4397,6 +4397,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 // to milliseconds introduces small errors made bigger when compounded over N reads, and since we don't require
                 // nanosecond precision on our charts, we're happy to take the small hit of a single, rounding error at the end.
                 AtomicLong totalTimeSpendReadingInNanos = new AtomicLong();
+                final SnapshotSourceReadTiming readTiming = new SnapshotSourceReadTiming(fileInfo.partName(i));
 
                 // Make reads abortable by mutating the snapshotStatus object
                 stage = UploadStage.OPEN_SOURCE;
@@ -4429,7 +4430,9 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                             sourceReadFailed.set(true);
                             throw e;
                         }
-                        totalTimeSpendReadingInNanos.addAndGet(System.nanoTime() - beforeReadNanos);
+                        final long readNanos = System.nanoTime() - beforeReadNanos;
+                        totalTimeSpendReadingInNanos.addAndGet(readNanos);
+                        readTiming.record(amountRead, readNanos);
                         return amountRead;
                     }
 
@@ -4443,6 +4446,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 stage = UploadStage.WRITE_BLOB;
                 shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, partName, inputStream, partBytes, false);
                 final long uploadTimeInMillis = threadPool.rawRelativeTimeInMillis() - startMillis;
+                readTiming.finish(partBytes, uploadTimeInMillis);
                 blobStoreSnapshotMetrics.incrementCountersForPartUpload(partBytes, uploadTimeInMillis);
                 blobStoreSnapshotMetrics.incrementUploadReadTime(TimeUnit.NANOSECONDS.toMillis(totalTimeSpendReadingInNanos.longValue()));
                 logger.trace(
