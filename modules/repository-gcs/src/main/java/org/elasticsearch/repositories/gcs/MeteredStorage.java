@@ -35,6 +35,8 @@ import com.google.cloud.storage.multipartupload.model.UploadPartRequest;
 import com.google.cloud.storage.multipartupload.model.UploadPartResponse;
 import com.google.cloud.storage.spi.v1.HttpStorageRpc;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.core.SuppressForbidden;
 
@@ -43,6 +45,7 @@ import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.OptionalInt;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 import static org.elasticsearch.repositories.gcs.StorageOperation.COPY;
@@ -134,7 +137,7 @@ public class MeteredStorage {
     ) throws IOException {
         var initStats = new OperationStats(purpose, INSERT);
         return statsCollector.continueWithIOSupplier(initStats, () -> {
-            var channel = new MeteredWriteChannel(statsCollector, initStats, storage.writer(blobInfo, writeOptions));
+            var channel = new MeteredWriteChannel(statsCollector, initStats, blobInfo.getName(), storage.writer(blobInfo, writeOptions));
             resumableWriteBufferSize.ifPresent(channel::setChunkSize);
             return channel;
         });
@@ -187,14 +190,27 @@ public class MeteredStorage {
      */
     @SuppressForbidden(reason = "wraps GCS channel")
     public static class MeteredWriteChannel implements WriteChannel {
+        private static final Logger timingLogger = LogManager.getLogger("org.elasticsearch.repositories.gcs.ResumableUploadTiming");
+        // a write that does not flush a chunk only copies into the SDK buffer, which takes far less than this
+        private static final long FLUSH_THRESHOLD_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+
         private final GcsRepositoryStatsCollector statsCollector;
         private final WriteChannel writeChannel;
         private final OperationStats stats;
+        private final String blobName;
+        private long bytesAccepted;
+        private long bytesSinceLoggedFlush;
 
-        public MeteredWriteChannel(GcsRepositoryStatsCollector statsCollector, OperationStats initStats, WriteChannel readChannel) {
+        public MeteredWriteChannel(
+            GcsRepositoryStatsCollector statsCollector,
+            OperationStats initStats,
+            String blobName,
+            WriteChannel writeChannel
+        ) {
             this.statsCollector = statsCollector;
-            this.writeChannel = readChannel;
+            this.writeChannel = writeChannel;
             this.stats = initStats;
+            this.blobName = blobName;
         }
 
         @Override
@@ -204,12 +220,34 @@ public class MeteredStorage {
 
         @Override
         public RestorableState<WriteChannel> capture() {
-            return () -> new MeteredWriteChannel(statsCollector, stats, writeChannel.capture().restore());
+            return () -> new MeteredWriteChannel(statsCollector, stats, blobName, writeChannel.capture().restore());
         }
 
         @Override
         public int write(ByteBuffer src) throws IOException {
-            return statsCollector.continueWithIOSupplier(stats, () -> writeChannel.write(src));
+            final long offset = bytesAccepted;
+            final long start = System.nanoTime();
+            final int written = ResumableUploadChunks.track(
+                blobName,
+                "write",
+                offset,
+                src.remaining(),
+                () -> statsCollector.continueWithIOSupplier(stats, () -> writeChannel.write(src))
+            );
+            bytesAccepted += written;
+            bytesSinceLoggedFlush += written;
+            final long elapsed = System.nanoTime() - start;
+            if (elapsed >= FLUSH_THRESHOLD_NANOS && timingLogger.isDebugEnabled()) {
+                // the write that blocked flushed a chunk, covering the bytes accepted since the previous flush
+                timingLogger.debug(
+                    "blob [{}] chunk flush of [{}] bytes took [{}] ms",
+                    blobName,
+                    bytesSinceLoggedFlush,
+                    elapsed / 1_000_000.0
+                );
+                bytesSinceLoggedFlush = 0;
+            }
+            return written;
         }
 
         @Override
@@ -219,7 +257,19 @@ public class MeteredStorage {
 
         @Override
         public void close() throws IOException {
-            statsCollector.finishRunnable(stats, writeChannel::close);
+            final long start = System.nanoTime();
+            ResumableUploadChunks.track(blobName, "close", bytesAccepted, -1, () -> {
+                statsCollector.finishRunnable(stats, writeChannel::close);
+                return null;
+            });
+            if (timingLogger.isDebugEnabled()) {
+                timingLogger.debug(
+                    "blob [{}] final chunk of up to [{}] bytes took [{}] ms on close",
+                    blobName,
+                    bytesSinceLoggedFlush,
+                    (System.nanoTime() - start) / 1_000_000.0
+                );
+            }
         }
     }
 
