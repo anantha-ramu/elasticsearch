@@ -7,8 +7,11 @@
 
 package org.elasticsearch.xpack.stateless.snapshots;
 
+import org.apache.logging.log4j.Level;
+import org.elasticsearch.common.logging.Loggers;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.MockLog;
 import org.elasticsearch.threadpool.ScalingExecutorBuilder;
 import org.elasticsearch.threadpool.TestThreadPool;
 import org.elasticsearch.threadpool.ThreadPool;
@@ -436,5 +439,53 @@ public class ReadAheadInputStreamTests extends ESTestCase {
 
         readAhead.setEnabled(false);
         assertThat(readAhead.maybeWrap(source, 10L * blockSize, "off again"), sameInstance(source));
+    }
+
+    /**
+     * The lines that show the overlap in the wave-4 readout: one per block, from the reader, with the read time on the pool and the wait.
+     */
+    public void testBlocksAreLoggedAtDebug() throws IOException {
+        final String loggerName = ReadAheadInputStream.class.getCanonicalName();
+        final var logger = org.apache.logging.log4j.LogManager.getLogger(ReadAheadInputStream.class);
+        final var originalLevel = logger.getLevel();
+        Loggers.setLevel(logger, Level.DEBUG);
+        try (var mockLog = MockLog.capture(ReadAheadInputStream.class)) {
+            mockLog.addExpectation(
+                new MockLog.SeenEventExpectation(
+                    "first block",
+                    loggerName,
+                    Level.DEBUG,
+                    "test read-ahead block [0] at offset [0]: [100] bytes read from source in * ms on [*"
+                        + POOL
+                        + "*] from [*] (epoch ms), "
+                        + "reader waited * ms"
+                )
+            );
+            mockLog.addExpectation(
+                new MockLog.SeenEventExpectation(
+                    "last block",
+                    loggerName,
+                    Level.DEBUG,
+                    "test read-ahead block [2] at offset [200]: [50] bytes read from source in * ms on [*"
+                        + POOL
+                        + "*] from [*] (epoch ms), "
+                        + "reader waited * ms"
+                )
+            );
+            mockLog.addExpectation(
+                new MockLog.SeenEventExpectation(
+                    "close",
+                    loggerName,
+                    Level.DEBUG,
+                    "test closed after [3] blocks, [*] ms of source reads on the executor, consumer waited [*] ms for them"
+                )
+            );
+            try (var stream = newStream(new TestSource(randomByteArrayOfLength(250), 25), 250, 100)) {
+                assertThat(stream.readAllBytes().length, equalTo(250));
+            }
+            mockLog.assertAllExpectationsMatched();
+        } finally {
+            Loggers.setLevel(logger, originalLevel);
+        }
     }
 }
