@@ -51,6 +51,8 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
     private final SnapshotBacklogTracker snapshotBacklogTracker;
     private final LocalPrimarySnapshotShardContextFactory localPrimaryFactory;
     private final Client client;
+    @Nullable // when there is no thread pool to read ahead on
+    private final SourceReadAhead sourceReadAhead;
 
     public StatelessSnapshotShardContextFactory() {
         throw new IllegalStateException("This no arg constructor only exists for SPI validation");
@@ -64,6 +66,10 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
         final ClusterSettings clusterSettings = stateless.getClusterService().getClusterSettings();
         clusterSettings.initializeAndWatch(STATELESS_SNAPSHOT_ENABLED_SETTING, this::setStatelessSnapshotEnabledStatus);
         clusterSettings.initializeAndWatch(RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING, this::setRelocationDuringSnapshotEnabled);
+        final var threadPool = stateless.getThreadPool();
+        this.sourceReadAhead = threadPool == null
+            ? null
+            : SourceReadAhead.create(threadPool.executor(StatelessPlugin.SNAPSHOT_READ_AHEAD_THREAD_POOL), clusterSettings);
         this.localPrimaryFactory = new LocalPrimarySnapshotShardContextFactory(
             stateless.getClusterService(),
             stateless.getIndicesService()
@@ -117,6 +123,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
                         snapshotCommitInfo.blobLocations(),
                         shardBlobContainerFunc,
                         snapshotCommitInfo.isShardRelocated(),
+                        sourceReadAhead,
                         snapshotCommitInfo.snapshotIndexCommit().closingBefore(listener)
                     )
                 );
@@ -189,6 +196,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
                             response.blobLocations(),
                             shardBlobContainerFunc,
                             null,
+                            sourceReadAhead,
                             listener
                         )
                     );

@@ -67,6 +67,8 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     private final BiFunction<ShardId, Long, BlobContainer> blobContainerFunc;
     @Nullable // when snapshot runs on a different node from the primary
     private final BooleanSupplier isShardRelocated;
+    @Nullable // when there is no executor to read ahead on
+    private final SourceReadAhead sourceReadAhead;
 
     public StatelessSnapshotShardContext(
         ShardId shardId,
@@ -82,12 +84,45 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         @Nullable BooleanSupplier isShardRelocated,
         ActionListener<ShardSnapshotResult> listener
     ) {
+        this(
+            shardId,
+            snapshotId,
+            indexId,
+            shardStateIdentifier,
+            snapshotStatus,
+            repositoryMetaVersion,
+            snapshotStartTime,
+            snapshotIndexCommit,
+            fileToBlobLocations,
+            blobContainerFunc,
+            isShardRelocated,
+            null,
+            listener
+        );
+    }
+
+    StatelessSnapshotShardContext(
+        ShardId shardId,
+        SnapshotId snapshotId,
+        IndexId indexId,
+        @Nullable String shardStateIdentifier,
+        IndexShardSnapshotStatus snapshotStatus,
+        IndexVersion repositoryMetaVersion,
+        long snapshotStartTime,
+        @Nullable SnapshotIndexCommit snapshotIndexCommit,
+        Map<String, BlobLocation> fileToBlobLocations,
+        BiFunction<ShardId, Long, BlobContainer> blobContainerFunc,
+        @Nullable BooleanSupplier isShardRelocated,
+        @Nullable SourceReadAhead sourceReadAhead,
+        ActionListener<ShardSnapshotResult> listener
+    ) {
         super(snapshotId, indexId, shardStateIdentifier, snapshotStatus, repositoryMetaVersion, snapshotStartTime, listener);
         this.shardId = shardId;
         this.snapshotIndexCommit = snapshotIndexCommit;
         this.fileToBlobLocations = fileToBlobLocations;
         this.blobContainerFunc = blobContainerFunc;
         this.isShardRelocated = isShardRelocated;
+        this.sourceReadAhead = sourceReadAhead;
     }
 
     @Override
@@ -155,7 +190,7 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         final BlobLocation blobLocation = fileToBlobLocations.get(file);
         assert blobLocation != null : "Blob location for file [" + file + "] not found in " + fileToBlobLocations;
         final BlobContainer blobContainer = blobContainerFunc.apply(shardId, blobLocation.primaryTerm());
-        return new BlobStoreFileReader(file, blobContainer, blobLocation, commitRefReleasable, isShardRelocated);
+        return new BlobStoreFileReader(file, blobContainer, blobLocation, commitRefReleasable, isShardRelocated, sourceReadAhead);
     }
 
     private Releasable maybeWithSnapshotIndexCommitRef() {
@@ -176,6 +211,8 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         private final BooleanSupplier isShardRelocated;
         private long readPosition; // relative to the start of the file
         private InputStream currentStream; // closed when openInput is called to create a new InputStream and on close()
+        @Nullable // when the stream is read as it is opened
+        private final SourceReadAhead sourceReadAhead;
 
         BlobStoreFileReader(
             String fileName,
@@ -183,6 +220,17 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
             BlobLocation blobLocation,
             Releasable commitRefReleasable,
             @Nullable BooleanSupplier isShardRelocated
+        ) {
+            this(fileName, blobContainer, blobLocation, commitRefReleasable, isShardRelocated, null);
+        }
+
+        BlobStoreFileReader(
+            String fileName,
+            BlobContainer blobContainer,
+            BlobLocation blobLocation,
+            Releasable commitRefReleasable,
+            @Nullable BooleanSupplier isShardRelocated,
+            @Nullable SourceReadAhead sourceReadAhead
         ) {
             this.fileName = fileName;
             this.blobContainer = blobContainer;
@@ -192,6 +240,7 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
             this.nextPositionInBlobFile = blobLocation.offset();
             this.isShardRelocated = isShardRelocated;
             this.readPosition = 0;
+            this.sourceReadAhead = sourceReadAhead;
         }
 
         @Override
@@ -222,13 +271,28 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
             }
         }
 
+        /**
+         * Opens the ranged read of the blob. If read-ahead is on, the bytes are read ahead here, below the checksum and the position
+         * that {@link ResettableBlobStoreInputStream} keeps, which are only updated by the thread that reads the stream, with the bytes in
+         * order, and above the snapshot rate limiter, which the caller of {@link #openInput} wraps around what it returns.
+         */
         private InputStream openInputStreamForBlob(long bytesFromStreamStart, long limit) throws IOException {
-            return blobContainer.readBlob(
-                OperationPurpose.SNAPSHOT_DATA,
-                blobLocation.blobName(),
-                nextPositionInBlobFile + bytesFromStreamStart,
-                limit - bytesFromStreamStart
-            );
+            final long position = nextPositionInBlobFile + bytesFromStreamStart;
+            final long length = limit - bytesFromStreamStart;
+            final InputStream stream = blobContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, blobLocation.blobName(), position, length);
+            if (sourceReadAhead == null) {
+                return stream;
+            }
+            try {
+                return sourceReadAhead.maybeWrap(
+                    stream,
+                    length,
+                    "file [" + fileName + "] blob [" + blobLocation.blobName() + "] from [" + position + "]"
+                );
+            } catch (RuntimeException | Error e) {
+                IOUtils.closeWhileHandlingException(stream);
+                throw e;
+            }
         }
 
         private class ResettableBlobStoreInputStream extends FilterInputStream {

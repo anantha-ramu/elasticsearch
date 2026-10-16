@@ -9,6 +9,8 @@ package org.elasticsearch.xpack.stateless.snapshots;
 
 import org.elasticsearch.common.collect.Iterators;
 import org.elasticsearch.common.settings.Setting;
+import org.elasticsearch.common.unit.ByteSizeUnit;
+import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.core.Strings;
 import org.elasticsearch.core.TimeValue;
 
@@ -102,6 +104,29 @@ public class StatelessSnapshotSettings {
     public static final Setting<TimeValue> STATELESS_SNAPSHOT_WAIT_FOR_ACTIVE_PRIMARY_TIMEOUT_SETTING = Setting.positiveTimeSetting(
         "stateless.snapshot.wait_for_active_primary_timeout",
         TimeValue.timeValueMinutes(5),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Experimental: while a snapshot of a shard uploads a file that was read from the object store, read the file's next block from the
+     * object store while the current one is uploaded, see {@link ReadAheadInputStream}. Takes effect for the next file part opened.
+     */
+    public static final Setting<Boolean> SOURCE_READ_AHEAD_ENABLED_SETTING = Setting.boolSetting(
+        "stateless.snapshot.source_read_ahead.enabled",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Experimental: the size of a block that is read ahead. Each upload that reads ahead holds two buffers of this size while it runs.
+     */
+    public static final Setting<ByteSizeValue> SOURCE_READ_AHEAD_BLOCK_SIZE_SETTING = Setting.byteSizeSetting(
+        "stateless.snapshot.source_read_ahead.block_size",
+        ByteSizeValue.of(16, ByteSizeUnit.MB),
+        ByteSizeValue.of(64, ByteSizeUnit.KB),
+        ByteSizeValue.of(256, ByteSizeUnit.MB),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
