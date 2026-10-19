@@ -73,7 +73,9 @@ final class GcsConnectionTracker {
         public HttpURLConnection openConnection(URL url) throws IOException {
             final HttpURLConnection connection = delegate.openConnection(url);
             final Slot slot = ACTIVE.get();
-            if (slot != null) {
+            // The first connection opened after begin() is the one of the request. Others opened on the thread while that request is in
+            // flight, such as the GET the source of the upload makes when it is rewound, are not.
+            if (slot != null && slot.connection == null) {
                 slot.connection = connection;
             }
             return connection;
