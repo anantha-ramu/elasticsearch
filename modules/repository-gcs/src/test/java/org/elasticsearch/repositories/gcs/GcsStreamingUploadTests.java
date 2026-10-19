@@ -117,6 +117,8 @@ public class GcsStreamingUploadTests extends ESTestCase {
     private GcsRepositoryStatsCollector statsCollector;
     private RecordingMeterRegistry meterRegistry;
     private final List<CountDownLatch> latches = new ArrayList<>();
+    /** chunk size of the SDK write channel, 16MiB if not set */
+    private ByteSizeValue sdkChunkSize;
 
     @Before
     public void startServer() throws Exception {
@@ -192,6 +194,12 @@ public class GcsStreamingUploadTests extends ESTestCase {
         clientSettings.put(MAX_RETRIES_SETTING.getConcreteSettingForNamespace(client).getKey(), 0);
         if (readTimeout != null) {
             clientSettings.put(READ_TIMEOUT_SETTING.getConcreteSettingForNamespace(client).getKey(), readTimeout);
+        }
+        if (sdkChunkSize != null) {
+            clientSettings.put(
+                GoogleCloudStorageClientSettings.RESUMABLE_WRITE_BUFFER_SIZE_SETTING.getConcreteSettingForNamespace(client).getKey(),
+                sdkChunkSize
+            );
         }
         final MockSecureSettings secureSettings = new MockSecureSettings();
         secureSettings.setFile(CREDENTIALS_FILE_SETTING.getConcreteSettingForNamespace(client).getKey(), createServiceAccount(random()));
@@ -942,6 +950,164 @@ public class GcsStreamingUploadTests extends ESTestCase {
         assertThat(e.getCode(), equalTo(status));
         assertThat(puts("blob").size(), equalTo(1));
         assertThat(queries("blob"), empty());
+    }
+
+    /**
+     * The source of a real snapshot: the file is read through Store.VerifyingIndexInput, which checks the checksum in the footer of the
+     * file as it is read, and the snapshot verifies it after all the parts were written. The bytes that a retry reads again must not be
+     * counted twice, which would fail the verification of a snapshot that was written correctly.
+     */
+    public void testSnapshotVerificationHoldsAfterBytesWereReadAgain() throws IOException {
+        final long partSize = 2L * KB256;
+        final var store = createBlobStore(streamingSettings(partSize), TimeValue.timeValueSeconds(1), null);
+        final CountDownLatch release = newLatch();
+        final AtomicInteger failures = new AtomicInteger();
+        // a partial commit, a failure after some bytes were committed, and a timeout, each of which makes the source read bytes again
+        fake.faults = call -> {
+            if (call.type() != FakeResumableUploadHandler.Type.PUT) {
+                return FakeResumableUploadHandler.Fault.NONE;
+            }
+            return switch (failures.getAndIncrement()) {
+                case 0 -> FakeResumableUploadHandler.Fault.partialCommit(KB256);
+                case 1 -> FakeResumableUploadHandler.Fault.commitThenStatus(KB256, 503);
+                case 2 -> FakeResumableUploadHandler.Fault.commitThenHang(KB256, release);
+                default -> FakeResumableUploadHandler.Fault.NONE;
+            };
+        };
+        try (var directory = new org.apache.lucene.store.ByteBuffersDirectory()) {
+            final byte[] content = randomData(7 * KB256 + 123);
+            try (var output = directory.createOutput("file", org.apache.lucene.store.IOContext.DEFAULT)) {
+                output.writeBytes(content, content.length);
+                org.apache.lucene.codecs.CodecUtil.writeFooter(output);
+            }
+            final byte[] fileBytes;
+            try (var input = directory.openInput("file", org.apache.lucene.store.IOContext.DEFAULT)) {
+                fileBytes = new byte[Math.toIntExact(input.length())];
+                input.readBytes(fileBytes, 0, fileBytes.length);
+            }
+            final AtomicInteger resets = new AtomicInteger();
+            try (
+                var verifying = new org.elasticsearch.index.store.Store.VerifyingIndexInput(
+                    directory.openInput("file", org.apache.lucene.store.IOContext.READONCE)
+                ) {
+                    @Override
+                    public void seek(long pos) throws IOException {
+                        resets.incrementAndGet();
+                        super.seek(pos);
+                    }
+                }
+            ) {
+                final InputStream source = new HookedInputStream(
+                    new RateLimitingInputStream(
+                        new InputStreamIndexInput(verifying, fileBytes.length),
+                        () -> new RateLimiter.SimpleRateLimiter(100_000),
+                        nanos -> {}
+                    ),
+                    null
+                );
+
+                write(store, "blob", source, fileBytes.length, false);
+
+                assertArrayEquals(fileBytes, fake.getBlob("blob"));
+                assertThat("the source was read again", resets.get(), greaterThan(0));
+                assertThat(counters().getRetries(), greaterThan(0L));
+                // throws a CorruptIndexException if the checksum of what was read the first time is not that of the footer
+                org.elasticsearch.index.store.Store.verify(verifying);
+            }
+        }
+    }
+
+    // ---- timing of the SDK path ----
+
+    private static final String TIMING_LOGGER = "org.elasticsearch.repositories.gcs.ResumableTiming";
+
+    private void writeThroughTheSdk(String name, byte[] data) {
+        try {
+            write(createBlobStoreForSdk(), name, snapshotSource(data, new AtomicInteger(), null), data.length, false);
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private GoogleCloudStorageBlobStore sdkStore;
+
+    private GoogleCloudStorageBlobStore createBlobStoreForSdk() {
+        if (sdkStore == null) {
+            sdkChunkSize = ByteSizeValue.ofKb(256);
+            sdkStore = createBlobStore(streamingSettings(0));
+        }
+        return sdkStore;
+    }
+
+    private List<String> callShapes(String name) {
+        return fake.getCalls()
+            .stream()
+            .filter(c -> name.equals(c.name()))
+            .map(c -> c.type() + "[" + c.from() + "," + c.end() + ")")
+            .toList();
+    }
+
+    public void testSdkPathTimingIsLoggedAtDebug() {
+        final byte[] data = randomData(3 * KB256 + 100);
+        Loggers.setLevel(ResumableTiming.logger, Level.DEBUG);
+        try {
+            MockLog.assertThatLogger(
+                () -> writeThroughTheSdk("blob", data),
+                TIMING_LOGGER,
+                new MockLog.PatternSeenEventExpectation(
+                    "a full chunk is flushed",
+                    TIMING_LOGGER,
+                    Level.DEBUG,
+                    "piece \\[\\d+\\] of \\[bucket/blob\\] end_offset \\[\\d+\\] flushed_bytes \\[262144\\] flush_ms \\[\\d+\\] "
+                        + "source_read_ms \\[\\d+\\] reads \\[\\d+\\]"
+                ),
+                new MockLog.PatternSeenEventExpectation(
+                    "the last chunk is sent when the channel is closed",
+                    TIMING_LOGGER,
+                    Level.DEBUG,
+                    "piece \\[\\d+\\] of \\[bucket/blob\\] last end_offset \\["
+                        + data.length
+                        + "\\] flushed_bytes \\[100\\] flush_ms \\[\\d+\\] "
+                        + "source_read_ms \\[\\d+\\] reads \\[\\d+\\]"
+                ),
+                new MockLog.PatternSeenEventExpectation(
+                    "totals",
+                    TIMING_LOGGER,
+                    Level.DEBUG,
+                    "uploaded \\[bucket/blob\\] bytes \\["
+                        + data.length
+                        + "\\] pieces \\[\\d+\\] total_ms \\[\\d+\\] source_read_ms \\[\\d+\\] "
+                        + "reads \\[\\d+\\] flush_ms \\[\\d+\\]"
+                )
+            );
+        } finally {
+            Loggers.setLevel(ResumableTiming.logger, (Level) null);
+        }
+        assertArrayEquals(data, fake.getBlob("blob"));
+        assertThat("the streaming upload is not involved", counters().getFiles(), equalTo(0L));
+    }
+
+    public void testSdkPathTimingChangesNothingAtInfo() {
+        final byte[] data = randomData(3 * KB256 + 100);
+        Loggers.setLevel(ResumableTiming.logger, Level.INFO);
+        try {
+            assertFalse(ResumableTiming.isEnabled());
+            MockLog.assertThatLogger(
+                () -> writeThroughTheSdk("info", data),
+                TIMING_LOGGER,
+                new MockLog.PatternNotSeenEventExpectation("nothing at debug", TIMING_LOGGER, Level.DEBUG, ".*"),
+                new MockLog.PatternNotSeenEventExpectation("nothing at info", TIMING_LOGGER, Level.INFO, ".*")
+            );
+            Loggers.setLevel(ResumableTiming.logger, Level.DEBUG);
+            assertTrue(ResumableTiming.isEnabled());
+            writeThroughTheSdk("debug", data);
+        } finally {
+            Loggers.setLevel(ResumableTiming.logger, (Level) null);
+        }
+        // the same blob is written, with the same requests, whether the timing is logged or not
+        assertArrayEquals(data, fake.getBlob("info"));
+        assertArrayEquals(data, fake.getBlob("debug"));
+        assertThat(callShapes("debug"), equalTo(callShapes("info")));
     }
 
     // ---- exceptions of the source ----
