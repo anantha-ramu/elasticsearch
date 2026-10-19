@@ -564,6 +564,25 @@ class GoogleCloudStorageBlobStore implements BlobStore {
         long size,
         boolean failIfAlreadyExists
     ) throws IOException {
+        if (purpose == OperationPurpose.SNAPSHOT_DATA && inputStream.markSupported()) {
+            // Only snapshot data is streamed: the source has a cheap mark and reset (it reopens the file at the mark), and the same blob
+            // store also serves other purposes (e.g. stateless commit uploads) whose sources are not suited to it.
+            final GcsStreamingUploadSettings streamingSettings = storageService.getStreamingUploadSettings();
+            final GcsStreamingUploadSettings.Config streamingConfig = streamingSettings.getConfig();
+            final MeteredStorage client = client();
+            if (streamingConfig.isEnabled() && client.supportsStreamingUpload()) {
+                client.meteredStreamingUpload(
+                    purpose,
+                    blobInfo,
+                    failIfAlreadyExists,
+                    inputStream,
+                    size,
+                    streamingConfig,
+                    streamingSettings.getThreadPool()
+                );
+                return;
+            }
+        }
         // We retry 410 GONE errors to cover the unlikely but possible scenario where a resumable upload session becomes broken and
         // needs to be restarted from scratch. Given how unlikely a 410 error should be according to SLAs we retry only twice.
         assert inputStream.markSupported();

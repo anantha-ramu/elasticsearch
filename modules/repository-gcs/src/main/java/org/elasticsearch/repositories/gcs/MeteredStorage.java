@@ -10,11 +10,14 @@
 package org.elasticsearch.repositories.gcs;
 
 import com.google.api.client.http.HttpHeaders;
+import com.google.api.client.http.HttpRequestFactory;
 import com.google.api.client.http.HttpResponse;
+import com.google.api.client.http.HttpTransport;
 import com.google.api.gax.paging.Page;
 import com.google.cloud.ReadChannel;
 import com.google.cloud.RestorableState;
 import com.google.cloud.WriteChannel;
+import com.google.cloud.http.HttpTransportOptions;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobInfo;
@@ -37,8 +40,10 @@ import com.google.cloud.storage.spi.v1.HttpStorageRpc;
 
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.core.SuppressForbidden;
+import org.elasticsearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
@@ -61,6 +66,7 @@ public class MeteredStorage {
     private final com.google.api.services.storage.Storage storageRpc;
     private final GcsRepositoryStatsCollector statsCollector;
     private final MultipartUploadClient multipartUploadClient;
+    private volatile HttpRequestFactory streamingUploadRequestFactory;
 
     public MeteredStorage(Storage storage, GcsRepositoryStatsCollector statsCollector) {
         this.storage = storage;
@@ -138,6 +144,84 @@ public class MeteredStorage {
             resumableWriteBufferSize.ifPresent(channel::setChunkSize);
             return channel;
         });
+    }
+
+    /**
+     * Whether {@link #meteredStreamingUpload} can be used, which needs the HTTP transport of a real SDK client.
+     */
+    boolean supportsStreamingUpload() {
+        return storage.getOptions() instanceof HttpStorageOptions options
+            && options.getTransportOptions() instanceof HttpTransportOptions
+            && storageRpc != null
+            && storageRpc.getJsonFactory() != null;
+    }
+
+    /**
+     * Uploads a blob as a streamed resumable upload, see {@link GcsStreamingUpload}. Counted as a single INSERT operation, like a write
+     * channel, with every request it sends counted as a request of that operation.
+     *
+     * @param source supports mark and reset, and is positioned at the start of the blob
+     */
+    public void meteredStreamingUpload(
+        OperationPurpose purpose,
+        BlobInfo blobInfo,
+        boolean failIfAlreadyExists,
+        InputStream source,
+        long size,
+        GcsStreamingUploadSettings.Config config,
+        ThreadPool threadPool
+    ) throws IOException {
+        final var options = (HttpStorageOptions) storage.getOptions();
+        final var stats = new OperationStats(purpose, INSERT);
+        final long startMillis = statsCollector.getTimer().absoluteTimeInMillis();
+        boolean succeeded = false;
+        try {
+            new GcsStreamingUpload(
+                getStreamingUploadRequestFactory(options),
+                storageRpc.getJsonFactory(),
+                options.getHost(),
+                blobInfo,
+                failIfAlreadyExists,
+                source,
+                size,
+                config,
+                stats,
+                statsCollector.getStreamingUploadCounters(),
+                threadPool
+            ).run();
+            succeeded = true;
+        } finally {
+            if (succeeded == false) {
+                stats.isLastRequestSucceed = false;
+            }
+            stats.totalDuration += statsCollector.getTimer().absoluteTimeInMillis() - startMillis;
+            statsCollector.collect(stats);
+        }
+    }
+
+    /**
+     * A request factory on the transport, credentials, timeouts and headers of the SDK client, without the SDK's own retrying and
+     * without its metering, which relies on a thread local that cannot be held while the streaming upload reads its source.
+     */
+    private HttpRequestFactory getStreamingUploadRequestFactory(HttpStorageOptions options) {
+        HttpRequestFactory factory = streamingUploadRequestFactory;
+        if (factory == null) {
+            final var transportOptions = (HttpTransportOptions) options.getTransportOptions();
+            final var sdkInitializer = transportOptions.getHttpRequestInitializer(options);
+            final HttpTransport transport = transportOptions.getHttpTransportFactory().create();
+            factory = transport.createRequestFactory(request -> {
+                if (sdkInitializer != null) {
+                    sdkInitializer.initialize(request);
+                }
+                request.setResponseInterceptor(null);
+                request.setThrowExceptionOnExecuteError(false);
+                request.setFollowRedirects(false);
+                request.setNumberOfRetries(0);
+                request.setEncoding(null);
+            });
+            streamingUploadRequestFactory = factory;
+        }
+        return factory;
     }
 
     public MeteredReadChannel meteredReader(OperationPurpose purpose, BlobId blobId, Storage.BlobSourceOption... options) {
