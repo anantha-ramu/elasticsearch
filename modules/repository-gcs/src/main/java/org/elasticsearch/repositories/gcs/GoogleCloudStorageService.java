@@ -172,10 +172,10 @@ public class GoogleCloudStorageService {
             builder.trustCertificates(certTrustStore);
             Proxy proxy = gcsClientSettings.getProxy();
             if (proxy != null) {
-                builder.setProxy(proxy);
                 notifyProxyIsSet(proxy);
             }
-            // same connections as the default factory, but lets the streaming upload break a stalled write
+            // Same connections as the builder makes with a proxy (or without one), but the streaming upload can find the connection of a
+            // request and break a stalled write. The builder ignores a connection factory once setProxy was called, so the proxy goes here.
             builder.setConnectionFactory(new GcsConnectionTracker.TrackingConnectionFactory(proxy));
             httpTransport = builder.build();
         } catch (RuntimeException | IOException e) {
