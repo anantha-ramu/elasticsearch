@@ -604,8 +604,21 @@ class GoogleCloudStorageBlobStore implements BlobStore {
                  * It is not enough to wrap the call to Streams#copy, we have to wrap the privileged calls too; this is because Streams#copy
                  * is in the stacktrace and is not granted the permissions needed to close and write the channel.
                  */
-                org.elasticsearch.core.Streams.copy(inputStream, Channels.newOutputStream(new WritableBlobChannel(writeChannel)), buffer);
-                writeChannel.close();
+                // the timing is for comparing with the streaming upload, and wraps the source and the channel only if DEBUG is on
+                final ResumableTiming timing = ResumableTiming.isEnabled()
+                    ? new ResumableTiming(blobInfo, getResumableWriteBufferSize().orElse(SDK_DEFAULT_CHUNK_SIZE))
+                    : null;
+                final WritableByteChannel channel = new WritableBlobChannel(writeChannel);
+                org.elasticsearch.core.Streams.copy(
+                    timing == null ? inputStream : timing.wrap(inputStream),
+                    Channels.newOutputStream(timing == null ? channel : timing.wrap(channel)),
+                    buffer
+                );
+                if (timing == null) {
+                    writeChannel.close();
+                } else {
+                    timing.close(writeChannel);
+                }
                 return;
             } catch (final StorageException se) {
                 final int errorCode = se.getCode();
