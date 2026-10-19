@@ -35,6 +35,7 @@ import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.BlobPath;
 import org.elasticsearch.common.blobstore.BlobStore;
+import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.collect.Iterators;
@@ -253,7 +254,11 @@ public class GoogleCloudStorageBlobStoreRepositoryTests extends ESMockAPIBasedRe
         chunkRecordingHandler.recording = true;
         try (BlobStore store = newBlobStore(repoName)) {
             final BlobContainer container = store.blobContainer(BlobPath.EMPTY);
-            container.writeBlob(randomPurpose(), "test-resumable-write-buffer", new BytesArray(randomByteArrayOfLength(blobSize)), true);
+            // snapshot data is not written through the SDK when streaming uploads are on, and then the chunk size of the SDK does not apply
+            final OperationPurpose purpose = GcsStreamingUploadSettings.PART_SIZE_SETTING.get(Settings.EMPTY).getBytes() > 0
+                ? randomValueOtherThan(OperationPurpose.SNAPSHOT_DATA, () -> randomPurpose())
+                : randomPurpose();
+            container.writeBlob(purpose, "test-resumable-write-buffer", new BytesArray(randomByteArrayOfLength(blobSize)), true);
             // Verify chunk sizes before deleting
             final List<Integer> sizes = new ArrayList<>(chunkRecordingHandler.recordedNonFinalChunkSizes);
             assertTrue("expected at least " + numFullChunks + " non-final chunks, got " + sizes, sizes.size() >= numFullChunks);
