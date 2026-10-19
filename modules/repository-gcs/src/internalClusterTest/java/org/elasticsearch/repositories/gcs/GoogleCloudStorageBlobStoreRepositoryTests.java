@@ -152,6 +152,12 @@ public class GoogleCloudStorageBlobStoreRepositoryTests extends ESMockAPIBasedRe
         settings.put(ENDPOINT_SETTING.getConcreteSettingForNamespace("test").getKey(), httpServerUrl());
         settings.put(TOKEN_URI_SETTING.getConcreteSettingForNamespace("test").getKey(), httpServerUrl() + "/token");
         settings.put(MAX_RETRIES_SETTING.getConcreteSettingForNamespace("test").getKey(), 6);
+        // The mock fails each request a few times before it lets it through, which the SDK is configured to retry quickly further down
+        // (6 retries, with delays of at most 1s). The streaming upload, when it is switched on, gets the same: retries that are as
+        // quick, and at least as many in a row.
+        settings.put(GcsStreamingUploadSettings.INITIAL_BACKOFF_SETTING.getKey(), "10ms");
+        settings.put(GcsStreamingUploadSettings.MAX_BACKOFF_SETTING.getKey(), "1s");
+        settings.put(GcsStreamingUploadSettings.MAX_ATTEMPTS_SETTING.getKey(), 20);
         // multiple nodes (6 for nightly) with multiple failures per request (2) and with only 2 threads for the HTTP mock GCS server,
         // might lead to timeouts when reading the response after writing (or draining) large buffers (16 MB)
         settings.put(READ_TIMEOUT_SETTING.getConcreteSettingForNamespace("test").getKey(), "60s");

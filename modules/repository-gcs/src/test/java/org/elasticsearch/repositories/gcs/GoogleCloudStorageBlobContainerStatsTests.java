@@ -215,7 +215,17 @@ public class GoogleCloudStorageBlobContainerStatsTests extends ESTestCase {
 
         // a resumable upload sends at least 2 requests, a POST with metadata only and multiple PUTs with SDK_DEFAULT_CHUNK_SIZE
         // the +1 means a POST request with metadata without PAYLOAD
-        final int totalRequests = parts + 1;
+        // Snapshot data is sent in parts of the streaming upload part size instead, if that is switched on (it is for the tests that
+        // are run with the JVM property that sets the default part size): the parts, and then the last up to 256kb on its own.
+        final long streamingPartSize = GcsStreamingUploadSettings.PART_SIZE_SETTING.get(Settings.EMPTY).getBytes();
+        final int totalRequests;
+        if (purpose == OperationPurpose.SNAPSHOT_DATA && streamingPartSize > 0) {
+            final long alignment = GcsStreamingUploadSettings.PART_ALIGNMENT_BYTES;
+            final long streamedBytes = size - (size - ((size - 1) / alignment) * alignment);
+            totalRequests = Math.toIntExact(1 + (streamedBytes + streamingPartSize - 1) / streamingPartSize + 1);
+        } else {
+            totalRequests = parts + 1;
+        }
         final StatsMap wantStats = new StatsMap(purpose);
         assertStatsEquals(wantStats.add(INSERT, 1, totalRequests), store.stats());
 
