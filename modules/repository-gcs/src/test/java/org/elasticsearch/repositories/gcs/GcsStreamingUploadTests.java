@@ -801,6 +801,21 @@ public class GcsStreamingUploadTests extends ESTestCase {
         }
     }
 
+    public void testFailuresBetweenSuccessfulPartsDoNotAddUp() throws IOException {
+        // every other request fails, which is more than the attempts allowed if they were counted over the whole blob
+        final var store = createBlobStore(streamingSettings(KB256).put(GcsStreamingUploadSettings.MAX_ATTEMPTS_SETTING.getKey(), 2));
+        final byte[] data = randomData(20 * KB256 + 1);
+        final AtomicInteger requests = new AtomicInteger();
+        fake.faults = call -> call.type() == FakeResumableUploadHandler.Type.PUT && requests.getAndIncrement() % 2 == 0
+            ? FakeResumableUploadHandler.Fault.status(503)
+            : FakeResumableUploadHandler.Fault.NONE;
+
+        write(store, "blob", snapshotSource(data, new AtomicInteger(), null), data.length, false);
+
+        assertArrayEquals(data, fake.getBlob("blob"));
+        assertThat(counters().getRetries(), greaterThan(10L));
+    }
+
     public void testFailureToOpenTheSessionIsRetried() throws IOException {
         final var store = createBlobStore(streamingSettings(KB256));
         final byte[] data = randomData(KB256 + 1);

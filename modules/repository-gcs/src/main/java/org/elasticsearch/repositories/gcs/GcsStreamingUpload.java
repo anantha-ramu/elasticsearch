@@ -275,6 +275,7 @@ final class GcsStreamingUpload {
                         );
                     }
                     if (committed == partEnd && partEnd < size) {
+                        noteProgress();
                         return;
                     }
                     if (committed < partEnd) {
