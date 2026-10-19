@@ -62,9 +62,17 @@ public class GcsRepositoryStatsCollector {
      * Also, 404 is billable error. Other errors 307, 4xx, and 5xx are not billable.
      * <a href="https://cloud.google.com/storage/pricing#price-tables">GCS pricing tables</a>.
      */
-    public static final HttpResponseInterceptor METERING_INTERCEPTOR = response -> {
-        var stats = getThreadLocal();
-        var code = response.getStatusCode();
+    public static final HttpResponseInterceptor METERING_INTERCEPTOR = response -> recordResponse(
+        getThreadLocal(),
+        response.getStatusCode()
+    );
+
+    /**
+     * Records one completed HTTP response in the given stats, with the semantics described on {@link #METERING_INTERCEPTOR}. Used directly
+     * by code that cannot hold the thread local for the duration of a request, for example the streaming upload which reads its source
+     * while the request is in flight.
+     */
+    static void recordResponse(OperationStats stats, int code) {
         stats.requestAttempts += 1;
         stats.isLastRequestSucceed = true;
         if (((code >= 200 && code < 300) || code == 308 || code == 404) == false) {
@@ -75,7 +83,7 @@ public class GcsRepositoryStatsCollector {
                 case 429 -> stats.requestThrottle += 1;
             }
         }
-    };
+    }
 
     /**
      * Track operations for billing and REST API
@@ -88,6 +96,7 @@ public class GcsRepositoryStatsCollector {
     private final RepositoriesMetrics telemetry;
     private final EnumMap<OperationPurpose, EnumMap<StorageOperation, Map<String, Object>>> telemetryAttributes;
     private final TimeProvider timer;
+    private final StreamingUploadCounters streamingUploadCounters = new StreamingUploadCounters();
 
     GcsRepositoryStatsCollector() {
         this(NOOP_TIMER, new RepositoryMetadata(GoogleCloudStorageRepository.TYPE, "", Settings.EMPTY), RepositoriesMetrics.NOOP);
@@ -305,6 +314,87 @@ public class GcsRepositoryStatsCollector {
 
     public RepositoriesMetrics getRepositoriesMetrics() {
         return telemetry;
+    }
+
+    TimeProvider getTimer() {
+        return timer;
+    }
+
+    StreamingUploadCounters getStreamingUploadCounters() {
+        return streamingUploadCounters;
+    }
+
+    /**
+     * Counters for the streaming snapshot upload, see {@link GcsStreamingUpload}. These complement the request counts in the regular
+     * stats, which already include every request the streaming upload sends.
+     */
+    static final class StreamingUploadCounters {
+        private final LongAdder files = new LongAdder();
+        private final LongAdder parts = new LongAdder();
+        private final LongAdder bytes = new LongAdder();
+        private final LongAdder retries = new LongAdder();
+        private final LongAdder resumedBytes = new LongAdder();
+        private final LongAdder partialCommits = new LongAdder();
+        private final LongAdder writeStalls = new LongAdder();
+        private final LongAdder sessionGone = new LongAdder();
+
+        void addFile(long parts, long bytes) {
+            this.files.increment();
+            this.parts.add(parts);
+            this.bytes.add(bytes);
+        }
+
+        void addRetry() {
+            retries.increment();
+        }
+
+        void addResumedBytes(long bytes) {
+            resumedBytes.add(bytes);
+        }
+
+        void addPartialCommit() {
+            partialCommits.increment();
+        }
+
+        void addWriteStall() {
+            writeStalls.increment();
+        }
+
+        void addSessionGone() {
+            sessionGone.increment();
+        }
+
+        long getFiles() {
+            return files.sum();
+        }
+
+        long getParts() {
+            return parts.sum();
+        }
+
+        long getBytes() {
+            return bytes.sum();
+        }
+
+        long getRetries() {
+            return retries.sum();
+        }
+
+        long getResumedBytes() {
+            return resumedBytes.sum();
+        }
+
+        long getPartialCommits() {
+            return partialCommits.sum();
+        }
+
+        long getWriteStalls() {
+            return writeStalls.sum();
+        }
+
+        long getSessionGone() {
+            return sessionGone.sum();
+        }
     }
 
     record Collector(LongAdder operations, LongAdder requests) {}

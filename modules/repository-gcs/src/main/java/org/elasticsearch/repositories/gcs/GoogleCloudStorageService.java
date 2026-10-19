@@ -70,9 +70,15 @@ public class GoogleCloudStorageService {
     private final GoogleCloudStorageClientsManager clientsManager;
 
     private final boolean isServerless;
+    private final GcsStreamingUploadSettings streamingUploadSettings;
 
     public GoogleCloudStorageService(ClusterService clusterService, ProjectResolver projectResolver) {
         final Settings nodeSettings = clusterService.getSettings();
+        this.streamingUploadSettings = new GcsStreamingUploadSettings(
+            nodeSettings,
+            clusterService.getClusterSettings(),
+            clusterService.threadPool()
+        );
         this.isServerless = DiscoveryNode.isStateless(nodeSettings);
         this.clientsManager = new GoogleCloudStorageClientsManager(nodeSettings, projectResolver.supportsMultipleProjects());
         if (projectResolver.supportsMultipleProjects()) {
@@ -82,6 +88,10 @@ public class GoogleCloudStorageService {
 
     public boolean isServerless() {
         return isServerless;
+    }
+
+    GcsStreamingUploadSettings getStreamingUploadSettings() {
+        return streamingUploadSettings;
     }
 
     /**
@@ -165,6 +175,8 @@ public class GoogleCloudStorageService {
                 builder.setProxy(proxy);
                 notifyProxyIsSet(proxy);
             }
+            // same connections as the default factory, but lets the streaming upload break a stalled write
+            builder.setConnectionFactory(new GcsConnectionTracker.TrackingConnectionFactory(proxy));
             httpTransport = builder.build();
         } catch (RuntimeException | IOException e) {
             throw e;

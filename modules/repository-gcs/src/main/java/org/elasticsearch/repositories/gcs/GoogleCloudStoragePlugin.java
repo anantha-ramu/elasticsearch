@@ -25,6 +25,7 @@ import org.elasticsearch.repositories.Repository;
 import org.elasticsearch.repositories.SnapshotMetrics;
 import org.elasticsearch.xcontent.NamedXContentRegistry;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -83,22 +84,26 @@ public class GoogleCloudStoragePlugin extends Plugin implements RepositoryPlugin
 
     @Override
     public List<Setting<?>> getSettings() {
-        return Arrays.asList(
-            GoogleCloudStorageClientSettings.CREDENTIALS_FILE_SETTING,
-            GoogleCloudStorageClientSettings.ENDPOINT_SETTING,
-            GoogleCloudStorageClientSettings.PROJECT_ID_SETTING,
-            GoogleCloudStorageClientSettings.CONNECT_TIMEOUT_SETTING,
-            GoogleCloudStorageClientSettings.READ_TIMEOUT_SETTING,
-            GoogleCloudStorageClientSettings.APPLICATION_NAME_SETTING,
-            GoogleCloudStorageClientSettings.TOKEN_URI_SETTING,
-            GoogleCloudStorageClientSettings.PROXY_TYPE_SETTING,
-            GoogleCloudStorageClientSettings.PROXY_HOST_SETTING,
-            GoogleCloudStorageClientSettings.PROXY_PORT_SETTING,
-            GoogleCloudStorageClientSettings.MAX_RETRIES_SETTING,
-            GoogleCloudStorageClientSettings.MEGABYTES_COPIED_PER_CHUNK_SETTING,
-            GoogleCloudStorageClientSettings.GCS_TENACIOUS_RETRIES_ENABLED_SETTING,
-            GoogleCloudStorageClientSettings.RESUMABLE_WRITE_BUFFER_SIZE_SETTING
+        final List<Setting<?>> settings = new ArrayList<>(
+            Arrays.asList(
+                GoogleCloudStorageClientSettings.CREDENTIALS_FILE_SETTING,
+                GoogleCloudStorageClientSettings.ENDPOINT_SETTING,
+                GoogleCloudStorageClientSettings.PROJECT_ID_SETTING,
+                GoogleCloudStorageClientSettings.CONNECT_TIMEOUT_SETTING,
+                GoogleCloudStorageClientSettings.READ_TIMEOUT_SETTING,
+                GoogleCloudStorageClientSettings.APPLICATION_NAME_SETTING,
+                GoogleCloudStorageClientSettings.TOKEN_URI_SETTING,
+                GoogleCloudStorageClientSettings.PROXY_TYPE_SETTING,
+                GoogleCloudStorageClientSettings.PROXY_HOST_SETTING,
+                GoogleCloudStorageClientSettings.PROXY_PORT_SETTING,
+                GoogleCloudStorageClientSettings.MAX_RETRIES_SETTING,
+                GoogleCloudStorageClientSettings.MEGABYTES_COPIED_PER_CHUNK_SETTING,
+                GoogleCloudStorageClientSettings.GCS_TENACIOUS_RETRIES_ENABLED_SETTING,
+                GoogleCloudStorageClientSettings.RESUMABLE_WRITE_BUFFER_SIZE_SETTING
+            )
         );
+        settings.addAll(GcsStreamingUploadSettings.getSettings());
+        return settings;
     }
 
     @Override
