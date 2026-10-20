@@ -35,6 +35,12 @@ import java.util.Map;
  * read which files the repository already has of them. The generations are in the {@link RepositoryData}, which only the master loads,
  * so index nodes ask the master, as peer recovery does for the latest snapshot of a shard (see
  * {@link org.elasticsearch.action.admin.cluster.snapshots.get.shard.TransportGetShardSnapshotAction}).
+ * <p>
+ * The answer only covers snapshots that have been finalized into the {@link RepositoryData}. A running snapshot that has already
+ * finished a shard has written newer shard-level metadata for it, which the next snapshot of the shard will start from (see
+ * {@link org.elasticsearch.snapshots.InFlightShardSnapshotStates}). That generation is in the {@link
+ * org.elasticsearch.cluster.SnapshotsInProgress} of the cluster state, so a node that wants the generation the next snapshot of a shard
+ * starts from takes it from there and uses this answer only for shards without one.
  */
 public class TransportGetShardGenerationsAction extends TransportMasterNodeAction<GetShardGenerationsRequest, GetShardGenerationsResponse> {
 
@@ -72,6 +78,7 @@ public class TransportGetShardGenerationsAction extends TransportMasterNodeActio
         ClusterState state,
         ActionListener<GetShardGenerationsResponse> listener
     ) {
+        assert ThreadPool.assertCurrentThreadPool(ThreadPool.Names.SNAPSHOT_META);
         final var projectRepo = request.projectRepo();
         // throws if the repository does not exist, which is passed on to the node that asked
         final var repository = repositoriesService.repository(projectRepo.projectId(), projectRepo.name());
