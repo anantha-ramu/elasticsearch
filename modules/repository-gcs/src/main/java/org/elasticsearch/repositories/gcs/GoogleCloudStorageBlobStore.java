@@ -548,6 +548,20 @@ class GoogleCloudStorageBlobStore implements BlobStore {
     }
 
     /**
+     * @return why a streaming upload cannot be used for this source and client, or {@code null} if it can
+     */
+    @Nullable
+    static String getStreamingUploadUnavailableReason(InputStream inputStream, MeteredStorage client) {
+        if (inputStream.markSupported() == false) {
+            return "the source does not support mark and reset";
+        }
+        if (client.supportsStreamingUpload() == false) {
+            return "the storage client does not use the HTTP transport of the SDK";
+        }
+        return null;
+    }
+
+    /**
      * Uploads a blob using the "resumable upload" method (multiple requests, which
      * can be independently retried in case of failure, see
      * https://cloud.google.com/storage/docs/json_api/v1/how-tos/resumable-upload
@@ -564,23 +578,33 @@ class GoogleCloudStorageBlobStore implements BlobStore {
         long size,
         boolean failIfAlreadyExists
     ) throws IOException {
-        if (purpose == OperationPurpose.SNAPSHOT_DATA && inputStream.markSupported()) {
+        if (purpose == OperationPurpose.SNAPSHOT_DATA) {
             // Only snapshot data is streamed: the source has a cheap mark and reset (it reopens the file at the mark), and the same blob
             // store also serves other purposes (e.g. stateless commit uploads) whose sources are not suited to it.
             final GcsStreamingUploadSettings streamingSettings = storageService.getStreamingUploadSettings();
             final GcsStreamingUploadSettings.Config streamingConfig = streamingSettings.getConfig();
-            final MeteredStorage client = client();
-            if (streamingConfig.isEnabled() && client.supportsStreamingUpload()) {
-                client.meteredStreamingUpload(
-                    purpose,
-                    blobInfo,
-                    failIfAlreadyExists,
-                    inputStream,
-                    size,
-                    streamingConfig,
-                    streamingSettings.getThreadPool()
+            if (streamingConfig.isEnabled()) {
+                final MeteredStorage client = client();
+                final String unavailable = getStreamingUploadUnavailableReason(inputStream, client);
+                if (unavailable == null) {
+                    client.meteredStreamingUpload(
+                        purpose,
+                        blobInfo,
+                        failIfAlreadyExists,
+                        inputStream,
+                        size,
+                        streamingConfig,
+                        streamingSettings.getThreadPool()
+                    );
+                    return;
+                }
+                // a treatment that silently behaves like the control would be misleading, so every fallback is logged
+                logger.info(
+                    "streaming upload is enabled but blob [{}/{}] is uploaded through the SDK instead: {}",
+                    bucketName,
+                    blobInfo.getName(),
+                    unavailable
                 );
-                return;
             }
         }
         // We retry 410 GONE errors to cover the unlikely but possible scenario where a resumable upload session becomes broken and
@@ -606,7 +630,7 @@ class GoogleCloudStorageBlobStore implements BlobStore {
                  */
                 // the timing is for comparing with the streaming upload, and wraps the source and the channel only if DEBUG is on
                 final ResumableTiming timing = ResumableTiming.isEnabled()
-                    ? new ResumableTiming(blobInfo, getResumableWriteBufferSize().orElse(SDK_DEFAULT_CHUNK_SIZE))
+                    ? new ResumableTiming(purpose, blobInfo, getResumableWriteBufferSize().orElse(SDK_DEFAULT_CHUNK_SIZE))
                     : null;
                 final WritableByteChannel channel = new WritableBlobChannel(writeChannel);
                 org.elasticsearch.core.Streams.copy(

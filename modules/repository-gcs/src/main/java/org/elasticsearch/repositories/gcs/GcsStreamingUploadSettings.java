@@ -116,11 +116,18 @@ final class GcsStreamingUploadSettings {
 
     /**
      * HttpURLConnection has no write timeout. A part whose socket write makes no progress for this long is disconnected and retried.
-     * 0 disables the watchdog.
+     * 0, the default, disables the watchdog.
+     *
+     * Off by default because over TLS the disconnect does not break a stalled write: it blocks on the lock that the stalled writer holds
+     * in SSLSocketImpl (reproduced on JDK 25), and only closes the socket once the stall has cleared by itself, which then fails a write
+     * that had recovered and resends from the committed offset.
+     *
+     * TODO the proper fix: SO_LINGER on the sockets of the streaming transport (setSoLinger(true, 1) makes the close return and the
+     * writer fail), the disconnect forked off the thread that polls, and a stall test over HTTPS (the existing one is plain HTTP).
      */
     static final Setting<TimeValue> WRITE_STALL_TIMEOUT_SETTING = Setting.timeSetting(
         "gcs.streaming_upload.write_stall_timeout",
-        TimeValue.timeValueSeconds(30),
+        TimeValue.ZERO,
         TimeValue.ZERO,
         Property.Dynamic,
         Property.NodeScope

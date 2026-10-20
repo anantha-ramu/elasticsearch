@@ -117,6 +117,8 @@ public class GcsStreamingUploadTests extends ESTestCase {
     private GcsRepositoryStatsCollector statsCollector;
     private RecordingMeterRegistry meterRegistry;
     private final List<CountDownLatch> latches = new ArrayList<>();
+    /** replaces the storage client of the blob store, to make it unsuitable for streaming */
+    private java.util.function.UnaryOperator<MeteredStorage> clientWrapper;
     /** chunk size of the SDK write channel, 16MiB if not set */
     private ByteSizeValue sdkChunkSize;
 
@@ -227,7 +229,13 @@ public class GcsStreamingUploadTests extends ESTestCase {
             statsCollector,
             dataStorageClass,
             null
-        );
+        ) {
+            @Override
+            MeteredStorage client() throws IOException {
+                final MeteredStorage client = super.client();
+                return clientWrapper == null ? client : clientWrapper.apply(client);
+            }
+        };
     }
 
     private static void write(GoogleCloudStorageBlobStore store, String name, InputStream source, long size, boolean failIfAlreadyExists)
@@ -1017,13 +1025,100 @@ public class GcsStreamingUploadTests extends ESTestCase {
         }
     }
 
+    // ---- fallback to the SDK ----
+
+    public void testFallbackToTheSdkIsLogged() throws IOException {
+        // a storage client that cannot stream, which makes the upload fall back to the SDK
+        clientWrapper = real -> new MeteredStorage(real.getOptions().getService(), statsCollector) {
+            @Override
+            boolean supportsStreamingUpload() {
+                return false;
+            }
+        };
+        final var store = createBlobStore(streamingSettings(KB256));
+        final byte[] data = randomData(2 * KB256);
+        final String logger = GoogleCloudStorageBlobStore.class.getName();
+
+        MockLog.assertThatLogger(() -> {
+            try {
+                write(store, "fallback", snapshotSource(data, new AtomicInteger(), null), data.length, false);
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        },
+            logger,
+            new MockLog.SeenEventExpectation(
+                "the fallback and its reason are logged",
+                logger,
+                Level.INFO,
+                "streaming upload is enabled but blob [bucket/fallback] is uploaded through the SDK instead: "
+                    + "the storage client does not use the HTTP transport of the SDK"
+            )
+        );
+
+        assertArrayEquals(data, fake.getBlob("fallback"));
+        assertThat(counters().getFiles(), equalTo(0L));
+
+        // and nothing is logged when streaming is not enabled, or when it is used
+        final var off = createBlobStore(streamingSettings(0));
+        MockLog.assertThatLogger(() -> {
+            try {
+                write(off, "off", snapshotSource(data, new AtomicInteger(), null), data.length, false);
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        }, logger, new MockLog.PatternNotSeenEventExpectation("no fallback when off", logger, Level.INFO, ".*uploaded through the SDK.*"));
+        clientWrapper = null;
+        final var on = createBlobStore(streamingSettings(KB256));
+        MockLog.assertThatLogger(() -> {
+            try {
+                write(on, "on", snapshotSource(data, new AtomicInteger(), null), data.length, false);
+            } catch (IOException e) {
+                throw new AssertionError(e);
+            }
+        },
+            logger,
+            new MockLog.PatternNotSeenEventExpectation("no fallback when streamed", logger, Level.INFO, ".*uploaded through the SDK.*")
+        );
+        assertThat(counters().getFiles(), equalTo(1L));
+    }
+
+    public void testReasonWhyStreamingIsUnavailable() {
+        final var store = createBlobStore(streamingSettings(KB256));
+        final MeteredStorage client;
+        try {
+            client = store.client();
+        } catch (IOException e) {
+            throw new AssertionError(e);
+        }
+        assertTrue(client.supportsStreamingUpload());
+        assertThat(
+            GoogleCloudStorageBlobStore.getStreamingUploadUnavailableReason(new java.io.ByteArrayInputStream(new byte[1]), client),
+            org.hamcrest.Matchers.nullValue()
+        );
+        final InputStream noMark = new FilterInputStream(new java.io.ByteArrayInputStream(new byte[1])) {
+            @Override
+            public boolean markSupported() {
+                return false;
+            }
+        };
+        assertThat(
+            GoogleCloudStorageBlobStore.getStreamingUploadUnavailableReason(noMark, client),
+            equalTo("the source does not support mark and reset")
+        );
+    }
+
     // ---- timing of the SDK path ----
 
     private static final String TIMING_LOGGER = "org.elasticsearch.repositories.gcs.ResumableTiming";
 
     private void writeThroughTheSdk(String name, byte[] data) {
+        writeThroughTheSdk(OperationPurpose.SNAPSHOT_DATA, name, data);
+    }
+
+    private void writeThroughTheSdk(OperationPurpose purpose, String name, byte[] data) {
         try {
-            write(createBlobStoreForSdk(), name, snapshotSource(data, new AtomicInteger(), null), data.length, false);
+            createBlobStoreForSdk().writeBlob(purpose, name, snapshotSource(data, new AtomicInteger(), null), data.length, false);
         } catch (IOException e) {
             throw new AssertionError(e);
         }
@@ -1058,14 +1153,14 @@ public class GcsStreamingUploadTests extends ESTestCase {
                     "a full chunk is flushed",
                     TIMING_LOGGER,
                     Level.DEBUG,
-                    "piece \\[\\d+\\] of \\[bucket/blob\\] end_offset \\[\\d+\\] flushed_bytes \\[262144\\] flush_ms \\[\\d+\\] "
-                        + "source_read_ms \\[\\d+\\] reads \\[\\d+\\]"
+                    "piece \\[\\d+\\] of \\[bucket/blob\\] purpose \\[SNAPSHOT_DATA\\] end_offset \\[\\d+\\] "
+                        + "flushed_bytes \\[262144\\] flush_ms \\[\\d+\\] source_read_ms \\[\\d+\\] reads \\[\\d+\\]"
                 ),
                 new MockLog.PatternSeenEventExpectation(
                     "the last chunk is sent when the channel is closed",
                     TIMING_LOGGER,
                     Level.DEBUG,
-                    "piece \\[\\d+\\] of \\[bucket/blob\\] last end_offset \\["
+                    "piece \\[\\d+\\] of \\[bucket/blob\\] purpose \\[SNAPSHOT_DATA\\] last end_offset \\["
                         + data.length
                         + "\\] flushed_bytes \\[100\\] flush_ms \\[\\d+\\] "
                         + "source_read_ms \\[\\d+\\] reads \\[\\d+\\]"
@@ -1074,7 +1169,7 @@ public class GcsStreamingUploadTests extends ESTestCase {
                     "totals",
                     TIMING_LOGGER,
                     Level.DEBUG,
-                    "uploaded \\[bucket/blob\\] bytes \\["
+                    "uploaded \\[bucket/blob\\] purpose \\[SNAPSHOT_DATA\\] bytes \\["
                         + data.length
                         + "\\] pieces \\[\\d+\\] total_ms \\[\\d+\\] source_read_ms \\[\\d+\\] "
                         + "reads \\[\\d+\\] flush_ms \\[\\d+\\]"
@@ -1085,6 +1180,39 @@ public class GcsStreamingUploadTests extends ESTestCase {
         }
         assertArrayEquals(data, fake.getBlob("blob"));
         assertThat("the streaming upload is not involved", counters().getFiles(), equalTo(0L));
+    }
+
+    public void testSdkPathTimingTellsThePurposeApart() {
+        // the same blob store also uploads other things, such as the commits of stateless shards
+        final byte[] data = randomData(3 * KB256 + 100);
+        final OperationPurpose other = randomValueOtherThan(OperationPurpose.SNAPSHOT_DATA, () -> randomFrom(OperationPurpose.values()));
+        Loggers.setLevel(ResumableTiming.logger, Level.DEBUG);
+        try {
+            MockLog.assertThatLogger(
+                () -> writeThroughTheSdk(other, "other", data),
+                TIMING_LOGGER,
+                new MockLog.PatternSeenEventExpectation(
+                    "a piece names the purpose",
+                    TIMING_LOGGER,
+                    Level.DEBUG,
+                    "piece \\[\\d+\\] of \\[bucket/other\\] purpose \\[" + other + "\\] .*"
+                ),
+                new MockLog.PatternSeenEventExpectation(
+                    "the totals name the purpose",
+                    TIMING_LOGGER,
+                    Level.DEBUG,
+                    "uploaded \\[bucket/other\\] purpose \\[" + other + "\\] bytes .*"
+                ),
+                new MockLog.PatternNotSeenEventExpectation(
+                    "and not that of snapshot data",
+                    TIMING_LOGGER,
+                    Level.DEBUG,
+                    ".*purpose \\[SNAPSHOT_DATA\\].*"
+                )
+            );
+        } finally {
+            Loggers.setLevel(ResumableTiming.logger, (Level) null);
+        }
     }
 
     public void testSdkPathTimingChangesNothingAtInfo() {

@@ -46,7 +46,8 @@ public class GcsStreamingUploadSettingsTests extends ESTestCase {
         assertThat(config.getMaxRetryTime(), equalTo(TimeValue.timeValueMinutes(5)));
         assertThat(config.getInitialBackoff(), equalTo(TimeValue.timeValueMillis(500)));
         assertThat(config.getMaxBackoff(), equalTo(TimeValue.timeValueSeconds(30)));
-        assertThat(config.getWriteStallTimeout(), equalTo(TimeValue.timeValueSeconds(30)));
+        // off: over TLS the disconnect of the watchdog does not break a stalled write, see the setting
+        assertThat(config.getWriteStallTimeout(), equalTo(TimeValue.ZERO));
     }
 
     public void testPartSizeMustBeAMultipleOf256kb() {

@@ -714,7 +714,13 @@ final class GcsStreamingUpload {
      * with an IOException and sends the part into the retry. Time spent reading the source, which may legitimately block for a long time
      * on the snapshot rate limiter, does not count.
      *
-     * It is a periodic task on the scheduler of the thread pool, the upload does not start a thread of its own.
+     * It is a periodic task of the thread pool, the upload does not start a thread of its own. The scheduler thread only hands each poll
+     * to the generic executor, so run() and the disconnect() in it are on a generic thread. A disconnect that blocks therefore ties up one
+     * generic thread (and this watchdog's later polls, which are rescheduled after run() returns), not the timers of the scheduler.
+     *
+     * Switched off by default, see {@link GcsStreamingUploadSettings#WRITE_STALL_TIMEOUT_SETTING}: over TLS disconnect() blocks on the lock
+     * of the stalled writer. TODO SO_LINGER on the sockets of the streaming transport, the disconnect forked off the polling thread, and a
+     * stall test over HTTPS.
      */
     private static final class Watchdog implements AutoCloseable, Runnable {
         private static final long IDLE = Long.MIN_VALUE;

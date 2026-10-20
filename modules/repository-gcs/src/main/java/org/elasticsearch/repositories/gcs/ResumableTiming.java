@@ -13,6 +13,7 @@ import com.google.cloud.storage.BlobInfo;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.core.SuppressForbidden;
 
 import java.io.FilterInputStream;
@@ -29,7 +30,8 @@ import java.util.concurrent.TimeUnit;
  *
  * Only used when the logger is enabled for DEBUG; the upload does not create or call any of this otherwise.
  *
- * For each piece, a line with the bytes flushed, the time the flushing write took, and the time spent blocked in reads of the source
+ * For each piece, a line with the purpose of the upload (the same blob store serves snapshot data and, in stateless, commit uploads), the
+ * bytes flushed, the time the flushing write took, and the time spent blocked in reads of the source
  * since the previous flush. The SDK does not say when it flushes, so a write is taken for a flush when it crosses a multiple of the chunk
  * size or when it took long, as copying into the chunk buffer takes microseconds. The close of the channel sends the last chunk.
  */
@@ -44,6 +46,7 @@ final class ResumableTiming {
         return logger.isDebugEnabled();
     }
 
+    private final OperationPurpose purpose;
     private final String description;
     private final long chunkSize;
     private final long startNanos = System.nanoTime();
@@ -56,7 +59,8 @@ final class ResumableTiming {
     private long readNanos;
     private long flushNanos;
 
-    ResumableTiming(BlobInfo blobInfo, long chunkSize) {
+    ResumableTiming(OperationPurpose purpose, BlobInfo blobInfo, long chunkSize) {
+        this.purpose = purpose;
         this.description = blobInfo.getBucket() + "/" + blobInfo.getName();
         this.chunkSize = chunkSize;
     }
@@ -129,8 +133,9 @@ final class ResumableTiming {
         } finally {
             pieceFlushed(System.nanoTime() - start, written % chunkSize, true);
             logger.debug(
-                "uploaded [{}] bytes [{}] pieces [{}] total_ms [{}] source_read_ms [{}] reads [{}] flush_ms [{}]",
+                "uploaded [{}] purpose [{}] bytes [{}] pieces [{}] total_ms [{}] source_read_ms [{}] reads [{}] flush_ms [{}]",
                 description,
+                purpose,
                 written,
                 pieces,
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos),
@@ -150,9 +155,10 @@ final class ResumableTiming {
 
     private void pieceFlushed(long flushNanosOfPiece, long bytes, boolean last) {
         logger.debug(
-            "piece [{}] of [{}] {}end_offset [{}] flushed_bytes [{}] flush_ms [{}] source_read_ms [{}] reads [{}]",
+            "piece [{}] of [{}] purpose [{}] {}end_offset [{}] flushed_bytes [{}] flush_ms [{}] source_read_ms [{}] reads [{}]",
             pieces,
             description,
+            purpose,
             last ? "last " : "",
             written,
             bytes,
