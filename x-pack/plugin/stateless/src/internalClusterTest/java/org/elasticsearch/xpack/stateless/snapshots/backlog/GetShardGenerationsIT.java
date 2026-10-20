@@ -115,8 +115,20 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
             );
         }
 
+        // deleting a snapshot (as retention does) writes new shard-level metadata for every shard of it as well
+        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, "snap-1"));
+        final var afterFirstDelete = getShardGenerations(indexNode, REPOSITORY, shardIds);
+        assertThat(afterFirstDelete.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
+        assertThat(afterFirstDelete.shardGenerations(), equalTo(expectedShardGenerations(shardIds)));
+        for (ShardId shardId : shardIds) {
+            assertThat(
+                afterFirstDelete.shardGenerations().get(shardId).generation(),
+                not(equalTo(afterSecondSnapshot.shardGenerations().get(shardId).generation()))
+            );
+        }
+
         // once no snapshot refers to the index the repository holds nothing of the shards any more
-        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, "snap-1", "snap-2"));
+        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, "snap-2"));
         final var afterDelete = getShardGenerations(indexNode, REPOSITORY, shardIds);
         assertThat(afterDelete.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
         assertThat(afterDelete.shardGenerations(), anEmptyMap());
