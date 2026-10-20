@@ -93,10 +93,9 @@ final class SourceReadPrefetch {
     }
 
     private void maybeDropPooledPages() {
-        // the pages that were kept for reuse are of no use once nothing reads ahead, and are heap
-        if (plan().mode() == Mode.SINGLE) {
-            pool.clear();
-        }
+        // the pages that are kept for reuse are of no use once nothing reads ahead, and are heap, also those that a read that was still
+        // going gives back later
+        pool.setRetainPages(plan().mode() != Mode.SINGLE);
     }
 
     SourceReadBufferPool getPool() {

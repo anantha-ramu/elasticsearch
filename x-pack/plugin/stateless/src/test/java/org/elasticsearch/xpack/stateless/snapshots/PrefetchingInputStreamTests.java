@@ -9,7 +9,7 @@ package org.elasticsearch.xpack.stateless.snapshots;
 
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
-import org.elasticsearch.core.CheckedRunnable;
+import org.elasticsearch.core.CheckedSupplier;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.threadpool.FixedExecutorBuilder;
 import org.elasticsearch.threadpool.TestThreadPool;
@@ -237,10 +237,10 @@ public class PrefetchingInputStreamTests extends ESTestCase {
      * faster than over one connection.
      */
     public void testParallelRangesOverlapAndReadFasterThanOneConnection() throws Exception {
-        assertWithRetries(3, this::testParallelRangesOverlapAndReadFasterThanOneConnectionOnce);
+        assertTimingWithRetries(3, this::testParallelRangesOverlapAndReadFasterThanOneConnectionOnce);
     }
 
-    private void testParallelRangesOverlapAndReadFasterThanOneConnectionOnce() throws Exception {
+    private String testParallelRangesOverlapAndReadFasterThanOneConnectionOnce() throws Exception {
         final int rangeSize = 128 * 1024;
         final int length = 8 * rangeSize;
         final int connections = between(2, 4);
@@ -264,12 +264,11 @@ public class PrefetchingInputStreamTests extends ESTestCase {
         assertThat("ranges were open at the same time", store.maxOpenGets.get(), greaterThan(1));
         assertThat(store.maxOpenGets.get(), lessThanOrEqualTo(connections));
         // the ideal is 1/connections of the time of one connection; the bar is far below what one connection can do
-        assertThat(
-            "parallel [" + parallelNanos + "ns] vs single [" + singleNanos + "ns]",
-            (double) parallelNanos,
-            lessThan(0.8 * singleNanos)
-        );
+        final String timing = (double) parallelNanos < 0.8 * singleNanos
+            ? null
+            : "parallel [" + parallelNanos + "ns] vs single [" + singleNanos + "ns]";
         assertIdle(pool);
+        return timing;
     }
 
     /**
@@ -278,10 +277,10 @@ public class PrefetchingInputStreamTests extends ESTestCase {
      * chunks are written, so the part takes the time of the slower of the two.
      */
     public void testReadAheadOverlapsReadsWithWrites() throws Exception {
-        assertWithRetries(3, this::testReadAheadOverlapsReadsWithWritesOnce);
+        assertTimingWithRetries(3, this::testReadAheadOverlapsReadsWithWritesOnce);
     }
 
-    private void testReadAheadOverlapsReadsWithWritesOnce() throws Exception {
+    private String testReadAheadOverlapsReadsWithWritesOnce() throws Exception {
         final int rangeSize = 128 * 1024;
         final int length = 8 * rangeSize;
         final long rate = 8L * 1024 * 1024;
@@ -311,12 +310,11 @@ public class PrefetchingInputStreamTests extends ESTestCase {
             greaterThan(store.writes.get() / 2)
         );
         assertThat(store.maxOpenGets.get(), equalTo(1));
-        assertThat(
-            "read-ahead [" + readAheadNanos + "ns] vs plain [" + plainNanos + "ns]",
-            (double) readAheadNanos,
-            lessThan(0.85 * plainNanos)
-        );
+        final String timing = (double) readAheadNanos < 0.85 * plainNanos
+            ? null
+            : "read-ahead [" + readAheadNanos + "ns] vs plain [" + plainNanos + "ns]";
         assertIdle(pool);
+        return timing;
     }
 
     private static void copy(InputStream in, OutputStream out, int chunk) throws IOException {
@@ -662,18 +660,22 @@ public class PrefetchingInputStreamTests extends ESTestCase {
 
     /**
      * The tests of speed compare the times of two reads that sleep to stay under a rate, which a machine that is busy with something
-     * else stretches, so a failed comparison is tried again, twice, before it is a failure. Where the reads overlap is checked in each try.
+     * else stretches. Each try checks, and fails on, what has to hold however slow the machine is: how many reads were open, and whether
+     * they overlapped. Only when the times do not compare as they should is the try made again, twice, before that is a failure.
+     *
+     * @param attempt the try, which returns null if the times compared as they should, and what they were if they did not
      */
-    private static void assertWithRetries(int attempts, CheckedRunnable<Exception> attempt) throws Exception {
-        for (int i = 1;; i++) {
-            try {
-                attempt.run();
-                return;
-            } catch (AssertionError e) {
-                if (i == attempts) {
-                    throw e;
+    private void assertTimingWithRetries(int attempts, CheckedSupplier<String, Exception> attempt) throws Exception {
+        String last = null;
+        for (int i = 1; i <= attempts; i++) {
+            last = attempt.get();
+            if (last == null) {
+                if (i > 1) {
+                    logger.info("the times compared as they should in try [{}] of [{}]", i, attempts);
                 }
+                return;
             }
         }
+        fail("the times did not compare as they should in [" + attempts + "] tries, the last was " + last);
     }
 }

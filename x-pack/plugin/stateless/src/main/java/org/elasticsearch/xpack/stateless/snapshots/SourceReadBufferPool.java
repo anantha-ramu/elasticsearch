@@ -31,6 +31,7 @@ final class SourceReadBufferPool {
     private final AtomicInteger freeCount = new AtomicInteger();
     private final AtomicLong pagesInUse = new AtomicLong();
     private volatile long capPages;
+    private volatile boolean retainPages = true;
 
     SourceReadBufferPool(long capBytes) {
         this(PAGE_SIZE_BYTES, capBytes);
@@ -51,6 +52,17 @@ final class SourceReadBufferPool {
     void setCapBytes(long capBytes) {
         this.capPages = Math.max(0, capBytes) / pageSize;
         trimFree();
+    }
+
+    /**
+     * Whether released pages are kept for reuse. A node that does not read ahead keeps none, so that the pages of a read that was still
+     * going when the settings were switched off are not held on to after it ends.
+     */
+    void setRetainPages(boolean retainPages) {
+        this.retainPages = retainPages;
+        if (retainPages == false) {
+            clear();
+        }
     }
 
     long getCapBytes() {
@@ -145,7 +157,7 @@ final class SourceReadBufferPool {
         void release() {
             if (released.compareAndSet(false, true)) {
                 for (int i = 0; i < pages.length; i++) {
-                    if (freeCount.get() < capPages) {
+                    if (retainPages && freeCount.get() < capPages) {
                         freeCount.incrementAndGet();
                         free.add(pages[i]);
                     }

@@ -24,7 +24,7 @@ import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
-import org.elasticsearch.core.CheckedRunnable;
+import org.elasticsearch.core.CheckedSupplier;
 import org.elasticsearch.core.PathUtils;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexVersion;
@@ -571,6 +571,53 @@ public class StatelessSnapshotShardContextPrefetchTests extends ESTestCase {
         assertIdle(pool, store);
     }
 
+    /**
+     * What the streaming upload's resume does: the source is reset to the mark while a range that is further on is in flight, blocked on
+     * the network. The stream that is dropped must not hand the new one a stale range, and must give back everything it holds once the
+     * blocked read returns.
+     */
+    public void testResetWhileARangeIsBlockedInFlight() throws Exception {
+        final int rangeSize = 64;
+        final int fileLength = 30 * rangeSize + CodecUtil.footerLength();
+        final var bytes = fileOfLength(fileLength);
+        final var store = blobOf(bytes, 0, 0, 0);
+        final int blockedRange = between(2, 6);
+        final int blockFrom = blockedRange * rangeSize;
+        final var blocked = new CountDownLatch(1);
+        final var release = new CountDownLatch(1);
+        final var blockedOnce = new AtomicBoolean();
+        store.beforeRead = position -> {
+            // the first read of the range blocks, the reads of the stream that replaces it do not
+            if (position >= blockFrom && blockedOnce.compareAndSet(false, true)) {
+                blocked.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    throw new IOException(e);
+                }
+            }
+        };
+        final var pool = new SourceReadBufferPool(PAGE, Long.MAX_VALUE / 4);
+        final var context = contextOf(store, 0, fileLength, prefetch(randomFrom(Mode.READ_AHEAD, Mode.PARALLEL), rangeSize, pool));
+        try (var fileReader = fileReader(context)) {
+            final var in = fileReader.openInput(fileLength);
+            final int mark = between(0, rangeSize - 1);
+            assertArrayEquals(Arrays.copyOf(bytes, mark), in.readNBytes(mark));
+            in.mark(Integer.MAX_VALUE);
+            // as far as the range before the blocked one, which has the blocked one in flight behind it
+            final int upTo = (blockedRange - 1) * rangeSize + between(1, rangeSize);
+            assertArrayEquals(Arrays.copyOfRange(bytes, mark, upTo), in.readNBytes(upTo - mark));
+            safeAwait(blocked);
+
+            in.reset(); // while the range is blocked
+            release.countDown();
+
+            assertArrayEquals(Arrays.copyOfRange(bytes, mark, fileLength), in.readAllBytes());
+            fileReader.verify();
+        }
+        assertIdle(pool, store); // the GET of the blocked range was closed by the task, once it stopped
+    }
+
     public void testFailureOfAReadSurfacesToTheConsumer() throws Exception {
         final int rangeSize = between(PAGE, 256);
         final int fileLength = between(4 * rangeSize, 10 * rangeSize) + CodecUtil.footerLength();
@@ -594,10 +641,10 @@ public class StatelessSnapshotShardContextPrefetchTests extends ESTestCase {
      * reads with the writes, so the file takes the time of the slower of the two instead of both.
      */
     public void testReadAheadOverlapsTheReadsWithTheWritesOfTheUpload() throws Exception {
-        assertWithRetries(3, this::testReadAheadOverlapsTheReadsWithTheWritesOfTheUploadOnce);
+        assertTimingWithRetries(3, this::testReadAheadOverlapsTheReadsWithTheWritesOfTheUploadOnce);
     }
 
-    private void testReadAheadOverlapsTheReadsWithTheWritesOfTheUploadOnce() throws Exception {
+    private String testReadAheadOverlapsTheReadsWithTheWritesOfTheUploadOnce() throws Exception {
         final int fileLength = 1024 * 1024;
         final var bytes = fileOfLength(fileLength);
         final long rate = 8L * 1024 * 1024;
@@ -620,8 +667,11 @@ public class StatelessSnapshotShardContextPrefetchTests extends ESTestCase {
             greaterThan(ahead.writes.get() / 2)
         );
         assertThat("one connection", ahead.maxOpenGets.get(), equalTo(1));
-        assertThat("read-ahead [" + aheadNanos + "ns] vs off [" + offNanos + "ns]", (double) aheadNanos, lessThan(0.85 * offNanos));
+        final String timing = (double) aheadNanos < 0.85 * offNanos
+            ? null
+            : "read-ahead [" + aheadNanos + "ns] vs off [" + offNanos + "ns]";
         assertIdle(pool, ahead);
+        return timing;
     }
 
     /**
@@ -629,10 +679,10 @@ public class StatelessSnapshotShardContextPrefetchTests extends ESTestCase {
      * file is faster than over the one connection.
      */
     public void testParallelRangesOverlapAndReadFasterThanOneConnection() throws Exception {
-        assertWithRetries(3, this::testParallelRangesOverlapAndReadFasterThanOneConnectionOnce);
+        assertTimingWithRetries(3, this::testParallelRangesOverlapAndReadFasterThanOneConnectionOnce);
     }
 
-    private void testParallelRangesOverlapAndReadFasterThanOneConnectionOnce() throws Exception {
+    private String testParallelRangesOverlapAndReadFasterThanOneConnectionOnce() throws Exception {
         final int fileLength = 1024 * 1024;
         final var bytes = fileOfLength(fileLength);
         final long rate = 8L * 1024 * 1024;
@@ -653,8 +703,11 @@ public class StatelessSnapshotShardContextPrefetchTests extends ESTestCase {
         final long parallelNanos = readOnly(parallel, fileLength, prefetch);
         assertThat("ranges were fetched at the same time", parallel.maxOpenGets.get(), greaterThan(1));
         assertThat(parallel.maxOpenGets.get(), org.hamcrest.Matchers.lessThanOrEqualTo(connections));
-        assertThat("parallel [" + parallelNanos + "ns] vs off [" + offNanos + "ns]", (double) parallelNanos, lessThan(0.8 * offNanos));
+        final String timing = (double) parallelNanos < 0.8 * offNanos
+            ? null
+            : "parallel [" + parallelNanos + "ns] vs off [" + offNanos + "ns]";
         assertIdle(pool, parallel);
+        return timing;
     }
 
     private long upload(RateLimitedFakeStore store, int fileLength, SourceReadPrefetch prefetch) throws IOException {
@@ -716,9 +769,18 @@ public class StatelessSnapshotShardContextPrefetchTests extends ESTestCase {
         assertThat(prefetch.plan().rangeSize(), equalTo(1024 * 1024));
         assertThat(prefetch.getPool().getCapBytes(), equalTo(ByteSizeValue.ofMb(10).getBytes()));
 
+        final var inFlight = prefetch.getPool().tryAcquire(1);
+        assertNotNull(inFlight);
         clusterSettings.applySettings(Settings.EMPTY);
+        inFlight.release(); // a read that was still going when the settings were switched off gives its pages back
+        assertThat("and they are not kept", prefetch.getPool().getFreePages(), equalTo(0L));
         assertThat(prefetch.plan(), equalTo(SourceReadPrefetch.Plan.SINGLE));
         assertThat("the pages that were kept are dropped", prefetch.getPool().getFreePages(), equalTo(0L));
+
+        // and they are kept again once a mode is on
+        clusterSettings.applySettings(Settings.builder().put(StatelessSnapshotSettings.SOURCE_READ_AHEAD_SETTING.getKey(), true).build());
+        prefetch.getPool().tryAcquire(1).release();
+        assertThat(prefetch.getPool().getFreePages(), equalTo(1L));
     }
 
     public void testPageIsNotHumongousAndTheCapDefaultsToAShareOfTheHeap() {
@@ -786,18 +848,22 @@ public class StatelessSnapshotShardContextPrefetchTests extends ESTestCase {
 
     /**
      * The tests of speed compare the times of two reads that sleep to stay under a rate, which a machine that is busy with something
-     * else stretches, so a failed comparison is tried again, twice, before it is a failure. Where the reads overlap is checked in each try.
+     * else stretches. Each try checks, and fails on, what has to hold however slow the machine is: how many reads were open, and whether
+     * they overlapped. Only when the times do not compare as they should is the try made again, twice, before that is a failure.
+     *
+     * @param attempt the try, which returns null if the times compared as they should, and what they were if they did not
      */
-    private static void assertWithRetries(int attempts, CheckedRunnable<Exception> attempt) throws Exception {
-        for (int i = 1;; i++) {
-            try {
-                attempt.run();
-                return;
-            } catch (AssertionError e) {
-                if (i == attempts) {
-                    throw e;
+    private void assertTimingWithRetries(int attempts, CheckedSupplier<String, Exception> attempt) throws Exception {
+        String last = null;
+        for (int i = 1; i <= attempts; i++) {
+            last = attempt.get();
+            if (last == null) {
+                if (i > 1) {
+                    logger.info("the times compared as they should in try [{}] of [{}]", i, attempts);
                 }
+                return;
             }
         }
+        fail("the times did not compare as they should in [" + attempts + "] tries, the last was " + last);
     }
 }
