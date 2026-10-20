@@ -86,7 +86,15 @@ class GoogleCloudStorageRetryingInputStream extends RetryingInputStream<Long> {
                     if (timed) {
                         GcsSocketObserver.beginRequest();
                     }
-                    final HttpResponse resp = meteredGet.executeMedia();
+                    final HttpResponse resp;
+                    try {
+                        resp = meteredGet.executeMedia();
+                    } catch (IOException | RuntimeException e) {
+                        if (timed) {
+                            GcsSocketObserver.endRequest(); // so that this thread does not keep the socket of the request that failed
+                        }
+                        throw e;
+                    }
                     final long headersNanos = timed ? System.nanoTime() - requestStartNanos : 0L;
                     final GcsSocketObserver.Connection connection = timed ? GcsSocketObserver.endRequest() : null;
                     // Store the generation of the first response we received, so we can detect

@@ -32,6 +32,9 @@ final class GcsReadTiming {
 
     private static final double MIB = 1024 * 1024;
 
+    /** A read that takes this long has waited for data, as one that is served from what was received before does not. */
+    private static final long BLOCKED_READ_NANOS = 1_000_000;
+
     private GcsReadTiming() {}
 
     static boolean isEnabled() {
@@ -73,6 +76,8 @@ final class GcsReadTiming {
         private final GcsSocketObserver.Connection connection;
         private long bytes;
         private long readNanos;
+        private long blockedNanos;
+        private long blockedBytes;
         private long firstByteNanos = -1;
         private boolean logged;
 
@@ -127,6 +132,12 @@ final class GcsReadTiming {
         private void afterRead(long beginNanos, int n) {
             final long now = System.nanoTime();
             readNanos += now - beginNanos;
+            if (n > 0 && now - beginNanos >= BLOCKED_READ_NANOS) {
+                // The read waited for the network: whatever it returned was mostly not there when it was called, so over such reads the
+                // bytes per second are the rate at which the connection delivered, whatever the consumer did between its reads.
+                blockedNanos += now - beginNanos;
+                blockedBytes += n;
+            }
             if (n > 0) {
                 bytes += n;
                 if (firstByteNanos < 0) {
@@ -157,7 +168,8 @@ final class GcsReadTiming {
             logger.debug(
                 "GET repository [{}] purpose [{}] blob [{}/{}] range_start [{}] range_length [{}] bytes [{}] elapsed_ms [{}] "
                     + "first_byte_ms [{}] headers_ms [{}] "
-                    + "in_read_ms [{}] rate_mib_s [{}] in_read_rate_mib_s [{}] {} thread [{}]",
+                    + "in_read_ms [{}] rate_mib_s [{}] in_read_rate_mib_s [{}] "
+                    + "blocked_ms [{}] blocked_bytes [{}] blocked_rate_mib_s [{}] {} thread [{}]",
                 repository,
                 purpose,
                 bucket,
@@ -171,6 +183,9 @@ final class GcsReadTiming {
                 TimeUnit.NANOSECONDS.toMillis(readNanos),
                 rate(bytes, dataNanos),
                 rate(bytes, readNanos),
+                TimeUnit.NANOSECONDS.toMillis(blockedNanos),
+                blockedBytes,
+                rate(blockedBytes, blockedNanos),
                 connection == null ? "connection unknown" : connection.toString(),
                 Thread.currentThread().getName()
             );

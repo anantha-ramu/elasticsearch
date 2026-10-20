@@ -314,4 +314,25 @@ public class GcsSocketObserverTests extends ESTestCase {
             return delegate.createSocket(address, port, localAddress, localPort);
         }
     }
+
+    /**
+     * Connections that were made before a logger was switched to DEBUG are in use when it is: they are known then, and reported as reused,
+     * as they have served requests that nobody counted.
+     */
+    public void testConnectionMadeBeforeObservingIsKnownOnceObservingStartsAndIsReused() throws IOException {
+        final var observing = new java.util.concurrent.atomic.AtomicBoolean(false);
+        final var factory = GcsSocketObserver.observing(trustingFactory, observing::get);
+        GcsSocketObserver.beginRequest();
+        get(factory);
+        assertThat("nothing is observed while it is off", GcsSocketObserver.endRequest(), nullValue());
+
+        observing.set(true);
+        GcsSocketObserver.beginRequest();
+        get(factory); // over the connection that was kept alive
+        final var connection = GcsSocketObserver.endRequest();
+        assertThat(connection, notNullValue());
+        assertTrue("made while nothing was observed, so used before", connection.reused());
+        assertThat(connection.remote(), containsString(":" + server.getAddress().getPort()));
+        assertThat(connection.receiveBuffer(), greaterThan(0));
+    }
 }

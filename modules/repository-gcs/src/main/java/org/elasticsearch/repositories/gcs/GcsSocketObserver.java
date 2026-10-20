@@ -40,11 +40,13 @@ import javax.net.ssl.SSLSocketFactory;
  * socket that is made, and wraps it in one that notes the thread that writes to it. A request writes its head on the thread that executes
  * it, so after the request that thread's last written socket is the one the request used, and a socket that an observed request used before
  * is a reuse (requests that nobody observes, such as listings, are not counted, so a first observed request may be reported as new on a
- * connection that was in use already).
+ * connection that was made while observing and used by such requests).
  * <p>
  * It is installed once per transport, as the one factory of the transport, so that the keep-alive cache, which is keyed by it, is shared as
- * it is without it. It wraps a socket only while {@link #isObserving()} says so, which is when one of the loggers that make use of it is at
- * DEBUG; a socket made at any other time is the JDK's own. The connections of GCS are TLS ones. Requests over plain HTTP, as in the tests
+ * it is without it. It wraps every socket, so that connections made before a logger was switched to DEBUG are known when it is, and a
+ * wrapped socket notes the thread that writes to it only while {@link #isObserving()} says so, which is when one of the loggers that make
+ * use of it is at DEBUG; with those off a write costs a check of the level more than it did. A connection that was made while nothing was
+ * observed is reported as reused, as it was used before. The connections of GCS are TLS ones. Requests over plain HTTP, as in the tests
  * against a local fixture, are not observed.
  */
 final class GcsSocketObserver {
@@ -91,7 +93,8 @@ final class GcsSocketObserver {
         if (socket == null) {
             return null;
         }
-        final boolean reused = socket.requests.getAndIncrement() > 0;
+        // a socket that was made while nothing was observed has served requests before this one, which were not counted
+        final boolean reused = socket.requests.getAndIncrement() > 0 || socket.madeWhileObserving == false;
         return new Connection(socket.id, remoteOf(socket.delegate), reused, receiveBufferOf(socket.delegate));
     }
 
@@ -133,8 +136,9 @@ final class GcsSocketObserver {
         }
 
         private Socket wrap(Socket socket) {
-            if (socket instanceof SSLSocket ssl && observing.getAsBoolean()) {
-                return new ObservedSocket(ssl);
+            if (socket instanceof SSLSocket ssl) {
+                // always wrapped, so that a connection that is made while nothing is logged can be told apart when it is used later
+                return new ObservedSocket(ssl, observing, observing.getAsBoolean());
             }
             return socket;
         }
@@ -193,10 +197,14 @@ final class GcsSocketObserver {
         private final SSLSocket delegate;
         private final long id = SOCKET_IDS.incrementAndGet();
         private final AtomicInteger requests = new AtomicInteger();
+        private final BooleanSupplier observing;
+        private final boolean madeWhileObserving;
         private volatile OutputStream out;
 
-        ObservedSocket(SSLSocket delegate) {
+        ObservedSocket(SSLSocket delegate, BooleanSupplier observing, boolean madeWhileObserving) {
             this.delegate = delegate;
+            this.observing = observing;
+            this.madeWhileObserving = madeWhileObserving;
         }
 
         @Override
@@ -207,14 +215,20 @@ final class GcsSocketObserver {
                 stream = new OutputStream() {
                     @Override
                     public void write(int b) throws IOException {
-                        LAST_WRITTEN.set(ObservedSocket.this);
+                        note();
                         wrapped.write(b);
                     }
 
                     @Override
                     public void write(byte[] b, int off, int len) throws IOException {
-                        LAST_WRITTEN.set(ObservedSocket.this);
+                        note();
                         wrapped.write(b, off, len);
+                    }
+
+                    private void note() {
+                        if (observing.getAsBoolean()) {
+                            LAST_WRITTEN.set(ObservedSocket.this);
+                        }
                     }
 
                     @Override

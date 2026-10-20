@@ -724,7 +724,8 @@ public class GcsStreamingUploadTests extends ESTestCase {
                     DEBUG_LOGGER,
                     Level.DEBUG,
                     "part \\[0\\] of \\[bucket/blob\\] range .* request_ms \\[\\d+\\] connection_rate_mib_s \\[(\\d+\\.\\d|n/a)\\] "
-                        + "socket_write_rate_mib_s \\[(\\d+\\.\\d|n/a)\\] connection unknown"
+                        + "socket_write_rate_mib_s \\[(\\d+\\.\\d|n/a)\\] "
+                        + "blocked_write_rate_mib_s \\[(\\d+\\.\\d|n/a)\\] connection unknown"
                 ),
                 new MockLog.PatternSeenEventExpectation(
                     "file timing logged at debug",
