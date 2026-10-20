@@ -53,6 +53,7 @@ import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
 import org.elasticsearch.xpack.stateless.StatelessMockRepository;
 import org.elasticsearch.xpack.stateless.StatelessMockRepositoryPlugin;
 import org.elasticsearch.xpack.stateless.StatelessMockRepositoryStrategy;
+import org.elasticsearch.xpack.stateless.StatelessPlugin;
 import org.elasticsearch.xpack.stateless.TestUtils;
 import org.elasticsearch.xpack.stateless.cache.SharedBlobCacheWarmingService;
 import org.elasticsearch.xpack.stateless.cache.StatelessSharedBlobCacheService;
@@ -104,6 +105,7 @@ import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSetti
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
@@ -126,6 +128,89 @@ public class StatelessSnapshotIT extends AbstractStatelessPluginIntegTestCase {
     @Override
     protected boolean addMockFsRepository() {
         return false;
+    }
+
+    /**
+     * The snapshot source reads, which are off by default, are on for some of the runs of every test of this class, with a range, a number
+     * of connections, and memory for the buffers that make little of the files of the tests: they are mostly smaller than the smallest
+     * range, so this is the wiring and the settings. {@link #testSnapshotOfFilesLargerThanARangeReadAheadAndInParallel} reads files that
+     * are larger than a range.
+     */
+    @Override
+    protected Settings.Builder nodeSettings() {
+        final var builder = super.nodeSettings();
+        switch (between(0, 2)) {
+            case 0 -> {
+                // off, as it is by default
+            }
+            case 1 -> builder.put(StatelessSnapshotSettings.SOURCE_READ_AHEAD_SETTING.getKey(), true);
+            case 2 -> builder.put(StatelessSnapshotSettings.SOURCE_READ_PARALLEL_CONNECTIONS_SETTING.getKey(), between(2, 4));
+            default -> throw new AssertionError();
+        }
+        if (randomBoolean()) {
+            builder.put(StatelessSnapshotSettings.SOURCE_READ_RANGE_SIZE_SETTING.getKey(), "256kb");
+        }
+        if (randomBoolean()) {
+            builder.put(StatelessSnapshotSettings.SOURCE_READ_MAX_BUFFER_MEMORY_SETTING.getKey(), randomFrom("1mb", "4mb", "64mb"));
+        }
+        return builder;
+    }
+
+    public void testSnapshotOfFilesLargerThanARangeReadAheadAndInParallel() throws Exception {
+        final var settings = Settings.builder().put(STATELESS_SNAPSHOT_ENABLED_SETTING.getKey(), "read_from_object_store").build();
+        final var indexNode = startMasterAndIndexNode(settings);
+        startSearchNode(settings);
+        ensureStableCluster(2);
+
+        final String indexName = randomIdentifier();
+        createIndex(indexName, 1, 1);
+        ensureGreen(indexName);
+        // content that does not compress, so that the files of the shard are larger than the smallest range, and are read in several
+        final int nDocs = between(12, 20);
+        final var bulk = client().prepareBulk();
+        for (int i = 0; i < nDocs; i++) {
+            bulk.add(
+                prepareIndex(indexName).setSource("payload", java.util.Base64.getEncoder().encodeToString(randomByteArrayOfLength(200_000)))
+            );
+        }
+        assertFalse(bulk.get().hasFailures());
+        flush(indexName);
+
+        final boolean parallel = randomBoolean();
+        updateClusterSettings(
+            Settings.builder()
+                .put(StatelessSnapshotSettings.SOURCE_READ_RANGE_SIZE_SETTING.getKey(), "256kb")
+                .put(StatelessSnapshotSettings.SOURCE_READ_AHEAD_SETTING.getKey(), parallel == false)
+                .put(StatelessSnapshotSettings.SOURCE_READ_PARALLEL_CONNECTIONS_SETTING.getKey(), parallel ? between(2, 4) : 1)
+        );
+
+        final var repoName = randomIdentifier();
+        createRepository(repoName, "fs");
+        final var snapshotName = randomIdentifier();
+        createSnapshot(repoName, snapshotName, List.of(indexName), List.of());
+
+        // the ranges were read by the pool that is made for them
+        final var readPool = internalCluster().getInstance(ThreadPool.class, indexNode)
+            .stats()
+            .stats()
+            .stream()
+            .filter(stats -> stats.name().equals(StatelessPlugin.SNAPSHOT_READ_THREAD_POOL))
+            .findFirst()
+            .orElseThrow();
+        assertThat(readPool.completed(), greaterThan(0L));
+
+        safeGet(client().admin().indices().prepareDelete(indexName).execute());
+        final var restoreSnapshotResponse = safeGet(
+            client().admin()
+                .cluster()
+                .prepareRestoreSnapshot(TEST_REQUEST_TIMEOUT, repoName, snapshotName)
+                .setIndices(indexName)
+                .setWaitForCompletion(true)
+                .execute()
+        );
+        assertThat(restoreSnapshotResponse.getRestoreInfo().successfulShards(), equalTo(1));
+        ensureGreen(indexName);
+        assertHitCount(prepareSearch(indexName), nDocs);
     }
 
     public void testStatelessSnapshotReadsFromObjectStore() throws IOException {
@@ -573,6 +658,9 @@ public class StatelessSnapshotIT extends AbstractStatelessPluginIntegTestCase {
             .put(RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING.getKey(), true)
             .put(ObjectStoreService.TYPE_SETTING.getKey(), ObjectStoreService.ObjectStoreType.MOCK)
             .put("thread_pool.snapshot.max", 1) // single thread for controlled test
+            // The test blocks the first two reads of the source, one after the other, and expects the commit to be released by the first
+            // read that follows the relocation. Ranges read in parallel make several reads at once, which the test does not model.
+            .put(StatelessSnapshotSettings.SOURCE_READ_PARALLEL_CONNECTIONS_SETTING.getKey(), 1)
             .build();
         final var node0 = startMasterAndIndexNode(settings);
         final var node1 = startMasterAndIndexNode(settings);

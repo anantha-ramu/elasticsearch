@@ -23,6 +23,8 @@ import org.elasticsearch.common.blobstore.fs.FsBlobContainer;
 import org.elasticsearch.common.blobstore.fs.FsBlobStore;
 import org.elasticsearch.common.blobstore.support.FilterBlobContainer;
 import org.elasticsearch.common.lucene.store.InputStreamIndexInput;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.core.PathUtils;
 import org.elasticsearch.index.Index;
@@ -38,9 +40,14 @@ import org.elasticsearch.repositories.SnapshotShardContext;
 import org.elasticsearch.snapshots.AbortedSnapshotException;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.threadpool.FixedExecutorBuilder;
+import org.elasticsearch.threadpool.TestThreadPool;
+import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.commits.BlobFile;
 import org.elasticsearch.xpack.stateless.commits.BlobLocation;
 import org.elasticsearch.xpack.stateless.engine.PrimaryTermAndGeneration;
+import org.junit.After;
+import org.junit.Before;
 
 import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
@@ -59,6 +66,51 @@ import static org.hamcrest.Matchers.is;
 import static org.mockito.Mockito.mock;
 
 public class StatelessSnapshotShardContextTests extends ESTestCase {
+
+    private static final String READ_POOL = "test_snapshot_read";
+
+    private ThreadPool threadPool;
+
+    @Before
+    public void createThreadPool() {
+        threadPool = new TestThreadPool(
+            getTestName(),
+            new FixedExecutorBuilder(Settings.EMPTY, READ_POOL, 8, 32, "test.snapshot_read", EsExecutors.TaskTrackingConfig.DO_NOT_TRACK)
+        );
+    }
+
+    @After
+    public void terminateThreadPool() {
+        terminate(threadPool);
+    }
+
+    /**
+     * Reads as it always was in one of three runs, and otherwise ahead on one connection or in ranges over several, with ranges that are a
+     * small part of the files of the tests, so that the tests that mark and reset run against all the ways a file is read.
+     */
+    private SourceReadPrefetch randomSourceReadPrefetch(int fileLength) {
+        final int mode = between(0, 2);
+        if (mode == 0) {
+            return null;
+        }
+        final var prefetch = new SourceReadPrefetch(
+            threadPool.executor(READ_POOL),
+            new SourceReadBufferPool(between(1, 128), Long.MAX_VALUE / 4)
+        );
+        prefetch.setRangeSize(between(1, Math.max(1, fileLength / 2)));
+        prefetch.setReadAhead(mode == 1);
+        prefetch.setConnections(mode == 2 ? between(2, 4) : 1);
+        return prefetch;
+    }
+
+    private static void assertAllClosed(List<CloseTrackingInputStream> streams) throws Exception {
+        // the ranges that were read ahead of the reader are closed by the tasks that read them, when they stop
+        assertBusy(() -> {
+            for (CloseTrackingInputStream s : streams) {
+                assertTrue("Expected all opened input streams to be closed", s.isClosed());
+            }
+        });
+    }
 
     public void testBlobStoreFileReader() throws IOException {
         final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
@@ -254,7 +306,7 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
         }
     }
 
-    public void testResetWithoutMark() throws IOException {
+    public void testResetWithoutMark() throws Exception {
         final var setup = createMarkResetTestSetup();
         try (var fileReader = setup.context.fileReader("file", mock(StoreFileMetadata.class))) {
             final var stream = fileReader.openInput(setup.fileLength);
@@ -272,12 +324,10 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
             fileReader.verify();
         }
 
-        for (CloseTrackingInputStream s : setup.allOpenedStreams) {
-            assertTrue("Expected all opened input streams to be closed", s.isClosed());
-        }
+        assertAllClosed(setup.allOpenedStreams);
     }
 
-    public void testMarkAndReset() throws IOException {
+    public void testMarkAndReset() throws Exception {
         final var setup = createMarkResetTestSetup();
         try (var fileReader = setup.context.fileReader("file", mock(StoreFileMetadata.class))) {
             final var stream = fileReader.openInput(setup.fileLength);
@@ -299,12 +349,10 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
             fileReader.verify();
         }
 
-        for (CloseTrackingInputStream s : setup.allOpenedStreams) {
-            assertTrue("Expected all opened input streams to be closed", s.isClosed());
-        }
+        assertAllClosed(setup.allOpenedStreams);
     }
 
-    public void testMultipleResets() throws IOException {
+    public void testMultipleResets() throws Exception {
         final var setup = createMarkResetTestSetup();
         try (var fileReader = setup.context.fileReader("file", mock(StoreFileMetadata.class))) {
             final var stream = fileReader.openInput(setup.fileLength);
@@ -338,9 +386,7 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
             fileReader.verify();
         }
 
-        for (CloseTrackingInputStream s : setup.allOpenedStreams) {
-            assertTrue("Expected all opened input streams to be closed", s.isClosed());
-        }
+        assertAllClosed(setup.allOpenedStreams);
     }
 
     private record MarkResetTestSetup(
@@ -423,6 +469,7 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
                 }
             },
             () -> false,
+            randomSourceReadPrefetch(Math.toIntExact(totalLength)),
             new PlainActionFuture<>()
         );
 

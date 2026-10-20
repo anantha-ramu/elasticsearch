@@ -13,6 +13,7 @@ import org.elasticsearch.action.support.TransportActions;
 import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.settings.ClusterSettings;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.snapshots.IndexShardSnapshotStatus;
@@ -48,6 +49,8 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
     private final SnapshotsCommitService snapshotsCommitService;
     private final LocalPrimarySnapshotShardContextFactory localPrimaryFactory;
     private final Client client;
+    @Nullable // when there is no thread pool to read ahead on
+    private final SourceReadPrefetch sourceReadPrefetch;
 
     public StatelessSnapshotShardContextFactory() {
         throw new IllegalStateException("This no arg constructor only exists for SPI validation");
@@ -60,6 +63,10 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
         final ClusterSettings clusterSettings = stateless.getClusterService().getClusterSettings();
         clusterSettings.initializeAndWatch(STATELESS_SNAPSHOT_ENABLED_SETTING, this::setStatelessSnapshotEnabledStatus);
         clusterSettings.initializeAndWatch(RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING, this::setRelocationDuringSnapshotEnabled);
+        final var threadPool = stateless.getThreadPool();
+        this.sourceReadPrefetch = threadPool == null
+            ? null
+            : SourceReadPrefetch.create(threadPool.executor(StatelessPlugin.SNAPSHOT_READ_THREAD_POOL), clusterSettings);
         this.localPrimaryFactory = new LocalPrimarySnapshotShardContextFactory(
             stateless.getClusterService(),
             stateless.getIndicesService()
@@ -109,6 +116,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
                         snapshotCommitInfo.blobLocations(),
                         shardBlobContainerFunc,
                         snapshotCommitInfo.isShardRelocated(),
+                        sourceReadPrefetch,
                         snapshotCommitInfo.snapshotIndexCommit().closingBefore(listener)
                     )
                 );
@@ -181,6 +189,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
                             response.blobLocations(),
                             shardBlobContainerFunc,
                             null,
+                            sourceReadPrefetch,
                             listener
                         )
                     );

@@ -67,6 +67,8 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     private final BiFunction<ShardId, Long, BlobContainer> blobContainerFunc;
     @Nullable // when snapshot runs on a different node from the primary
     private final BooleanSupplier isShardRelocated;
+    @Nullable // when there is no executor to read ahead on
+    private final SourceReadPrefetch sourceReadPrefetch;
 
     public StatelessSnapshotShardContext(
         ShardId shardId,
@@ -82,12 +84,45 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         @Nullable BooleanSupplier isShardRelocated,
         ActionListener<ShardSnapshotResult> listener
     ) {
+        this(
+            shardId,
+            snapshotId,
+            indexId,
+            shardStateIdentifier,
+            snapshotStatus,
+            repositoryMetaVersion,
+            snapshotStartTime,
+            snapshotIndexCommit,
+            fileToBlobLocations,
+            blobContainerFunc,
+            isShardRelocated,
+            null,
+            listener
+        );
+    }
+
+    StatelessSnapshotShardContext(
+        ShardId shardId,
+        SnapshotId snapshotId,
+        IndexId indexId,
+        @Nullable String shardStateIdentifier,
+        IndexShardSnapshotStatus snapshotStatus,
+        IndexVersion repositoryMetaVersion,
+        long snapshotStartTime,
+        @Nullable SnapshotIndexCommit snapshotIndexCommit,
+        Map<String, BlobLocation> fileToBlobLocations,
+        BiFunction<ShardId, Long, BlobContainer> blobContainerFunc,
+        @Nullable BooleanSupplier isShardRelocated,
+        @Nullable SourceReadPrefetch sourceReadPrefetch,
+        ActionListener<ShardSnapshotResult> listener
+    ) {
         super(snapshotId, indexId, shardStateIdentifier, snapshotStatus, repositoryMetaVersion, snapshotStartTime, listener);
         this.shardId = shardId;
         this.snapshotIndexCommit = snapshotIndexCommit;
         this.fileToBlobLocations = fileToBlobLocations;
         this.blobContainerFunc = blobContainerFunc;
         this.isShardRelocated = isShardRelocated;
+        this.sourceReadPrefetch = sourceReadPrefetch;
     }
 
     @Override
@@ -155,7 +190,15 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         final BlobLocation blobLocation = fileToBlobLocations.get(file);
         assert blobLocation != null : "Blob location for file [" + file + "] not found in " + fileToBlobLocations;
         final BlobContainer blobContainer = blobContainerFunc.apply(shardId, blobLocation.primaryTerm());
-        return new BlobStoreFileReader(file, blobContainer, blobLocation, commitRefReleasable, isShardRelocated);
+        return new BlobStoreFileReader(
+            file,
+            blobContainer,
+            blobLocation,
+            commitRefReleasable,
+            isShardRelocated,
+            sourceReadPrefetch,
+            status()::ensureNotAborted
+        );
     }
 
     private Releasable maybeWithSnapshotIndexCommitRef() {
@@ -176,6 +219,12 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         private final BooleanSupplier isShardRelocated;
         private long readPosition; // relative to the start of the file
         private InputStream currentStream; // closed when openInput is called to create a new InputStream and on close()
+        @Nullable // when the stream is read as it is opened
+        private final SourceReadPrefetch sourceReadPrefetch;
+        private final SourceReadPrefetch.Plan readPlan; // how this file is read, fixed when it starts
+        private final Runnable abortCheck;
+        @Nullable // when the read of the current stream is not logged
+        private volatile SourceReadTiming.Stats currentStats;
 
         BlobStoreFileReader(
             String fileName,
@@ -183,6 +232,18 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
             BlobLocation blobLocation,
             Releasable commitRefReleasable,
             @Nullable BooleanSupplier isShardRelocated
+        ) {
+            this(fileName, blobContainer, blobLocation, commitRefReleasable, isShardRelocated, null, () -> {});
+        }
+
+        BlobStoreFileReader(
+            String fileName,
+            BlobContainer blobContainer,
+            BlobLocation blobLocation,
+            Releasable commitRefReleasable,
+            @Nullable BooleanSupplier isShardRelocated,
+            @Nullable SourceReadPrefetch sourceReadPrefetch,
+            Runnable abortCheck
         ) {
             this.fileName = fileName;
             this.blobContainer = blobContainer;
@@ -192,6 +253,9 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
             this.nextPositionInBlobFile = blobLocation.offset();
             this.isShardRelocated = isShardRelocated;
             this.readPosition = 0;
+            this.sourceReadPrefetch = sourceReadPrefetch;
+            this.readPlan = sourceReadPrefetch == null ? SourceReadPrefetch.Plan.SINGLE : sourceReadPrefetch.plan();
+            this.abortCheck = abortCheck;
         }
 
         @Override
@@ -222,13 +286,68 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
             }
         }
 
+        /**
+         * Opens the ranged read of the blob. If the file is read ahead or in parallel, that happens here, below the checksum and the
+         * position that {@link ResettableBlobStoreInputStream} keeps, which are only updated by the thread that reads the stream, with the
+         * bytes in order, and above the snapshot rate limiter, which the caller of {@link #openInput} wraps around what it returns.
+         */
         private InputStream openInputStreamForBlob(long bytesFromStreamStart, long limit) throws IOException {
-            return blobContainer.readBlob(
+            final long position = nextPositionInBlobFile + bytesFromStreamStart;
+            final long length = limit - bytesFromStreamStart;
+            final PrefetchingInputStream.RangeOpener ranges = (offset, len) -> blobContainer.readBlob(
                 OperationPurpose.SNAPSHOT_DATA,
                 blobLocation.blobName(),
-                nextPositionInBlobFile + bytesFromStreamStart,
-                limit - bytesFromStreamStart
+                position + offset,
+                len
             );
+            if (sourceReadPrefetch == null) {
+                return ranges.open(0, length);
+            }
+            // Before each read of the source, which a task makes on its own thread, and while the reader waits for a task, do what the
+            // repository does before each read of the reader: stop if the snapshot was aborted, and let go of the commit if the shard
+            // relocated. The snapshot would otherwise only notice when the reader reads again, which can be long after.
+            final Runnable beforeRead = () -> {
+                abortCheck.run();
+                maybeReleaseCommitRef();
+            };
+            final String mode = SourceReadPrefetch.modeOf(readPlan, length);
+            final SourceReadTiming.Stats stats = SourceReadTiming.isEnabled()
+                ? new SourceReadTiming.Stats(fileName, blobLocation.blobName(), position, length, mode)
+                : null;
+            final InputStream stream;
+            try {
+                stream = sourceReadPrefetch.open(
+                    readPlan,
+                    length,
+                    ranges,
+                    beforeRead,
+                    "file [" + fileName + "] blob [" + blobLocation.blobName() + "] from [" + position + "]",
+                    stats
+                );
+            } catch (RuntimeException | Error | IOException e) {
+                if (stats != null) {
+                    stats.logAndRelease();
+                }
+                throw e;
+            }
+            currentStats = stats;
+            // the reads of a stream that is not read ahead are the time the consumer waits for data; for one that is, it measures that
+            return SourceReadTiming.maybeLog(stream, stats, stream instanceof PrefetchingInputStream == false);
+        }
+
+        /**
+         * Tells the log of the current stream how long the snapshot rate limiter paused its reader.
+         */
+        @Override
+        public void recordRateLimiterPause(long nanos) {
+            final var stats = currentStats;
+            if (stats != null) {
+                stats.addLimiterPause(nanos);
+            }
+        }
+
+        private boolean isPrefetching() {
+            return sourceReadPrefetch != null && readPlan.mode() != SourceReadPrefetch.Mode.SINGLE;
         }
 
         private class ResettableBlobStoreInputStream extends FilterInputStream {
@@ -290,9 +409,16 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
                 ensureOpen();
                 final var oldIn = in;
                 final long bytesFromStreamStart = markPosition - streamStartPosition;
-                in = openInputStreamForBlob(bytesFromStreamStart, limit);
-                readPosition = markPosition;
-                IOUtils.closeWhileHandlingException(oldIn);
+                if (isPrefetching()) {
+                    // the buffers and the connections of the stream that is dropped are given back before the new one asks for its own
+                    IOUtils.closeWhileHandlingException(oldIn);
+                    in = openInputStreamForBlob(bytesFromStreamStart, limit);
+                    readPosition = markPosition;
+                } else {
+                    in = openInputStreamForBlob(bytesFromStreamStart, limit);
+                    readPosition = markPosition;
+                    IOUtils.closeWhileHandlingException(oldIn);
+                }
             }
 
             @Override

@@ -125,6 +125,7 @@ import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 import org.elasticsearch.telemetry.TelemetryProvider;
 import org.elasticsearch.telemetry.metric.MeterRegistry;
 import org.elasticsearch.threadpool.ExecutorBuilder;
+import org.elasticsearch.threadpool.FixedExecutorBuilder;
 import org.elasticsearch.threadpool.ScalingExecutorBuilder;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xcontent.NamedXContentRegistry;
@@ -354,6 +355,15 @@ public class StatelessPlugin extends Plugin
     public static final String BLOB_COPY_THREAD_POOL = BlobStoreRepository.STATELESS_BLOB_COPY_THREAD_NAME;
     public static final String BLOB_COPY_THREAD_POOL_SETTING = "stateless." + BLOB_COPY_THREAD_POOL + "_thread_pool";
 
+    /**
+     * Experimental: runs the reads that a snapshot makes ahead of, or in parallel to, the one that feeds its upload, see
+     * {@link org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings#SOURCE_READ_PARALLEL_CONNECTIONS_SETTING}. A pool of its
+     * own, because those reads wait for the network and must not take threads from the pools that run the uploads, nor from the shard read
+     * pools. Threads are only started when something is read ahead, which needs a setting that is off by default.
+     */
+    public static final String SNAPSHOT_READ_THREAD_POOL = "stateless_snapshot_read";
+    public static final String SNAPSHOT_READ_THREAD_POOL_SETTING = "stateless." + SNAPSHOT_READ_THREAD_POOL + "_thread_pool";
+
     public static final String MEMORY_NODE_ATTR = NAME + ".memory";
 
     /**
@@ -506,6 +516,17 @@ public class StatelessPlugin extends Plugin
                 TimeValue.timeValueMinutes(5),
                 true,
                 BLOB_COPY_THREAD_POOL_SETTING
+            ),
+            // A snapshot thread reads one file at a time, with at most as many ranges in flight as the setting for the parallel
+            // connections allows, so this is as many threads as all the snapshot threads can have ranges in flight. The queue is as long
+            // as the pool, and a task that does not fit is read by the snapshot thread itself.
+            new FixedExecutorBuilder(
+                settings,
+                SNAPSHOT_READ_THREAD_POOL,
+                ThreadPool.getMaxSnapshotThreadPoolSize(processors) * StatelessSnapshotSettings.SOURCE_READ_MAX_PARALLEL_CONNECTIONS,
+                ThreadPool.getMaxSnapshotThreadPoolSize(processors) * StatelessSnapshotSettings.SOURCE_READ_MAX_PARALLEL_CONNECTIONS,
+                SNAPSHOT_READ_THREAD_POOL_SETTING,
+                EsExecutors.TaskTrackingConfig.DO_NOT_TRACK
             ), };
     }
 
@@ -595,6 +616,14 @@ public class StatelessPlugin extends Plugin
 
     public SnapshotsCommitService getSnapshotsCommitService() {
         return Objects.requireNonNull(this.snapshotsCommitServiceRef.get());
+    }
+
+    /**
+     * @return the thread pool, or {@code null} before the components are created
+     */
+    @Nullable
+    public ThreadPool getThreadPool() {
+        return this.threadPool.get();
     }
 
     public Client getClient() {
@@ -1521,6 +1550,10 @@ public class StatelessPlugin extends Plugin
             StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING,
             StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING,
             StatelessSnapshotSettings.STATELESS_SNAPSHOT_WAIT_FOR_ACTIVE_PRIMARY_TIMEOUT_SETTING,
+            StatelessSnapshotSettings.SOURCE_READ_AHEAD_SETTING,
+            StatelessSnapshotSettings.SOURCE_READ_PARALLEL_CONNECTIONS_SETTING,
+            StatelessSnapshotSettings.SOURCE_READ_RANGE_SIZE_SETTING,
+            StatelessSnapshotSettings.SOURCE_READ_MAX_BUFFER_MEMORY_SETTING,
             StatelessShardRelocationOrder.PRIORITIZE_WRITE_SHARD_RELOCATIONS_SETTING,
             StatelessMemoryMetricsService.FIXED_SHARD_MEMORY_OVERHEAD_SETTING,
             StatelessMemoryMetricsService.INDEXING_OPERATIONS_MEMORY_REQUIREMENTS_ENABLED_SETTING,
