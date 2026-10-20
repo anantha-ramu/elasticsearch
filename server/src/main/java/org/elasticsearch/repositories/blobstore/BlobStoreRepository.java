@@ -4391,7 +4391,10 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 AtomicLong totalTimeSpendReadingInNanos = new AtomicLong();
 
                 // Make reads abortable by mutating the snapshotStatus object
-                final InputStream inputStream = new FilterInputStream(maybeRateLimitSnapshots(fileReader.openInput(partBytes))) {
+                final InputStream inputStream = new FilterInputStream(maybeRateLimitSnapshots(fileReader.openInput(partBytes), nanos -> {
+                    blobStoreSnapshotMetrics.incrementSnapshotRateLimitingTimeInNanos(nanos);
+                    fileReader.recordRateLimiterPause(nanos);
+                })) {
                     @Override
                     public int read() throws IOException {
                         checkAborted();

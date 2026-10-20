@@ -120,6 +120,12 @@ public abstract class SnapshotShardContext extends DelegatingActionListener<Shar
          */
         default void maybeReleaseCommitRef() {}
 
+        /**
+         * Called with the time that the snapshot rate limiter paused the reading of the stream of {@link #openInput}, so that a reader that
+         * logs how long it took can tell it from the time it waited for data.
+         */
+        default void recordRateLimiterPause(long nanos) {}
+
         void verify() throws IOException;
     }
 
