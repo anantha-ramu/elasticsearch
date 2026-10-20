@@ -40,6 +40,7 @@ import java.nio.file.FileAlreadyExistsException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -338,7 +339,8 @@ final class GcsStreamingUpload {
         if (logger.isDebugEnabled()) {
             logger.debug(
                 "part [{}] of [{}] range [{}, {}) bytes [{}] source_read_ms [{}] socket_write_ms [{}] response_wait_ms [{}]"
-                    + " discard_ms [{}] attempt [{}] status [{}]",
+                    + " discard_ms [{}] attempt [{}] status [{}] request_ms [{}] connection_rate_mib_s [{}]"
+                    + " socket_write_rate_mib_s [{}] {}",
                 partIndex,
                 description,
                 from,
@@ -349,11 +351,22 @@ final class GcsStreamingUpload {
                 TimeUnit.NANOSECONDS.toMillis(reply.responseWaitNanos),
                 TimeUnit.NANOSECONDS.toMillis(discardNanos),
                 attempt,
-                reply.status
+                reply.status,
+                TimeUnit.NANOSECONDS.toMillis(reply.requestNanos),
+                // the rate of the connection: the bytes of the part over the time from the request to its response, in which the source
+                // was read as well as the socket written, so it is a floor; the rate of the socket writes alone is above what the
+                // connection takes when the writes do not wait for the source
+                rateMibPerSecond(partEnd - from, reply.requestNanos),
+                rateMibPerSecond(partEnd - from, content.writeNanos),
+                reply.connection == null ? "connection unknown" : reply.connection
             );
         }
         discardNanos = 0;
         return reply;
+    }
+
+    private static String rateMibPerSecond(long bytes, long nanos) {
+        return nanos <= 0 ? "n/a" : String.format(Locale.ROOT, "%.1f", bytes / (1024.0 * 1024.0) / (nanos / 1e9));
     }
 
     /**
@@ -546,6 +559,11 @@ final class GcsStreamingUpload {
                 content.connection = connection;
             }
             try {
+                final boolean observed = content != null && logger.isDebugEnabled();
+                final long requestStartNanos = System.nanoTime();
+                if (observed) {
+                    GcsSocketObserver.beginRequest();
+                }
                 response = request.execute();
                 final long responseNanos = System.nanoTime();
                 final int status = response.getStatusCode();
@@ -557,7 +575,9 @@ final class GcsStreamingUpload {
                     status == 308 ? parseCommitted(range) : -1,
                     location,
                     body,
-                    content != null && content.writeEndNanos != 0 ? responseNanos - content.writeEndNanos : 0
+                    content != null && content.writeEndNanos != 0 ? responseNanos - content.writeEndNanos : 0,
+                    responseNanos - requestStartNanos,
+                    observed ? GcsSocketObserver.endRequest() : null
                 );
             } catch (IOException | RuntimeException e) {
                 final HttpURLConnection httpConnection = connection.getConnection();
@@ -602,7 +622,15 @@ final class GcsStreamingUpload {
         return Long.parseLong(matcher.group(1)) + 1;
     }
 
-    private record Reply(int status, long committed, @Nullable String location, @Nullable String body, long responseWaitNanos) {
+    private record Reply(
+        int status,
+        long committed,
+        @Nullable String location,
+        @Nullable String body,
+        long responseWaitNanos,
+        long requestNanos,
+        @Nullable GcsSocketObserver.Connection connection
+    ) {
         String describeBody() {
             return body == null || body.isEmpty() ? "" : " body [" + (body.length() > 500 ? body.substring(0, 500) + "..." : body) + "]";
         }

@@ -81,7 +81,14 @@ class GoogleCloudStorageRetryingInputStream extends RetryingInputStream<Long> {
                             meteredGet.getRequestHeaders().setRange("bytes=" + start + "-" + end);
                         }
                     }
+                    final boolean timed = GcsReadTiming.isEnabled();
+                    final long requestStartNanos = timed ? System.nanoTime() : 0L;
+                    if (timed) {
+                        GcsSocketObserver.beginRequest();
+                    }
                     final HttpResponse resp = meteredGet.executeMedia();
+                    final long headersNanos = timed ? System.nanoTime() - requestStartNanos : 0L;
+                    final GcsSocketObserver.Connection connection = timed ? GcsSocketObserver.endRequest() : null;
                     // Store the generation of the first response we received, so we can detect
                     // if the file has changed if we need to resume
                     if (lastGeneration == null) {
@@ -92,6 +99,20 @@ class GoogleCloudStorageRetryingInputStream extends RetryingInputStream<Long> {
                     InputStream content = resp.getContent();
                     if (contentLength != null) {
                         content = new ContentLengthValidatingInputStream(content, contentLength);
+                    }
+                    if (timed) {
+                        content = GcsReadTiming.timed(
+                            content,
+                            blobStore.getRepositoryName(),
+                            purpose.getKey(),
+                            blobId.getBucket(),
+                            blobId.getName(),
+                            start,
+                            end,
+                            requestStartNanos,
+                            headersNanos,
+                            connection
+                        );
                     }
                     return new SingleAttemptInputStream<>(content, start, lastGeneration);
                 } catch (IOException e) {

@@ -98,6 +98,40 @@ public class GoogleCloudStorageRetryingInputStreamTests extends ESTestCase {
         }
     }
 
+    /**
+     * A GET is logged when its body is read to the end, at DEBUG, under the logger of GET timings, whatever its purpose; the connection
+     * is not known for the mock transport, which does not make sockets.
+     */
+    public void testGetOfSnapshotDataIsLoggedAtDebug() throws Exception {
+        final String loggerName = "org.elasticsearch.repositories.gcs.GetTiming";
+        final var logger = org.apache.logging.log4j.LogManager.getLogger(loggerName);
+        final var originalLevel = logger.getLevel();
+        final byte[] bytes = randomByteArrayOfLength(randomIntBetween(1, 512));
+        org.elasticsearch.common.logging.Loggers.setLevel(logger, org.apache.logging.log4j.Level.DEBUG);
+        try (var mockLog = org.elasticsearch.test.MockLog.capture(loggerName)) {
+            mockLog.addExpectation(
+                new org.elasticsearch.test.MockLog.SeenEventExpectation(
+                    "the GET",
+                    loggerName,
+                    org.apache.logging.log4j.Level.DEBUG,
+                    "GET repository [*] purpose [SnapshotData] blob ["
+                        + BUCKET_NAME
+                        + "/"
+                        + BLOB_NAME
+                        + "] range_start [0] range_length [to_end] bytes ["
+                        + bytes.length
+                        + "] * connection unknown *"
+                )
+            );
+            try (var stream = createRetryingInputStream(bytes)) {
+                assertArrayEquals(bytes, stream.readAllBytes());
+            }
+            mockLog.assertAllExpectationsMatched();
+        } finally {
+            org.elasticsearch.common.logging.Loggers.setLevel(logger, originalLevel);
+        }
+    }
+
     public void testReadBeyondBlobLengthThrowsRequestedRangeNotSatisfiedException() {
         byte[] bytes = randomByteArrayOfLength(randomIntBetween(1, 512));
         int position = bytes.length + randomIntBetween(0, 100);

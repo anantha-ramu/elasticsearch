@@ -720,6 +720,13 @@ public class GcsStreamingUploadTests extends ESTestCase {
                         + "response_wait_ms \\[\\d+\\].* attempt \\[1\\].*"
                 ),
                 new MockLog.PatternSeenEventExpectation(
+                    "connection rate of a part logged at debug",
+                    DEBUG_LOGGER,
+                    Level.DEBUG,
+                    "part \\[0\\] of \\[bucket/blob\\] range .* request_ms \\[\\d+\\] connection_rate_mib_s \\[(\\d+\\.\\d|n/a)\\] "
+                        + "socket_write_rate_mib_s \\[(\\d+\\.\\d|n/a)\\] connection unknown"
+                ),
+                new MockLog.PatternSeenEventExpectation(
                     "file timing logged at debug",
                     DEBUG_LOGGER,
                     Level.DEBUG,

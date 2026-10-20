@@ -170,6 +170,10 @@ public class GoogleCloudStorageService {
                 SecurityUtils.loadKeyStore(certTrustStore, keyStoreStream, "notasecret");
             }
             builder.trustCertificates(certTrustStore);
+            // Every client of the node is made here, including the one of the stateless object store. Sockets are only observed while a
+            // DEBUG logger that reports on the connections is on, otherwise the factory hands out the sockets of the one it wraps. It is
+            // the one factory of the transport, so connections are kept alive and reused as they are without it.
+            builder.setSslSocketFactory(GcsSocketObserver.observing(builder.getSslSocketFactory()));
             Proxy proxy = gcsClientSettings.getProxy();
             if (proxy != null) {
                 notifyProxyIsSet(proxy);
