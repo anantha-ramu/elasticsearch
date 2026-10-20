@@ -240,6 +240,7 @@ import org.elasticsearch.xpack.stateless.reshard.TransportUpdateSplitTargetShard
 import org.elasticsearch.xpack.stateless.snapshots.SnapshotsCommitService;
 import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings;
 import org.elasticsearch.xpack.stateless.snapshots.TransportGetShardSnapshotCommitInfoAction;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.TransportGetShardGenerationsAction;
 import org.elasticsearch.xpack.stateless.utils.SearchShardSizeCollector;
 import org.elasticsearch.xpack.stateless.utils.SearchShardSizeCollectorProvider;
 import org.elasticsearch.xpack.stateless.utils.StatelessCommitServiceProvider;
@@ -712,7 +713,8 @@ public class StatelessPlugin extends Plugin
                 TransportPublishIndexingOperationsHeapMemoryRequirements.class
             ),
             new ActionHandler(TransportPublishMergeMemoryEstimate.INSTANCE, TransportPublishMergeMemoryEstimate.class),
-            new ActionHandler(TransportGetShardSnapshotCommitInfoAction.TYPE, TransportGetShardSnapshotCommitInfoAction.class)
+            new ActionHandler(TransportGetShardSnapshotCommitInfoAction.TYPE, TransportGetShardSnapshotCommitInfoAction.class),
+            new ActionHandler(TransportGetShardGenerationsAction.TYPE, TransportGetShardGenerationsAction.class)
         );
     }
 
