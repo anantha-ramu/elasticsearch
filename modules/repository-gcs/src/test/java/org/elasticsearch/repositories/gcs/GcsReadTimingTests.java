@@ -127,81 +127,113 @@ public class GcsReadTimingTests extends ESTestCase {
     }
 
     /**
-     * A body that delivers at about 10 MiB/s, read by a consumer that stops for much longer than a read between its reads, as the upload
-     * does while it writes: the rate over the wall time falls with the pauses, and the rate of the reads that waited stays that of the
-     * body, which is the one to look at for the speed of the connection.
+     * Waits until the time, in nanoseconds of {@link System#nanoTime}: a sleep for what is long, and a spin for what is shorter than the
+     * sleeps of the machine can be told apart.
+     */
+    static void waitUntil(long deadlineNanos) {
+        while (true) {
+            final long left = deadlineNanos - System.nanoTime();
+            if (left <= 0) {
+                return;
+            }
+            if (left > 5_000_000) {
+                safeSleep(left / 2_000_000);
+            } else {
+                Thread.onSpinWait();
+            }
+        }
+    }
+
+    /**
+     * A body that is delivered in the records of 16 KiB that a TLS read returns, at a known rate, read by a consumer that stops between
+     * its reads as the upload does while it writes. The rate over the wall time falls with the pauses, and the rate over the reads that
+     * waited is that of the body, at the rate of a slow connection and at those of a fast one, where a record arrives every 0.1 ms.
      */
     public void testBlockedRateIsTheRateOfTheBodyWhateverTheConsumerDoes() throws Exception {
-        final var line = new java.util.concurrent.atomic.AtomicReference<String>();
-        final var expectation = new MockLog.LoggingExpectation() {
-            @Override
-            public void match(org.apache.logging.log4j.core.LogEvent event) {
-                if (event.getMessage().getFormattedMessage().startsWith("GET repository")) {
-                    line.set(event.getMessage().getFormattedMessage());
+        for (double mibPerSecond : new double[] { 10, 85, 200 }) {
+            final var line = new java.util.concurrent.atomic.AtomicReference<String>();
+            final var expectation = new MockLog.LoggingExpectation() {
+                @Override
+                public void match(org.apache.logging.log4j.core.LogEvent event) {
+                    if (event.getMessage().getFormattedMessage().startsWith("GET repository")) {
+                        line.set(event.getMessage().getFormattedMessage());
+                    }
                 }
-            }
 
-            @Override
-            public void assertMatched() {
-                assertNotNull(line.get());
-            }
-        };
-        final int chunk = 256 * 1024;
-        final int chunks = 5;
-        // 25 ms for a chunk is 10 MiB/s
-        final InputStream slow = new java.io.InputStream() {
-            private int served;
-
-            @Override
-            public int read() {
-                throw new AssertionError("not used");
-            }
-
-            @Override
-            public int read(byte[] b, int off, int len) {
-                if (served >= chunk * chunks) {
-                    return -1;
+                @Override
+                public void assertMatched() {
+                    assertNotNull(line.get());
                 }
-                safeSleep(25);
-                final int n = Math.min(Math.min(len, chunk), chunk * chunks - served);
-                served += n;
-                return n;
-            }
-        };
-        withDebug(() -> {
-            try (var mockLog = MockLog.capture(LOGGER_NAME)) {
-                mockLog.addExpectation(expectation);
-                final InputStream in = GcsReadTiming.timed(
-                    slow,
-                    "repo",
-                    "SnapshotData",
-                    "bucket",
-                    "blob",
-                    0,
-                    chunk * chunks - 1L,
-                    System.nanoTime(),
-                    0,
-                    null
-                );
-                final var buffer = new byte[chunk];
-                while (in.read(buffer) >= 0) {
-                    safeSleep(100); // the consumer is busy with something else, as the upload is with its writes
+            };
+            final int record = 16 * 1024;
+            final int total = 2 * 1024 * 1024;
+            final long recordNanos = (long) (record / (mibPerSecond * 1024 * 1024) * 1e9);
+            final InputStream body = new java.io.InputStream() {
+                private int served;
+                private long nextFreeNanos = System.nanoTime();
+
+                @Override
+                public int read() {
+                    throw new AssertionError("not used");
                 }
-                in.close();
-                mockLog.assertAllExpectationsMatched();
-            }
-            return null;
-        });
-        final var m = java.util.regex.Pattern.compile("rate_mib_s \\[([\\d.]+)\\].* blocked_rate_mib_s \\[([\\d.]+)\\]")
-            .matcher(line.get());
-        assertTrue(line.get(), m.find());
-        final double wallRate = Double.parseDouble(m.group(1));
-        final double blockedRate = Double.parseDouble(m.group(2));
-        assertThat("blocked rate is near the 10 MiB/s of the body: " + line.get(), blockedRate, org.hamcrest.Matchers.closeTo(10.0, 4.0));
-        assertThat(
-            "the rate over the wall time includes the pauses: " + line.get(),
-            wallRate,
-            org.hamcrest.Matchers.lessThan(blockedRate * 0.6)
-        );
+
+                @Override
+                public int read(byte[] b, int off, int len) {
+                    if (served >= total) {
+                        return -1;
+                    }
+                    final int n = Math.min(Math.min(len, record), total - served);
+                    // a record arrives when the one before it has, and not before the read asks for it, as the connection does not
+                    // deliver ahead of the reader past what it holds
+                    nextFreeNanos = Math.max(nextFreeNanos, System.nanoTime()) + recordNanos;
+                    waitUntil(nextFreeNanos);
+                    served += n;
+                    return n;
+                }
+            };
+            withDebug(() -> {
+                try (var mockLog = MockLog.capture(LOGGER_NAME)) {
+                    mockLog.addExpectation(expectation);
+                    final InputStream in = GcsReadTiming.timed(
+                        body,
+                        "repo",
+                        "SnapshotData",
+                        "bucket",
+                        "blob",
+                        0,
+                        total - 1L,
+                        System.nanoTime(),
+                        0,
+                        null
+                    );
+                    final var buffer = new byte[record];
+                    int reads = 0;
+                    while (in.read(buffer) >= 0) {
+                        // every eighth read, the consumer is busy for twice as long as the eight took, as the upload is with its writes
+                        if (++reads % 8 == 0) {
+                            waitUntil(System.nanoTime() + 16 * recordNanos);
+                        }
+                    }
+                    in.close();
+                    mockLog.assertAllExpectationsMatched();
+                }
+                return null;
+            });
+            final var m = java.util.regex.Pattern.compile(" rate_mib_s \\[([\\d.]+)\\].* blocked_rate_mib_s \\[([\\d.]+)\\]")
+                .matcher(line.get());
+            assertTrue(line.get(), m.find());
+            final double wallRate = Double.parseDouble(m.group(1));
+            final double blockedRate = Double.parseDouble(m.group(2));
+            assertThat(
+                "blocked rate is that of the body, [" + mibPerSecond + "] MiB/s: " + line.get(),
+                blockedRate,
+                org.hamcrest.Matchers.closeTo(mibPerSecond, 0.35 * mibPerSecond)
+            );
+            assertThat(
+                "the rate over the wall time includes the pauses: " + line.get(),
+                wallRate,
+                org.hamcrest.Matchers.lessThan(blockedRate * 0.6)
+            );
+        }
     }
 }

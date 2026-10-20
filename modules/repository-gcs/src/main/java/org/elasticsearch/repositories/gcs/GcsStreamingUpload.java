@@ -358,7 +358,7 @@ final class GcsStreamingUpload {
                 // connection takes when the writes do not wait for the source
                 rateMibPerSecond(partEnd - from, reply.requestNanos),
                 rateMibPerSecond(partEnd - from, content.writeNanos),
-                rateMibPerSecond(content.blockedWriteBytes, content.blockedWriteNanos),
+                content.blockedWrites.describe(),
                 reply.connection == null ? "connection unknown" : reply.connection
             );
         }
@@ -650,8 +650,7 @@ final class GcsStreamingUpload {
         private GcsConnectionTracker.Slot connection;
         private long readNanos;
         private long writeNanos;
-        private long blockedWriteNanos; // of the writes that waited, which took at least a millisecond
-        private long blockedWriteBytes;
+        private final GcsBlockedRate blockedWrites = new GcsBlockedRate(); // over the writes that waited, an upper bound of the rate
         private long writeEndNanos;
 
         /**
@@ -719,11 +718,7 @@ final class GcsStreamingUpload {
             }
             final long took = System.nanoTime() - writeStart;
             writeNanos += took;
-            if (took >= 1_000_000) {
-                // a write that waited for the socket to take the bytes: over these the bytes per second are what the connection takes
-                blockedWriteNanos += took;
-                blockedWriteBytes += length;
-            }
+            blockedWrites.record(took, length);
         }
     }
 
