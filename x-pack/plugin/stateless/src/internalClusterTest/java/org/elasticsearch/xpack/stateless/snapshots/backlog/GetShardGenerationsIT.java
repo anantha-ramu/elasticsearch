@@ -14,6 +14,7 @@ import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.repositories.ProjectRepo;
 import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.repositories.RepositoryMissingException;
+import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
 import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.StatelessSnapshotEnabledStatus;
 
@@ -21,6 +22,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.elasticsearch.snapshots.AbstractSnapshotIntegTestCase.createFullSnapshot;
 import static org.elasticsearch.snapshots.AbstractSnapshotIntegTestCase.getRepositoryData;
@@ -38,6 +40,7 @@ import static org.hamcrest.Matchers.not;
 public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase {
 
     private static final String REPOSITORY = "repo";
+    private static final ProjectRepo DEFAULT_PROJECT_REPOSITORY = new ProjectRepo(ProjectId.DEFAULT, REPOSITORY);
     private static final String INDEX = "index";
 
     @Override
@@ -55,11 +58,24 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
             .build();
     }
 
-    private static GetShardGenerationsResponse getShardGenerations(String node, String repository, List<ShardId> shardIds) {
+    private static GetShardGenerationsResponse getShardGenerations(String node, ProjectRepo projectRepo, List<ShardId> shardIds) {
         return safeGet(
             client(node).execute(
                 TransportGetShardGenerationsAction.TYPE,
-                new GetShardGenerationsRequest(TEST_REQUEST_TIMEOUT, new ProjectRepo(ProjectId.DEFAULT, repository), shardIds)
+                new GetShardGenerationsRequest(TEST_REQUEST_TIMEOUT, projectRepo, shardIds)
+            )
+        );
+    }
+
+    private static Throwable getShardGenerationsFailure(String node, ProjectRepo projectRepo, List<ShardId> shardIds) {
+        return ExceptionsHelper.unwrapCause(
+            safeAwaitFailure(
+                GetShardGenerationsResponse.class,
+                listener -> client(node).execute(
+                    TransportGetShardGenerationsAction.TYPE,
+                    new GetShardGenerationsRequest(TEST_REQUEST_TIMEOUT, projectRepo, shardIds),
+                    listener
+                )
             )
         );
     }
@@ -95,18 +111,18 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
         }
 
         // before the first snapshot the repository holds nothing of the shards
-        final var beforeSnapshot = getShardGenerations(indexNode, REPOSITORY, shardIds);
+        final var beforeSnapshot = getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds);
         assertThat(beforeSnapshot.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
         assertThat(beforeSnapshot.shardGenerations(), anEmptyMap());
 
         createFullSnapshot(logger, REPOSITORY, "snap-1");
-        final var afterFirstSnapshot = getShardGenerations(indexNode, REPOSITORY, shardIds);
+        final var afterFirstSnapshot = getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds);
         assertThat(afterFirstSnapshot.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
         assertThat(afterFirstSnapshot.shardGenerations(), equalTo(expectedShardGenerations(shardIds)));
 
         // every snapshot writes new shard-level metadata for every shard it includes, even when nothing was written in between
         createFullSnapshot(logger, REPOSITORY, "snap-2");
-        final var afterSecondSnapshot = getShardGenerations(indexNode, REPOSITORY, shardIds);
+        final var afterSecondSnapshot = getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds);
         assertThat(afterSecondSnapshot.shardGenerations(), equalTo(expectedShardGenerations(shardIds)));
         for (ShardId shardId : shardIds) {
             assertThat(
@@ -117,7 +133,7 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
 
         // deleting a snapshot (as retention does) writes new shard-level metadata for every shard of it as well
         assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, "snap-1"));
-        final var afterFirstDelete = getShardGenerations(indexNode, REPOSITORY, shardIds);
+        final var afterFirstDelete = getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds);
         assertThat(afterFirstDelete.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
         assertThat(afterFirstDelete.shardGenerations(), equalTo(expectedShardGenerations(shardIds)));
         for (ShardId shardId : shardIds) {
@@ -129,7 +145,7 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
 
         // once no snapshot refers to the index the repository holds nothing of the shards any more
         assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, "snap-2"));
-        final var afterDelete = getShardGenerations(indexNode, REPOSITORY, shardIds);
+        final var afterDelete = getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds);
         assertThat(afterDelete.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
         assertThat(afterDelete.shardGenerations(), anEmptyMap());
     }
@@ -141,14 +157,31 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
         ensureGreen(INDEX);
 
         final var shardIds = List.of(new ShardId(resolveIndex(INDEX), 0));
-        final var e = safeAwaitFailure(
-            GetShardGenerationsResponse.class,
-            listener -> client(indexNode).execute(
-                TransportGetShardGenerationsAction.TYPE,
-                new GetShardGenerationsRequest(TEST_REQUEST_TIMEOUT, new ProjectRepo(ProjectId.DEFAULT, "missing"), shardIds),
-                listener
-            )
+        final var e = getShardGenerationsFailure(indexNode, new ProjectRepo(ProjectId.DEFAULT, "missing"), shardIds);
+        assertThat(e.getClass(), equalTo(RepositoryMissingException.class));
+    }
+
+    /**
+     * The repository is looked up in the project the request names, not by its name alone. These tests run one project only, so this
+     * asks for the repository of the default project under the id of a project that does not exist.
+     */
+    public void testRepositoryOfAnotherProjectIsNotUsed() {
+        startMasterOnlyNode(snapshotNodeSettings());
+        final String indexNode = startIndexNode(snapshotNodeSettings());
+        createRepository(REPOSITORY, "fs");
+        createIndex(INDEX, indexSettings(1, 0).build());
+        ensureGreen(INDEX);
+        indexDocs(INDEX, between(10, 100));
+        createFullSnapshot(logger, REPOSITORY, "snap");
+        final var shardIds = List.of(new ShardId(resolveIndex(INDEX), 0));
+        // the default project's repository has shard-level metadata of the shard
+        assertThat(
+            getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds).shardGenerations().keySet(),
+            equalTo(Set.copyOf(shardIds))
         );
-        assertThat(ExceptionsHelper.unwrapCause(e).getClass(), equalTo(RepositoryMissingException.class));
+
+        final var otherProject = randomValueOtherThan(ProjectId.DEFAULT, ESTestCase::randomUniqueProjectId);
+        final var e = getShardGenerationsFailure(indexNode, new ProjectRepo(otherProject, REPOSITORY), shardIds);
+        assertThat(e.getClass(), equalTo(RepositoryMissingException.class));
     }
 }
