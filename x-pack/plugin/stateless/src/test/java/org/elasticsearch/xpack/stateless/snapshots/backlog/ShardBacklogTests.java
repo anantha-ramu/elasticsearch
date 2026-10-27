@@ -226,9 +226,9 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * Commits as Lucene writes them and a snapshot reads them ({@link Store.MetadataSnapshot#loadFromIndexCommit}), with deletes, so
-     * that some files have the writer uuid of the segment and others that of its deletes, and an index created again under the same
-     * file names.
+     * Commits as Lucene writes them and a snapshot reads them ({@link Store.MetadataSnapshot#loadFromIndexCommit}), with deletes and
+     * merges, and then an index created again under the same file names. Also checks what {@link ShardBacklog} assumes of such commits:
+     * only the files it leaves out by name have a hash.
      */
     public void testLuceneCommitsMatchWhatTheSnapshotWouldUpload() throws IOException {
         var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
@@ -252,6 +252,11 @@ public class ShardBacklogTests extends ESTestCase {
                         writer.commit();
                         final var files = new ArrayList<StoreFileMetadata>();
                         for (StoreFileMetadata file : Store.MetadataSnapshot.loadFromIndexCommit(null, directory, logger)) {
+                            // what ShardBacklog relies on: the files it leaves out by name are exactly those kept as their hash,
+                            // and the others have no hash
+                            final boolean leftOut = Store.MetadataSnapshot.isReadAsHash(file.name());
+                            assertThat(file.name(), file.hashEqualsContents(), equalTo(leftOut));
+                            assertThat(file.name(), file.hash().length == 0, equalTo(leftOut == false));
                             files.add(file);
                         }
                         final var commit = new Commit(null, files);
