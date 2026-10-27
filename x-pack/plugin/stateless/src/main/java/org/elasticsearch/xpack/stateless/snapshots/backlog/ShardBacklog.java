@@ -7,7 +7,6 @@
 
 package org.elasticsearch.xpack.stateless.snapshots.backlog;
 
-import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.store.Store;
 import org.elasticsearch.index.store.StoreFileMetadata;
@@ -19,37 +18,34 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * How many bytes the next snapshot of a shard would upload to a repository, decided the way the snapshot decides it
- * ({@code BlobStoreRepository#doSnapshotShard}), from what the repository holds of the shard ({@link ShardBaseline}) and the shard's
- * latest commit:
+ * Works out how many bytes the next snapshot of a shard would upload to a repository, the way the snapshot itself decides it
+ * ({@code BlobStoreRepository#doSnapshotShard}), by comparing what the repository holds of the shard ({@link ShardBaseline}) with the
+ * shard's latest commit:
  * <ul>
- *     <li>nothing, if a snapshot in the repository has the commit's shard state id;</li>
- *     <li>otherwise the length of every commit file the repository does not hold, leaving out the files whose contents a snapshot keeps
- *     inside the shard-level metadata ({@link Store.MetadataSnapshot#isReadAsHash}), which are never uploaded.</li>
+ *     <li>if a snapshot in the repository has the commit's shard state id, nothing is uploaded;</li>
+ *     <li>otherwise every commit file the repository doesn't hold is uploaded, apart from the {@code .si} and {@code segments_N} files,
+ *     whose contents a snapshot keeps inside the shard-level metadata ({@link Store.MetadataSnapshot#isReadAsHash}).</li>
  * </ul>
- * Nothing is read here. The caller reads the checksums of the commit files, and only of the files that {@link #filesNeedingChecksum}
- * names: a file that the repository does not hold by name, length and writer uuid counts without one.
+ * Nothing is read here. The caller first asks which files need their checksum ({@link #filesNeedingChecksum}), reads only those, and
+ * passes them to {@link #bytesToUpload}. Only a file the repository has a file of the same name and length for is worth checking.
  */
 final class ShardBacklog {
 
     private ShardBacklog() {}
 
     /**
-     * A file of a shard's commit, as a snapshot sees it ({@link Store.MetadataSnapshot#loadFromIndexCommit}).
-     *
-     * @param writerUuid {@link StoreFileMetadata#writerUuid()}, empty if the commit has none for the file
+     * A file of a shard's commit, by name and length, before its checksum is read.
      */
-    record CommitFile(String name, long length, BytesRef writerUuid) {
+    record CommitFile(String name, long length) {
         CommitFile {
             Objects.requireNonNull(name);
-            Objects.requireNonNull(writerUuid);
         }
     }
 
     /**
      * @param stateId the shard state id a snapshot of the commit would have ({@code SnapshotShardsService#getShardStateId}), {@code null}
      *                if the shard is not in a steady state
-     * @return the files whose checksum decides whether the repository holds them
+     * @return the commit files the repository has a file of the same name and length for, whose checksums {@link #bytesToUpload} needs
      */
     static List<CommitFile> filesNeedingChecksum(ShardBaseline baseline, @Nullable String stateId, Collection<CommitFile> commitFiles) {
         if (baseline.hasStateId(stateId)) {
@@ -57,7 +53,7 @@ final class ShardBacklog {
         }
         final List<CommitFile> files = new ArrayList<>();
         for (CommitFile file : commitFiles) {
-            if (isUploaded(file) && baseline.mayHold(file.name(), file.length(), file.writerUuid())) {
+            if (isUploaded(file) && baseline.mayHold(file.name(), file.length())) {
                 files.add(file);
             }
         }
@@ -65,17 +61,17 @@ final class ShardBacklog {
     }
 
     /**
-     * @param stateId   the shard state id a snapshot of the commit would have ({@code SnapshotShardsService#getShardStateId}),
-     *                  {@code null} if the shard is not in a steady state
-     * @param checksums the checksums in the footers of the commit files, by file name; must contain every file that
-     *                  {@link #filesNeedingChecksum} names
+     * @param stateId          the shard state id a snapshot of the commit would have ({@code SnapshotShardsService#getShardStateId}),
+     *                         {@code null} if the shard is not in a steady state
+     * @param filesWithChecksum the files that {@link #filesNeedingChecksum} returned, with their checksums, by file name, as a snapshot
+     *                         reads them ({@link Store.MetadataSnapshot#loadFromIndexCommit})
      * @return the bytes the next snapshot of the commit would upload
      */
     static long bytesToUpload(
         ShardBaseline baseline,
         @Nullable String stateId,
         Collection<CommitFile> commitFiles,
-        Map<String, Long> checksums
+        Map<String, StoreFileMetadata> filesWithChecksum
     ) {
         if (baseline.hasStateId(stateId)) {
             return 0;
@@ -85,12 +81,14 @@ final class ShardBacklog {
             if (isUploaded(file) == false) {
                 continue;
             }
-            if (baseline.mayHold(file.name(), file.length(), file.writerUuid())) {
-                final Long checksum = checksums.get(file.name());
-                if (checksum == null) {
+            if (baseline.mayHold(file.name(), file.length())) {
+                final StoreFileMetadata fileWithChecksum = filesWithChecksum.get(file.name());
+                if (fileWithChecksum == null) {
                     throw new IllegalArgumentException("no checksum for [" + file.name() + "]");
                 }
-                if (baseline.holds(file.name(), file.length(), file.writerUuid(), checksum)) {
+                assert fileWithChecksum.name().equals(file.name()) && fileWithChecksum.length() == file.length()
+                    : fileWithChecksum + " vs " + file;
+                if (baseline.holds(fileWithChecksum)) {
                     continue;
                 }
             }
