@@ -12,6 +12,7 @@ package org.elasticsearch.action.bulk;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.Build;
 import org.elasticsearch.action.ActionFuture;
@@ -43,7 +44,6 @@ import org.elasticsearch.datastreams.DataStreamsPlugin;
 import org.elasticsearch.escf.EscfEncoder;
 import org.elasticsearch.index.IndexMode;
 import org.elasticsearch.index.IndexSettings;
-import org.elasticsearch.index.codec.columnar.ColumnarDocValuesFormatSelector;
 import org.elasticsearch.index.mapper.SeqNoFieldMapper;
 import org.elasticsearch.index.mapper.ShardBatchMapper;
 import org.elasticsearch.index.mapper.SourceFieldMapper;
@@ -2465,10 +2465,11 @@ public class BatchBulkIT extends ESIntegTestCase {
             assertTrue("batch path lost document [" + id + "]", fromBatch[i].getResponse().isExists());
             final Map<String, Object> batchSource = fromBatch[i].getResponse().getSourceAsMap();
             assertThat("source of [" + id + "]", batchSource, equalTo(fromRow[i].getResponse().getSourceAsMap()));
-            // Synthetic source renders absorbed leaves under _unmapped. env is in every document, so two empty sinks cannot pass as equal.
+            // Synthetic source renders absorbed leaves under their own paths. env is in every document, so two empty sinks cannot pass as
+            // equal.
             assertThat(
                 "unmapped leaf of [" + id + "]",
-                XContentMapValues.extractValue(FlattenedFieldMapper.UNMAPPED_SINK_NAME + ".env", batchSource),
+                XContentMapValues.extractValue("env", batchSource),
                 equalTo(sources.get(id).get("env"))
             );
         }
@@ -2517,12 +2518,8 @@ public class BatchBulkIT extends ESIntegTestCase {
                     mapping.startObject("field");
                     {
                         mapping.field("type", "keyword");
-                        mapping.startObject("doc_values");
-                        {
-                            mapping.field("multi_value", false);
-                            mapping.field("on_failure", "ignore");
-                        }
-                        mapping.endObject();
+                        mapping.field("multi_value", false);
+                        mapping.field("on_failure", "ignore");
                     }
                     mapping.endObject();
                 }
@@ -3051,7 +3048,6 @@ public class BatchBulkIT extends ESIntegTestCase {
      * seen once, so the column is written over the shapes its layout is chosen from rather than one of them.
      */
     public void testColumnarCodecBatchMatchesRowPath() throws IOException {
-        assumeTrue("columnar_codec feature flag must be enabled", ColumnarDocValuesFormatSelector.COLUMNAR_CODEC_FEATURE_FLAG.isEnabled());
         final String batched = "test-columnar-codec-batched";
         final String sequential = "test-columnar-codec-sequential";
 
@@ -3209,15 +3205,10 @@ public class BatchBulkIT extends ESIntegTestCase {
                         .put("index.number_of_shards", 1)
                         .put("index.number_of_replicas", 0)
                         .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
-                        .put(IndexSettings.COLUMNAR_CODEC_ENABLED_SETTING.getKey(), true)
                 )
                 .setMapping(mapping)
         );
         ensureGreen(index);
-        // The cluster kill switch overrules the request setting, and an index that came back without the codec
-        // would read back the same on both paths while saying nothing about the format this test is here for.
-        final Settings created = indicesAdmin().prepareGetSettings(TEST_REQUEST_TIMEOUT, index).get().getIndexToSettings().get(index);
-        assumeTrue("columnar codec is disabled for [" + index + "]", IndexSettings.COLUMNAR_CODEC_ENABLED_SETTING.get(created));
     }
 
     /**
@@ -3395,6 +3386,81 @@ public class BatchBulkIT extends ESIntegTestCase {
             assertNoFailures(searchResponse);
             assertThat("both docs should be indexed after fallback", searchResponse.getHits().getTotalHits().value(), equalTo(2L));
         });
+    }
+
+    /**
+     * A leaf array with more elements than fit in a sorted doc value ({@code IndexWriter.MAX_TERM_LENGTH} bytes of encoded
+     * offsets) cannot be indexed through the columnar path: {@code ColumnarOffsetsBuilder} bails out, the batch falls back to
+     * the row path, and only that document is rejected, with an explicit error instead of Lucene's. The other documents in
+     * the bulk request are indexed by the row path, with their array order intact.
+     */
+    public void testColumnarOversizedArrayOffsetsRejectOnlyThatDocument() throws IOException {
+        final String index = "test-columnar-oversized-offsets";
+        assertAcked(
+            indicesAdmin().prepareCreate(index)
+                .setSettings(
+                    Settings.builder()
+                        .put("index.number_of_shards", 1)
+                        .put("index.number_of_replicas", 0)
+                        .put(IndexSettings.MODE.getKey(), IndexMode.COLUMNAR.getName())
+                        .put(IndexSettings.RECOVERY_USE_SYNTHETIC_SOURCE_SETTING.getKey(), true)
+                )
+                .setMapping("""
+                    {"dynamic":"strict","properties":{"n":{"type":"long"}}}""")
+        );
+        ensureGreen(index);
+        final String coordinatingNode = findCoordinatingNode();
+
+        final Map<String, String> sources = new LinkedHashMap<>();
+        final int numDocs = between(3, 10);
+        for (int i = 0; i < numDocs; i++) {
+            // Out-of-order values with duplicates, so the offsets sidecar carries real ordering information.
+            sources.put("doc-" + i, "{\"n\":[3,1,3,2," + i + "]}");
+        }
+        // One more slot than the limit guarantees the encoded offsets exceed it, since every slot takes at least one byte.
+        final StringBuilder oversized = new StringBuilder("{\"n\":[");
+        final int numSlots = IndexWriter.MAX_TERM_LENGTH + between(1, 500);
+        for (int i = 0; i < numSlots; i++) {
+            oversized.append(i == 0 ? "" : ",").append(randomInt(3));
+        }
+        oversized.append("]}");
+        sources.put("oversized", oversized.toString());
+
+        final BulkResponse response;
+        try (var mockLog = MockLog.capture(ShardBatchMapper.class)) {
+            mockLog.addExpectation(
+                new MockLog.SeenEventExpectation(
+                    "columnar batch mapping bails out",
+                    ShardBatchMapper.class.getName(),
+                    Level.WARN,
+                    "columnar batch mapping failed on *, falling back"
+                )
+            );
+            response = client(coordinatingNode).bulk(bulkOf(index, sources)).actionGet();
+            mockLog.assertAllExpectationsMatched();
+        }
+
+        assertTrue(response.hasFailures());
+        for (BulkItemResponse item : response.getItems()) {
+            if (item.getId().equals("oversized")) {
+                assertTrue("oversized array must be rejected, but got: " + item.getResponse(), item.isFailed());
+                assertThat(item.getFailure().getStatus(), equalTo(RestStatus.BAD_REQUEST));
+                assertThat(item.getFailure().getMessage(), containsString("encoded offsets of field [n.offsets] are too large to store"));
+                assertThat(item.getFailure().getMessage(), containsString("cannot be preserved in [_ignored_source]"));
+            } else {
+                assertFalse(item.getFailureMessage(), item.isFailed());
+            }
+        }
+
+        refresh(index);
+        assertResponse(prepareSearch(index).setQuery(QueryBuilders.matchAllQuery()).setSize(0).setTrackTotalHits(true), searchResponse -> {
+            assertNoFailures(searchResponse);
+            assertThat(searchResponse.getHits().getTotalHits().value(), equalTo((long) numDocs));
+        });
+        // A document the row path indexed after the fallback still reproduces its array order and duplicates.
+        var getResponse = client().get(new GetRequest(index).id("doc-0")).actionGet();
+        assertTrue(getResponse.isExists());
+        assertThat(getResponse.getSourceAsMap().get("n"), equalTo(List.of(3, 1, 3, 2, 0)));
     }
 
     private static BulkRequest bulkOf(String index, Map<String, String> sources) {
