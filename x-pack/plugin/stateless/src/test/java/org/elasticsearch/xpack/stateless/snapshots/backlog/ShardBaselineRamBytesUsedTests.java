@@ -63,27 +63,31 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     /**
-     * The plan estimates about 250 bytes per file for an object per file. Lucene file names are up to about 20 characters and writer
-     * uuids 16 bytes, and state ids about 55 characters.
+     * Apart from its name, a file costs its length and checksum (8 bytes each), its writer uuid (16 bytes) and three array offsets (4
+     * bytes each), 44 bytes; a state id costs its characters and an offset.
      */
     public void testBytesPerFileAndStateId() {
         final int fileCount = 1000;
-        final var files = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap", randomFiles(fileCount), null));
+        final List<FileInfo> fileInfos = randomFiles(fileCount);
+        final long nameBytes = fileInfos.stream().mapToLong(file -> file.physicalName().length()).sum();
+        final var files = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap", fileInfos, null));
         final long empty = ShardBaseline.EMPTY.ramBytesUsed();
-        final long bytesPerFile = (ShardBaseline.of(files).ramBytesUsed() - empty) / fileCount;
-        assertThat(bytesPerFile, lessThan(100L));
+        assertThat((ShardBaseline.of(files).ramBytesUsed() - empty - nameBytes) / fileCount, lessThan(50L));
 
         final int stateIdCount = 400;
+        long stateIdBytes = 0;
         var stateIds = BlobStoreIndexShardSnapshots.EMPTY;
         for (int i = 0; i < stateIdCount; i++) {
-            stateIds = stateIds.withAddedSnapshot(new SnapshotFiles("snap-" + i, List.of(), randomStateId()));
+            final var stateId = randomStateId();
+            stateIdBytes += stateId.length();
+            stateIds = stateIds.withAddedSnapshot(new SnapshotFiles("snap-" + i, List.of(), stateId));
         }
-        final long bytesPerStateId = (ShardBaseline.of(stateIds).ramBytesUsed() - empty) / stateIdCount;
-        assertThat(bytesPerStateId, lessThan(80L));
+        assertThat((ShardBaseline.of(stateIds).ramBytesUsed() - empty - stateIdBytes) / stateIdCount, lessThan(8L));
     }
 
     /**
-     * Files as a shard has them: names up to about 20 characters, the files of a segment sharing its writer uuid.
+     * Files as a shard has them: names of about 6 to 45 characters, the longer ones of per-field formats, and the files of a
+     * segment sharing its writer uuid.
      */
     private static List<FileInfo> randomFiles(int count) {
         final List<FileInfo> files = new ArrayList<>(count);
@@ -92,7 +96,9 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
             if (writerUuid == null || randomBoolean()) {
                 writerUuid = new BytesRef(randomByteArrayOfLength(16));
             }
-            final var name = "_" + Integer.toString(i, Character.MAX_RADIX) + randomFrom(".cfs", "_Lucene912_0.doc", "_ES87TSDB_0.dvd");
+            final var name = "_"
+                + Integer.toString(i, Character.MAX_RADIX)
+                + randomFrom(".cfs", "_Lucene912_0.doc", "_ES87TSDB_0.dvd", "_ES818HnswBinaryQuantizedVectorsFormat_0.vec");
             files.add(
                 new FileInfo(
                     "__" + UUIDs.randomBase64UUID(random()),

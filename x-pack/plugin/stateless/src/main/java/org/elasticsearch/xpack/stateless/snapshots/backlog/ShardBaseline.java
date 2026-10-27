@@ -41,9 +41,9 @@ import java.util.TreeSet;
  */
 final class ShardBaseline implements Accountable {
 
-    static final ShardBaseline EMPTY = of(BlobStoreIndexShardSnapshots.EMPTY);
-
     private static final long SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(ShardBaseline.class);
+
+    static final ShardBaseline EMPTY = of(BlobStoreIndexShardSnapshots.EMPTY);
 
     // the physical names of the files, each once, in BytesRef order
     private final PackedBytes names;
@@ -51,7 +51,7 @@ final class ShardBaseline implements Accountable {
     private final int[] fileStarts;
     private final long[] lengths;
     private final long[] checksums;
-    // empty for a file the repository has no writer uuid for
+    // in file order, empty for a file the repository has no writer uuid for
     private final PackedBytes writerUuids;
     // the shard state ids of the snapshots, each once, in BytesRef order
     private final PackedBytes stateIds;
@@ -75,9 +75,9 @@ final class ShardBaseline implements Accountable {
     }
 
     /**
-     * Leaves out the files that never match a commit file that a snapshot uploads: files kept inside the shard-level metadata, which only
-     * match files of the same name, also kept there; files with a hash, which only match files with the same hash; and files whose
-     * checksum is not written the way {@link Store#digestToString} writes a commit file's checksum, which only match the same string.
+     * Leaves out the files that never match a commit file that a snapshot uploads: files with a hash, such as the files kept inside the
+     * shard-level metadata, which only match files with the same hash; and files whose checksum is not written the way
+     * {@link Store#digestToString} writes a commit file's checksum, which only match the same string.
      */
     static ShardBaseline of(BlobStoreIndexShardSnapshots snapshots) {
         // a file that several snapshots refer to is the same FileInfo in each, so most of them are only looked at once
@@ -93,9 +93,7 @@ final class ShardBaseline implements Accountable {
                     continue;
                 }
                 final StoreFileMetadata metadata = fileInfo.metadata();
-                if (Store.MetadataSnapshot.isReadAsHash(metadata.name())
-                    || metadata.hash().length > 0
-                    || isDigestString(metadata.checksum()) == false) {
+                if (metadata.hash().length > 0 || isDigestString(metadata.checksum()) == false) {
                     continue;
                 }
                 filesByName.computeIfAbsent(new BytesRef(metadata.name()), name -> new LinkedHashSet<>())

@@ -47,7 +47,8 @@ final class ShardBacklog {
     }
 
     /**
-     * @param stateId the commit's shard state id, {@code null} if it has none
+     * @param stateId the shard state id a snapshot of the commit would have ({@code SnapshotShardsService#getShardStateId}), {@code null}
+     *                if the shard is not in a steady state
      * @return the files whose checksum decides whether the repository holds them
      */
     static List<CommitFile> filesNeedingChecksum(ShardBaseline baseline, @Nullable String stateId, Collection<CommitFile> commitFiles) {
@@ -64,7 +65,8 @@ final class ShardBacklog {
     }
 
     /**
-     * @param stateId   the commit's shard state id, {@code null} if it has none
+     * @param stateId   the shard state id a snapshot of the commit would have ({@code SnapshotShardsService#getShardStateId}),
+     *                  {@code null} if the shard is not in a steady state
      * @param checksums the checksums in the footers of the commit files, by file name; must contain every file that
      *                  {@link #filesNeedingChecksum} names
      * @return the bytes the next snapshot of the commit would upload
@@ -98,8 +100,8 @@ final class ShardBacklog {
     }
 
     /**
-     * A snapshot keeps the contents of the other files inside the shard-level metadata ({@link StoreFileMetadata#hashEqualsContents}),
-     * whether or not the repository has them already.
+     * Whether a snapshot uploads the file if the repository does not hold it. It keeps the contents of the {@code .si} and
+     * {@code segments_N} files inside the shard-level metadata instead ({@link StoreFileMetadata#hashEqualsContents}).
      */
     private static boolean isUploaded(CommitFile file) {
         return Store.MetadataSnapshot.isReadAsHash(file.name()) == false;

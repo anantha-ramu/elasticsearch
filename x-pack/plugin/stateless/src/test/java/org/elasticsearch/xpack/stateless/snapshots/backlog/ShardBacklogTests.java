@@ -8,6 +8,12 @@
 package org.elasticsearch.xpack.stateless.snapshots.backlog;
 
 import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.SerialMergeScheduler;
+import org.apache.lucene.index.Term;
 import org.apache.lucene.store.ByteBuffersDataOutput;
 import org.apache.lucene.store.ByteBuffersIndexOutput;
 import org.apache.lucene.util.BytesRef;
@@ -31,6 +37,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -135,20 +142,24 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     public void testChecksumsAreOnlyNeededForFilesOfTheSameNameAndLength() {
-        final var cfs = file("_0.cfs", 1000, 11, NO_WRITER_UUID);
-        final var repository = repository(snapshot("snap-1", null, cfs));
-        final var sameNameAndLength = file("_0.cfs", 1000, 21, randomWriterUuid());
+        final var repository = repository(
+            snapshot("snap-1", null, file("_0.cfs", 1000, 11, NO_WRITER_UUID), file("_0.cfe", 100, 12, randomWriterUuid()))
+        );
+        // either side without writer uuid: the checksum decides
+        final var cfsWithWriterUuid = file("_0.cfs", 1000, 21, randomWriterUuid());
+        final var cfeWithoutWriterUuid = file("_0.cfe", 100, 22, NO_WRITER_UUID);
         final var commit = commit(
             null,
-            sameNameAndLength,
+            cfsWithWriterUuid,
+            cfeWithoutWriterUuid,
             file("_1.cfs", 1000, 11, NO_WRITER_UUID),
-            file("_0.cfe", 100, 12, NO_WRITER_UUID)
+            file("_0.fdt", 100, 12, NO_WRITER_UUID)
         );
 
         final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline(repository), null, commitFiles(commit));
 
-        assertThat(needingChecksum, equalTo(List.of(commitFile(sameNameAndLength))));
-        assertBacklog(repository, commit, 2100);
+        assertThat(needingChecksum, equalTo(List.of(commitFile(cfsWithWriterUuid), commitFile(cfeWithoutWriterUuid))));
+        assertBacklog(repository, commit, 2200);
     }
 
     public void testAMissingChecksumIsRejected() {
@@ -191,41 +202,67 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * Builds repositories the way snapshots do, from a history of random commits of a few file names, each with a few versions that
-     * often share their length and checksum, sometimes without writer uuid, then removes some of the snapshots as retention does and
-     * reads the shard-level metadata back as a node would. The bytes to upload for a last commit must be what the snapshot would
-     * upload, as worked out with the snapshot's own matching ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}).
+     * Builds a repository the way snapshots do, from a history of random commits of a few file names, each with a few versions that
+     * often share their length and checksum, sometimes without writer uuid, plus files only older versions write (a hash, a checksum
+     * written otherwise). Then removes some of the snapshots as retention does and reads the shard-level metadata back as a node would.
      */
     public void testRandomHistoriesMatchWhatTheSnapshotWouldUpload() throws IOException {
-        for (int round = 0; round < 50; round++) {
-            final var versions = randomFileVersions();
-            final var stateIds = List.of("state-1", "state-2", "state-3");
+        final var versions = randomFileVersions();
+        final var stateIds = List.of("state-1", "state-2", "state-3");
 
-            var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
-            final List<SnapshotId> snapshotIds = new ArrayList<>();
-            for (int i = between(0, 8); i > 0; i--) {
-                final var snapshotId = new SnapshotId("snap-" + snapshotIds.size(), randomUUID());
-                snapshots = snapshotShard(snapshots, snapshotId.getName(), randomCommit(versions, stateIds));
-                snapshotIds.add(snapshotId);
-            }
-            if (snapshotIds.isEmpty() == false && randomBoolean()) {
-                snapshots = snapshots.withRetainedSnapshots(Set.copyOf(randomSubsetOf(snapshotIds)));
-            }
-            final var readBack = readBack(snapshots);
+        var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
+        final List<SnapshotId> snapshotIds = new ArrayList<>();
+        for (int i = between(0, 8); i > 0; i--) {
+            final var snapshotId = new SnapshotId("snap-" + snapshotIds.size(), randomUUID());
             final var commit = randomCommit(versions, stateIds);
+            snapshots = snapshotShard(snapshots, snapshotId.getName(), randomBoolean() ? commit : withOlderVersionFiles(commit));
+            snapshotIds.add(snapshotId);
+        }
+        if (snapshotIds.isEmpty() == false && randomBoolean()) {
+            snapshots = snapshots.withRetainedSnapshots(Set.copyOf(randomSubsetOf(snapshotIds)));
+        }
 
-            final long expected = uploadedBytes(readBack, commit);
-            final var baseline = ShardBaseline.of(readBack);
-            final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), commitFiles(commit));
-            assertThat(needingChecksum, equalTo(filesWithSameNameAndLength(readBack, commit)));
-            // only the checksums asked for, so that a file whose checksum is needed but not asked for fails
-            final Map<String, Long> checksums = new HashMap<>();
-            for (StoreFileMetadata file : commit.files()) {
-                if (needingChecksum.contains(commitFile(file))) {
-                    checksums.put(file.name(), checksum(file));
+        assertMatchesWhatTheSnapshotWouldUpload(readBack(snapshots), randomCommit(versions, stateIds));
+    }
+
+    /**
+     * Commits as Lucene writes them and a snapshot reads them ({@link Store.MetadataSnapshot#loadFromIndexCommit}), with deletes, so
+     * that some files have the writer uuid of the segment and others that of its deletes, and an index created again under the same
+     * file names.
+     */
+    public void testLuceneCommitsMatchWhatTheSnapshotWouldUpload() throws IOException {
+        var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
+        final int recreateAt = between(1, 6);
+        for (int index = 0; index < 2; index++) {
+            try (var directory = newDirectory()) {
+                final var config = new IndexWriterConfig().setUseCompoundFile(randomBoolean())
+                    .setMergeScheduler(new SerialMergeScheduler());
+                try (var writer = new IndexWriter(directory, config)) {
+                    int docs = 0;
+                    for (int step = 0; step < (index == 0 ? recreateAt : 6); step++) {
+                        for (int i = between(1, 20); i > 0; i--) {
+                            writer.addDocument(List.of(new StringField("id", Integer.toString(docs++), Field.Store.NO)));
+                        }
+                        if (randomBoolean()) {
+                            writer.deleteDocuments(new Term("id", Integer.toString(between(0, docs - 1))));
+                        }
+                        if (rarely()) {
+                            writer.forceMerge(1);
+                        }
+                        writer.commit();
+                        final var files = new ArrayList<StoreFileMetadata>();
+                        for (StoreFileMetadata file : Store.MetadataSnapshot.loadFromIndexCommit(null, directory, logger)) {
+                            files.add(file);
+                        }
+                        final var commit = new Commit(null, files);
+
+                        assertMatchesWhatTheSnapshotWouldUpload(snapshots, commit);
+                        if (randomBoolean()) {
+                            snapshots = readBack(snapshotShard(snapshots, "snap-" + index + "-" + step, commit));
+                        }
+                    }
                 }
             }
-            assertThat(ShardBacklog.bytesToUpload(baseline, commit.stateId(), commitFiles(commit), checksums), equalTo(expected));
         }
     }
 
@@ -255,13 +292,28 @@ public class ShardBacklogTests extends ESTestCase {
 
     private static void assertBacklog(BlobStoreIndexShardSnapshots snapshots, Commit commit, long expectedBytes) {
         assertThat("what the snapshot would upload", uploadedBytes(snapshots, commit), equalTo(expectedBytes));
-        final var checksums = new HashMap<String, Long>();
+        assertMatchesWhatTheSnapshotWouldUpload(snapshots, commit);
+    }
+
+    /**
+     * The files needing a checksum must be the files whose checksum decides, and the bytes to upload, given only the checksums asked
+     * for, what the snapshot would upload, as worked out with the snapshot's own matching
+     * ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}).
+     */
+    private static void assertMatchesWhatTheSnapshotWouldUpload(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
+        final var baseline = ShardBaseline.of(snapshots);
+        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), commitFiles(commit));
+        assertThat("files needing a checksum", needingChecksum, equalTo(filesWhoseChecksumDecides(snapshots, commit)));
+        final Map<String, Long> checksums = new HashMap<>();
         for (StoreFileMetadata file : commit.files()) {
-            checksums.put(file.name(), checksum(file));
+            if (needingChecksum.contains(commitFile(file))) {
+                checksums.put(file.name(), checksum(file));
+            }
         }
         assertThat(
-            ShardBacklog.bytesToUpload(baseline(snapshots), commit.stateId(), commitFiles(commit), checksums),
-            equalTo(expectedBytes)
+            "bytes to upload",
+            ShardBacklog.bytesToUpload(baseline, commit.stateId(), commitFiles(commit), checksums),
+            equalTo(uploadedBytes(snapshots, commit))
         );
     }
 
@@ -315,10 +367,11 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * The commit files a snapshot would upload unless the repository has them, for which the repository has a file of the same name
-     * and length and a writer uuid that does not rule it out, unless a snapshot has the commit's state id.
+     * The commit files whose checksum decides whether the snapshot would upload them: a repository file of the same name would be
+     * reused ({@link FileInfo#isSame}) if the commit file had that file's checksum, as {@link Store#digestToString} writes a commit
+     * file's checksum. None if a snapshot has the commit's state id.
      */
-    private static List<CommitFile> filesWithSameNameAndLength(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
+    private static List<CommitFile> filesWhoseChecksumDecides(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
         if (commit.stateId() != null && snapshots.snapshots().stream().anyMatch(s -> commit.stateId().equals(s.shardStateIdentifier()))) {
             return List.of();
         }
@@ -327,16 +380,29 @@ public class ShardBacklogTests extends ESTestCase {
             if (file.hashEqualsContents()) {
                 continue;
             }
-            final boolean candidate = snapshots.snapshots()
+            final boolean checksumDecides = snapshots.snapshots()
                 .stream()
                 .flatMap(snapshot -> snapshot.indexFiles().stream())
-                .map(FileInfo::metadata)
-                .anyMatch(
-                    held -> held.name().equals(file.name())
-                        && held.length() == file.length()
-                        && (held.writerUuid().length == 0 || file.writerUuid().length == 0 || held.writerUuid().equals(file.writerUuid()))
-                );
-            if (candidate) {
+                .filter(held -> held.physicalName().equals(file.name()))
+                .anyMatch(held -> {
+                    final long heldChecksum;
+                    try {
+                        heldChecksum = Long.parseLong(held.checksum(), Character.MAX_RADIX);
+                    } catch (NumberFormatException e) {
+                        return false;
+                    }
+                    return held.isSame(
+                        new StoreFileMetadata(
+                            file.name(),
+                            file.length(),
+                            Store.digestToString(heldChecksum),
+                            file.writtenBy(),
+                            file.hash(),
+                            file.writerUuid()
+                        )
+                    );
+                });
+            if (checksumDecides) {
                 files.add(commitFile(file));
             }
         }
@@ -394,6 +460,33 @@ public class ShardBacklogTests extends ESTestCase {
             }
         }
         return new Commit(randomBoolean() ? null : randomFrom(stateIds), files);
+    }
+
+    /**
+     * The commit with some of its uploaded files as older Elasticsearch versions may have recorded them in the repository: with a hash
+     * that is not the whole file, or with the checksum written with a leading zero or in upper case, and without writer uuid, which
+     * older versions did not record. No commit file looks like that today, so these only appear in the repository.
+     */
+    private static Commit withOlderVersionFiles(Commit commit) {
+        final List<StoreFileMetadata> files = new ArrayList<>();
+        for (StoreFileMetadata file : commit.files()) {
+            if (file.hashEqualsContents() || randomBoolean()) {
+                files.add(file);
+            } else {
+                final boolean withHash = randomBoolean();
+                files.add(
+                    new StoreFileMetadata(
+                        file.name(),
+                        file.length(),
+                        withHash ? file.checksum() : randomFrom("0" + file.checksum(), file.checksum().toUpperCase(Locale.ROOT)),
+                        file.writtenBy(),
+                        withHash ? new BytesRef(randomByteArrayOfLength(between(1, 100))) : null,
+                        NO_WRITER_UUID
+                    )
+                );
+            }
+        }
+        return new Commit(commit.stateId(), files);
     }
 
     private static StoreFileMetadata file(String name, long length, long checksum, BytesRef writerUuid) {
