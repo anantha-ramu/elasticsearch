@@ -89,11 +89,12 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
 
     public void testOnlyTheLatestStateIdIsKept() {
         final List<FileInfo> files = randomFiles(0, between(1, 50));
-        final var latest = new SnapshotFiles("snap-latest", files, randomStateId());
+        // the latest after a force merge, so that its state id is longer than the others and keeping any other one costs less
+        final var latest = new SnapshotFiles("snap-latest", files, stateId(true));
         var manySnapshots = BlobStoreIndexShardSnapshots.EMPTY;
         for (int i = between(1, 400); i > 0; i--) {
             // a shard written to between snapshots: a new state id each time
-            manySnapshots = manySnapshots.withAddedSnapshot(new SnapshotFiles("snap-" + i, files, randomStateId()));
+            manySnapshots = manySnapshots.withAddedSnapshot(new SnapshotFiles("snap-" + i, files, stateId(false)));
         }
         manySnapshots = manySnapshots.withAddedSnapshot(latest);
 
@@ -216,9 +217,13 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
      * As {@code SnapshotShardsService#getShardStateId}: history uuid, force merge uuid ("na" if none) and max seq no.
      */
     private static String randomStateId() {
+        return stateId(randomBoolean());
+    }
+
+    private static String stateId(boolean forceMerged) {
         return UUIDs.randomBase64UUID(random())
             + "-"
-            + (randomBoolean() ? "na" : UUIDs.randomBase64UUID(random()))
+            + (forceMerged ? UUIDs.randomBase64UUID(random()) : "na")
             + "-"
             + randomNonNegativeLong();
     }
