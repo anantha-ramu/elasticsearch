@@ -105,7 +105,8 @@ public class TransportGetShardGenerationsActionTests extends ESTestCase {
     public void testIndexIsFoundByName() {
         final var gen0 = new ShardGeneration(randomUUID());
         final var data = repositoryData(randomNonNegativeLong(), ShardGenerations.builder().put(INDEX, 0, gen0).build());
-        // an index created again with the same name has a new uuid, its next snapshot uses the index id the repository has for the name
+        // an index created again under the same name gets a new uuid, but its next snapshot uses the index id the repository has for
+        // that name
         final var recreatedShard = new ShardId(new Index("index", randomUUID()), 0);
 
         final var response = TransportGetShardGenerationsAction.getResponse(data, List.of(recreatedShard));

@@ -35,7 +35,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 
 /**
- * Asks a real master from an index node, and checks the answers against the repository data the master has.
+ * Sends the request from an index node to a real master, and checks the answers against the master's repository data.
  */
 public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase {
 
@@ -49,7 +49,7 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
     }
 
     /**
-     * Snapshots as in serverless: read from the object store, and kept running while a shard relocates.
+     * Takes snapshots the way serverless does: they read from the object store, and keep running while a shard relocates.
      */
     private static Settings snapshotNodeSettings() {
         return Settings.builder()
@@ -81,7 +81,7 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
     }
 
     /**
-     * @return what the master's repository data says about the shards, in the form the action answers with
+     * @return what the master's repository data says about the shards, in the same form as the action's answer
      */
     private static Map<ShardId, RepositoryShardGeneration> expectedShardGenerations(List<ShardId> shardIds) {
         final RepositoryData repositoryData = getRepositoryData(getRepositoryOnMaster(REPOSITORY));
@@ -110,7 +110,7 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
             shardIds.add(new ShardId(index, i));
         }
 
-        // before the first snapshot the repository holds nothing of the shards
+        // before the first snapshot, none of the shards' files are backed up
         final var beforeSnapshot = getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds);
         assertThat(beforeSnapshot.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
         assertThat(beforeSnapshot.shardGenerations(), anEmptyMap());
@@ -120,7 +120,7 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
         assertThat(afterFirstSnapshot.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
         assertThat(afterFirstSnapshot.shardGenerations(), equalTo(expectedShardGenerations(shardIds)));
 
-        // every snapshot writes new shard-level metadata for every shard it includes, even when nothing was written in between
+        // every snapshot writes new metadata for each shard it includes, even if nothing was written in between
         createFullSnapshot(logger, REPOSITORY, "snap-2");
         final var afterSecondSnapshot = getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds);
         assertThat(afterSecondSnapshot.shardGenerations(), equalTo(expectedShardGenerations(shardIds)));
@@ -131,7 +131,7 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
             );
         }
 
-        // deleting a snapshot (as retention does) writes new shard-level metadata for every shard of it as well
+        // deleting a snapshot, as retention does, also writes new metadata for each of its shards
         assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, "snap-1"));
         final var afterFirstDelete = getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds);
         assertThat(afterFirstDelete.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
@@ -143,7 +143,7 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
             );
         }
 
-        // once no snapshot refers to the index the repository holds nothing of the shards any more
+        // once no snapshot includes the index, none of its shards' files are backed up any more
         assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, "snap-2"));
         final var afterDelete = getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds);
         assertThat(afterDelete.repositoryGeneration(), equalTo(getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId()));
@@ -162,8 +162,8 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
     }
 
     /**
-     * The repository is looked up in the project the request names, not by its name alone. These tests run one project only, so this
-     * asks for the repository of the default project under the id of a project that does not exist.
+     * The repository is looked up in the project the request names, not by name alone. These tests run a single project, so this asks
+     * for the default project's repository under the id of a project that doesn't exist.
      */
     public void testRepositoryOfAnotherProjectIsNotUsed() {
         startMasterOnlyNode(snapshotNodeSettings());
@@ -174,7 +174,7 @@ public class GetShardGenerationsIT extends AbstractStatelessPluginIntegTestCase 
         indexDocs(INDEX, between(10, 100));
         createFullSnapshot(logger, REPOSITORY, "snap");
         final var shardIds = List.of(new ShardId(resolveIndex(INDEX), 0));
-        // the default project's repository has shard-level metadata of the shard
+        // the default project's repository has metadata for the shard
         assertThat(
             getShardGenerations(indexNode, DEFAULT_PROJECT_REPOSITORY, shardIds).shardGenerations().keySet(),
             equalTo(Set.copyOf(shardIds))

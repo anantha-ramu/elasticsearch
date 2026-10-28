@@ -16,8 +16,8 @@ import org.elasticsearch.repositories.ShardGeneration;
 import java.io.IOException;
 
 /**
- * Where a repository keeps the shard-level metadata ({@code index-{generation}}) of a shard: the repository's id of the shard's index
- * and the generation of the metadata.
+ * Where to find a shard's backup metadata in a repository: the id the repository gives the shard's index, and the generation of the
+ * shard's metadata file ({@code index-{generation}}) to read.
  */
 public record RepositoryShardGeneration(IndexId indexId, ShardGeneration generation) implements Writeable {
 
