@@ -22,7 +22,8 @@ import java.util.Objects;
  * ({@code BlobStoreRepository#doSnapshotShard}), by comparing what the repository holds of the shard ({@link ShardBaseline}) with the
  * shard's latest commit:
  * <ul>
- *     <li>if a snapshot in the repository has the commit's shard state id, nothing is uploaded;</li>
+ *     <li>if a snapshot in the repository has the commit's shard state id, nothing is uploaded (the baseline keeps the latest state
+ *     id, the only one a commit of the shard can have);</li>
  *     <li>otherwise every commit file the repository doesn't hold is uploaded, apart from the {@code .si} and {@code segments_N} files,
  *     whose contents a snapshot keeps inside the shard-level metadata ({@link Store.MetadataSnapshot#isReadAsHash}).</li>
  * </ul>
@@ -56,7 +57,7 @@ final class ShardBacklog {
         }
         final List<CommitFile> files = new ArrayList<>();
         for (CommitFile file : commitFiles) {
-            if (isUploaded(file) && baseline.mayHold(file.name(), file.length())) {
+            if (isUploaded(file) && baseline.mayHold(file.name())) {
                 files.add(file);
             }
         }
@@ -86,7 +87,7 @@ final class ShardBacklog {
             if (isUploaded(file) == false) {
                 continue;
             }
-            if (baseline.mayHold(file.name(), file.length())) {
+            if (baseline.mayHold(file.name())) {
                 final StoreFileMetadata metadata = commitFileMetadata.get(file.name());
                 if (metadata == null) {
                     throw new IllegalArgumentException("no checksum for [" + file.name() + "]");

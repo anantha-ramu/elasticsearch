@@ -39,7 +39,7 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
 
     @Override
     protected Set<String> fieldsAccountedForInRamBytesUsed() {
-        return Set.of("filesByName", "stateIds");
+        return Set.of("filesByName", "stateId");
     }
 
     @Override
@@ -84,6 +84,45 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         assertThat(
             ShardBaseline.of(olderAndLatest, commitFiles(current)).ramBytesUsed(),
             equalTo(ShardBaseline.of(latest, commitFiles(current)).ramBytesUsed())
+        );
+    }
+
+    public void testOnlyTheLatestStateIdIsKept() {
+        final List<FileInfo> files = randomFiles(0, between(1, 50));
+        final var latest = new SnapshotFiles("snap-latest", files, randomStateId());
+        var manySnapshots = BlobStoreIndexShardSnapshots.EMPTY;
+        for (int i = between(1, 400); i > 0; i--) {
+            // a shard written to between snapshots: a new state id each time
+            manySnapshots = manySnapshots.withAddedSnapshot(new SnapshotFiles("snap-" + i, files, randomStateId()));
+        }
+        manySnapshots = manySnapshots.withAddedSnapshot(latest);
+
+        assertThat(
+            ShardBaseline.of(manySnapshots, commitFiles(files)).ramBytesUsed(),
+            equalTo(ShardBaseline.of(BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(latest), commitFiles(files)).ramBytesUsed())
+        );
+    }
+
+    public void testFilesOfTheSameNameAndAnotherLengthCostNothing() {
+        final List<FileInfo> current = randomFiles(0, between(1, 50));
+        // files of an earlier copy of the index, deleted and created again under the same name
+        final List<FileInfo> earlier = new ArrayList<>();
+        for (FileInfo file : current) {
+            earlier.add(
+                new FileInfo(
+                    "__" + UUIDs.randomBase64UUID(random()),
+                    metadata(file.physicalName(), file.length() + between(1, 1000), randomWriterUuid()),
+                    null
+                )
+            );
+        }
+        final var earlierAndCurrent = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-0", earlier, null))
+            .withAddedSnapshot(new SnapshotFiles("snap-1", current, null));
+        final var onlyCurrent = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-1", current, null));
+
+        assertThat(
+            ShardBaseline.of(earlierAndCurrent, commitFiles(current)).ramBytesUsed(),
+            equalTo(ShardBaseline.of(onlyCurrent, commitFiles(current)).ramBytesUsed())
         );
     }
 
@@ -148,9 +187,13 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     private static StoreFileMetadata metadata(String name, BytesRef writerUuid) {
+        return metadata(name, randomLongBetween(16, 5L << 30), writerUuid);
+    }
+
+    private static StoreFileMetadata metadata(String name, long length, BytesRef writerUuid) {
         return new StoreFileMetadata(
             name,
-            randomLongBetween(16, 5L << 30),
+            length,
             Store.digestToString(randomLongBetween(0, 0xFFFFFFFFL)),
             Version.LATEST.toString(),
             null,

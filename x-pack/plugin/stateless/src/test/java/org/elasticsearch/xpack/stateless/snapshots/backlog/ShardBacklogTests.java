@@ -46,6 +46,7 @@ import static org.elasticsearch.repositories.blobstore.BlobStoreRepository.INDEX
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
 public class ShardBacklogTests extends ESTestCase {
 
@@ -67,18 +68,59 @@ public class ShardBacklogTests extends ESTestCase {
         assertBacklog(BlobStoreIndexShardSnapshots.EMPTY, commit(null, cfs, file("_1.cfs", 2000, 13, randomWriterUuid())), 3000);
     }
 
-    public void testAStateIdOfAnyRetainedSnapshotMeansNothingToUpload() {
+    public void testTheLatestStateIdMeansNothingToUpload() {
         final var repository = repository(
             snapshot("snap-1", "state-1", file("_0.cfs", 1000, 11, randomWriterUuid())),
             snapshot("snap-2", "state-2", file("_1.cfs", 2000, 12, randomWriterUuid()))
         );
-        for (String stateId : List.of("state-1", "state-2")) {
-            // e.g. merged since the snapshot without any new writes: other files, same state
-            final var mergedFiles = commit(stateId, file("_2.cfs", 3000, 13, randomWriterUuid()));
+        // merged since the latest snapshot without any new writes: other files, the same state
+        final var merged = commit("state-2", file("_2.cfs", 3000, 13, randomWriterUuid()));
 
-            assertBacklog(repository, mergedFiles, 0);
-            assertThat(ShardBacklog.filesNeedingChecksum(baseline(repository, mergedFiles), stateId, commitFiles(mergedFiles)), empty());
+        assertBacklog(repository, merged, 0);
+        assertThat(ShardBacklog.filesNeedingChecksum(baseline(repository, merged), "state-2", commitFiles(merged)), empty());
+    }
+
+    public void testTheLatestSnapshotWithAStateIdCounts() {
+        final var cfs = file("_0.cfs", 1000, 11, randomWriterUuid());
+        // the latest snapshot was taken before the shard had settled, so it has no state id
+        final var repository = repository(snapshot("snap-1", "state-1", cfs), snapshot("snap-2", null, cfs));
+
+        assertBacklog(repository, commit("state-1", file("_1.cfs", 3000, 13, randomWriterUuid())), 0);
+    }
+
+    public void testACloneOfAnOlderSnapshotCountsUntilTheNextSnapshot() {
+        final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
+        final var cfs1 = file("_1.cfs", 2000, 12, randomWriterUuid());
+        var repository = repository(snapshot("snap-1", "state-1", cfs0), snapshot("snap-2", "state-2", cfs0, cfs1));
+        repository = repository.withClone("snap-1", "clone-1");
+        if (randomBoolean()) {
+            // the clone's original deleted, as retention does
+            repository = repository.withRetainedSnapshots(
+                Set.of(new SnapshotId("snap-2", randomUUID()), new SnapshotId("clone-1", randomUUID()))
+            );
         }
+        // merged since snap-2 without new writes: other files, the same state
+        final var merged = commit("state-2", file("_2.cfs", 3000, 13, randomWriterUuid()));
+
+        assertThat(uploadedBytes(repository, merged), equalTo(0L));
+        // the clone put state-1 last, so the backlog counts the merged file
+        assertThat(ShardBacklog.bytesToUpload(baseline(repository, merged), "state-2", commitFiles(merged), Map.of()), equalTo(3000L));
+        // the next snapshot takes the shortcut and puts state-2 last again
+        assertBacklog(snapshotShard(repository, "snap-3", merged), merged, 0);
+    }
+
+    public void testARestoredSnapshotMatchesByItsFiles() {
+        final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
+        final var repository = repository(
+            snapshot("snap-1", "history-1-na-5", cfs0),
+            snapshot("snap-2", "history-1-na-9", file("_1.cfs", 2000, 12, randomWriterUuid()))
+        );
+        // snap-1 restored: its files again, under a new history
+        final var restored = commit("history-2-na-5", cfs0);
+
+        assertBacklog(repository, restored, 0);
+        // a new file after the restore gets the name and length of a file of snap-2, but it is another file
+        assertBacklog(repository, restored, commit("history-2-na-7", cfs0, file("_1.cfs", 2000, 12, randomWriterUuid())), 2000);
     }
 
     public void testAnotherStateIdComparesTheFiles() {
@@ -131,7 +173,7 @@ public class ShardBacklogTests extends ESTestCase {
 
     public void testAFileOfAnyRetainedSnapshotMatches() {
         final var older = file("_0.cfs", 1000, 11, randomWriterUuid());
-        final var newer = file("_0.cfs", 2000, 12, randomWriterUuid());
+        final var newer = file("_0.cfs", 1000, 12, randomWriterUuid());
         // the index was deleted and created again between the two snapshots, so the repository has two files named _0.cfs
         final var repository = repository(snapshot("snap-1", null, older), snapshot("snap-2", null, newer));
 
@@ -241,32 +283,74 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * Builds a repository the way snapshots do, from a history of random commits of a few file names, each with a few versions that
-     * often share their length and checksum, sometimes without writer uuid, plus files only older versions write (a hash, a checksum
-     * written otherwise). Then removes some of the snapshots as retention does and reads the shard-level metadata back as a node would.
-     * A random commit is checked after every snapshot and a few at the end. These commits are not those of one Lucene index, so each
-     * check builds the baseline for the commit it checks.
+     * Builds a repository the way snapshots do, from a random history of a shard. Commits are drawn from a few file names, each with a
+     * few versions that often share their length and checksum, sometimes without writer uuid, and some snapshots record files as
+     * older versions did (a hash, a checksum written otherwise). The state id changes with new writes and stays the same when only the
+     * files change, as after a merge; a snapshot taken, or a commit checked, before the shard settled has none. Some histories clone
+     * older snapshots, some add a snapshot of an older commit, as a primary of an older term might, and some snapshots are removed as
+     * retention does. After every step, and against the shard-level metadata read back at the end, the backlog must never be below what
+     * the snapshot would upload, and must equal it unless the latest state id came from a clone or the history is out of order.
      */
     public void testRandomHistoriesMatchWhatTheSnapshotWouldUpload() throws IOException {
         final var versions = randomFileVersions();
-        final var stateIds = List.of("state-1", "state-2", "state-3");
-
-        var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
+        final boolean outOfOrder = randomInt(4) == 0;
+        final List<Commit> commits = new ArrayList<>();
+        final Set<String> clones = new HashSet<>();
         final List<SnapshotId> snapshotIds = new ArrayList<>();
-        for (int i = between(0, 8); i > 0; i--) {
-            final var snapshotId = new SnapshotId("snap-" + snapshotIds.size(), randomUUID());
-            final var commit = randomCommit(versions, stateIds);
-            snapshots = snapshotShard(snapshots, snapshotId.getName(), randomBoolean() ? commit : withOlderVersionFiles(commit));
-            snapshotIds.add(snapshotId);
-            assertMatchesWhatTheSnapshotWouldUpload(snapshots, randomCommit(versions, stateIds));
-        }
-        if (snapshotIds.isEmpty() == false && randomBoolean()) {
-            snapshots = snapshots.withRetainedSnapshots(Set.copyOf(randomSubsetOf(snapshotIds)));
+        var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
+        // snapshot names are never reused, even after retention removed the snapshot
+        int names = 0;
+        int writes = 0;
+        var live = new Commit(historyStateId(writes), randomFiles(versions));
+        commits.add(live);
+        boolean disordered = false;
+        for (int step = between(1, 12); step > 0; step--) {
+            switch (between(0, 4)) {
+                case 0 -> {
+                    writes++;
+                    live = new Commit(historyStateId(writes), randomFiles(versions));
+                    commits.add(live);
+                }
+                case 1 -> {
+                    live = new Commit(live.stateId(), randomFiles(versions));
+                    commits.add(live);
+                }
+                case 2 -> {
+                    final boolean older = outOfOrder && randomBoolean();
+                    final var snapshotted = older ? randomFrom(commits) : live;
+                    disordered |= older;
+                    final var snapshotId = new SnapshotId("snap-" + names++, randomUUID());
+                    final var recorded = new Commit(randomBoolean() ? snapshotted.stateId() : null, snapshotted.files());
+                    snapshots = snapshotShard(
+                        snapshots,
+                        snapshotId.getName(),
+                        randomBoolean() ? recorded : withOlderVersionFiles(recorded)
+                    );
+                    snapshotIds.add(snapshotId);
+                }
+                case 3 -> {
+                    if (snapshotIds.isEmpty() == false) {
+                        final var cloneId = new SnapshotId("clone-" + names++, randomUUID());
+                        snapshots = snapshots.withClone(randomFrom(snapshots.snapshots()).snapshot(), cloneId.getName());
+                        snapshotIds.add(cloneId);
+                        clones.add(cloneId.getName());
+                    }
+                }
+                case 4 -> {
+                    if (snapshotIds.isEmpty() == false) {
+                        final var retained = randomSubsetOf(snapshotIds);
+                        snapshots = snapshots.withRetainedSnapshots(Set.copyOf(retained));
+                        snapshotIds.retainAll(retained);
+                    }
+                }
+                default -> throw new AssertionError();
+            }
+            assertNeverBelowWhatTheSnapshotWouldUpload(snapshots, randomSettled(live), isExact(snapshots, clones, disordered));
         }
 
         final var readBack = readBack(snapshots);
-        for (int i = between(1, 5); i > 0; i--) {
-            assertMatchesWhatTheSnapshotWouldUpload(readBack, randomCommit(versions, stateIds));
+        for (int i = between(1, 3); i > 0; i--) {
+            assertNeverBelowWhatTheSnapshotWouldUpload(readBack, randomSettled(live), isExact(readBack, clones, disordered));
         }
     }
 
@@ -454,19 +538,20 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * The commit files a snapshot would upload unless the repository holds them, and that have a repository file of the same name and
-     * length, among those named in the commit the baseline was built for. None if a snapshot has the commit's state id.
+     * The commit files a snapshot would upload unless the repository holds them, and whose name the repository has a file of, among the
+     * files with the name and length of a file of the commit the baseline was built for. None if the latest snapshot with a state id
+     * has the commit's.
      */
     private static List<CommitFile> filesOfTheSameNameAndLength(
         BlobStoreIndexShardSnapshots snapshots,
         Commit baselineCommit,
         Commit commit
     ) {
-        final Set<String> kept = new HashSet<>();
+        final Map<String, Long> kept = new HashMap<>();
         for (StoreFileMetadata file : baselineCommit.files()) {
-            kept.add(file.name());
+            kept.put(file.name(), file.length());
         }
-        if (commit.stateId() != null && snapshots.snapshots().stream().anyMatch(s -> commit.stateId().equals(s.shardStateIdentifier()))) {
+        if (commit.stateId() != null && commit.stateId().equals(latestStateId(snapshots))) {
             return List.of();
         }
         final List<CommitFile> files = new ArrayList<>();
@@ -476,14 +561,74 @@ public class ShardBacklogTests extends ESTestCase {
                     .stream()
                     .flatMap(snapshot -> snapshot.indexFiles().stream())
                     .anyMatch(
-                        held -> kept.contains(held.physicalName())
-                            && held.physicalName().equals(file.name())
-                            && held.length() == file.length()
+                        held -> held.physicalName().equals(file.name()) && Long.valueOf(held.length()).equals(kept.get(held.physicalName()))
                     )) {
                 files.add(commitFile(file));
             }
         }
         return files;
+    }
+
+    /**
+     * Checks a baseline built for the commit it is used for: the files needing a checksum must be those that {@link
+     * #filesOfTheSameNameAndLength} names, and the bytes, given the checksums of only those, must never be below what the snapshot would
+     * upload, and equal to it if {@code exact}.
+     */
+    private static void assertNeverBelowWhatTheSnapshotWouldUpload(BlobStoreIndexShardSnapshots snapshots, Commit commit, boolean exact) {
+        final var baseline = baseline(snapshots, commit);
+        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), commitFiles(commit));
+        assertThat("files needing a checksum", needingChecksum, equalTo(filesOfTheSameNameAndLength(snapshots, commit, commit)));
+        final Map<String, StoreFileMetadata> metadata = new HashMap<>();
+        for (StoreFileMetadata file : commit.files()) {
+            if (needingChecksum.contains(commitFile(file))) {
+                metadata.put(file.name(), file);
+            }
+        }
+        final long bytes = ShardBacklog.bytesToUpload(baseline, commit.stateId(), commitFiles(commit), metadata);
+        final long uploaded = uploadedBytes(snapshots, commit);
+        assertThat("bytes to upload", bytes, greaterThanOrEqualTo(uploaded));
+        if (exact) {
+            assertThat("bytes to upload", bytes, equalTo(uploaded));
+        }
+    }
+
+    /**
+     * Whether the backlog must equal what the snapshot would upload: when the history is in order and the latest state id did not come
+     * from a clone, which may have put an older one last.
+     */
+    private static boolean isExact(BlobStoreIndexShardSnapshots snapshots, Set<String> clones, boolean disordered) {
+        String latest = null;
+        for (SnapshotFiles snapshot : snapshots.snapshots()) {
+            if (snapshot.shardStateIdentifier() != null) {
+                latest = snapshot.snapshot();
+            }
+        }
+        return disordered == false && (latest == null || clones.contains(latest) == false);
+    }
+
+    @Nullable
+    private static String latestStateId(BlobStoreIndexShardSnapshots snapshots) {
+        String stateId = null;
+        for (SnapshotFiles snapshot : snapshots.snapshots()) {
+            if (snapshot.shardStateIdentifier() != null) {
+                stateId = snapshot.shardStateIdentifier();
+            }
+        }
+        return stateId;
+    }
+
+    /**
+     * A state id as {@code SnapshotShardsService#getShardStateId} builds it, after the given number of writes.
+     */
+    private static String historyStateId(int writes) {
+        return "history-na-" + writes;
+    }
+
+    /**
+     * The commit as checked or snapshotted: with its state id if the shard has settled, without one if not.
+     */
+    private static Commit randomSettled(Commit commit) {
+        return randomBoolean() ? commit : new Commit(null, commit.files());
     }
 
     /**
@@ -547,14 +692,14 @@ public class ShardBacklogTests extends ESTestCase {
         return versions;
     }
 
-    private static Commit randomCommit(Map<String, List<StoreFileMetadata>> versions, List<String> stateIds) {
+    private static List<StoreFileMetadata> randomFiles(Map<String, List<StoreFileMetadata>> versions) {
         final List<StoreFileMetadata> files = new ArrayList<>();
         for (List<StoreFileMetadata> fileVersions : versions.values()) {
             if (randomBoolean()) {
                 files.add(randomFrom(fileVersions));
             }
         }
-        return new Commit(randomBoolean() ? null : randomFrom(stateIds), files);
+        return files;
     }
 
     /**
