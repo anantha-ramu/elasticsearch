@@ -17,8 +17,10 @@ import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
 import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.index.store.Store;
 import org.elasticsearch.index.store.StoreFileMetadata;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.CommitFile;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -26,10 +28,21 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * What a repository holds of one shard: the files of every snapshot in the shard-level metadata ({@code index-{generation}}, a
- * {@link BlobStoreIndexShardSnapshots}) and the shard state ids of those snapshots. {@link ShardBacklog} uses it to work out what the
- * next snapshot of the shard would upload. Whether the repository holds a commit file is decided by {@link StoreFileMetadata#isSame},
- * as the snapshot decides it.
+ * What a repository holds of one shard that still matters for a commit of the shard: the files in the shard-level metadata
+ * ({@code index-{generation}}, a {@link BlobStoreIndexShardSnapshots}) that have the name of one of the commit's files, and the shard
+ * state ids of the snapshots. {@link ShardBacklog} uses it to work out what the next snapshot of the shard would upload. Whether the
+ * repository holds a commit file is decided by {@link StoreFileMetadata#isSame}, as the snapshot decides it.
+ * <p>
+ * A baseline is for the commit it was built for and every later commit of the shard, until the shard-level metadata changes. Files that
+ * only older snapshots have, merged away since, are left out, so the baseline stays about the size of the shard's commit however long
+ * snapshots are retained. That is safe because Lucene never gives a new file of an index the name of an earlier one (segment names come
+ * from a counter, and the generations of a segment's files only go up), so no later commit can contain such a file and the snapshot
+ * would never reuse it.
+ * <p>
+ * One case differs. An index deleted and created again under the same name shares its folder in the repository, and its later files
+ * can get names the old index used. Those files have other writer uuids, so {@link StoreFileMetadata#isSame} tells them apart anyway,
+ * unless the repository has no writer uuid for the old file (older versions did not record one) and the two files have the same length
+ * and checksum by chance. The snapshot would then reuse the old file while the backlog counts the new one.
  */
 final class ShardBaseline implements Accountable {
 
@@ -37,7 +50,7 @@ final class ShardBaseline implements Accountable {
     private static final long FILE_SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(StoreFileMetadata.class);
     private static final long BYTES_REF_SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(BytesRef.class);
 
-    static final ShardBaseline EMPTY = of(BlobStoreIndexShardSnapshots.EMPTY);
+    static final ShardBaseline EMPTY = of(BlobStoreIndexShardSnapshots.EMPTY, List.of());
 
     // the files by physical name, each once whichever snapshots refer to it
     private final Map<String, List<StoreFileMetadata>> filesByName;
@@ -51,26 +64,30 @@ final class ShardBaseline implements Accountable {
     }
 
     /**
-     * Leaves out the {@code .si} and {@code segments_N} files ({@link Store.MetadataSnapshot#isReadAsHash}): a snapshot keeps their
-     * contents inside the shard-level metadata, so it never looks for them in the repository.
+     * @param commitFiles the files of the commit the baseline is for, normally the shard's latest
      */
-    static ShardBaseline of(BlobStoreIndexShardSnapshots snapshots) {
-        // keep each file once, as BlobStoreIndexShardSnapshots#findPhysicalIndexFile does: every snapshot of a file refers to its blob
-        final Map<String, StoreFileMetadata> filesByBlobName = new HashMap<>();
+    static ShardBaseline of(BlobStoreIndexShardSnapshots snapshots, Collection<CommitFile> commitFiles) {
+        // the names a snapshot of the commit, or of a later one, looks for in the repository: it keeps the contents of the .si and
+        // segments_N files inside the shard-level metadata instead
+        final Set<String> names = new HashSet<>();
+        for (CommitFile file : commitFiles) {
+            if (Store.MetadataSnapshot.isReadAsHash(file.name()) == false) {
+                names.add(file.name());
+            }
+        }
+        // each file once, as BlobStoreIndexShardSnapshots#findPhysicalIndexFile does: every snapshot of a file refers to its blob
+        final Set<String> blobNames = new HashSet<>();
+        final Map<String, List<StoreFileMetadata>> filesByName = new HashMap<>();
         final Set<String> stateIds = new HashSet<>();
         for (SnapshotFiles snapshot : snapshots) {
             if (snapshot.shardStateIdentifier() != null) {
                 stateIds.add(snapshot.shardStateIdentifier());
             }
             for (FileInfo fileInfo : snapshot.indexFiles()) {
-                if (Store.MetadataSnapshot.isReadAsHash(fileInfo.physicalName()) == false) {
-                    filesByBlobName.putIfAbsent(fileInfo.name(), fileInfo.metadata());
+                if (names.contains(fileInfo.physicalName()) && blobNames.add(fileInfo.name())) {
+                    filesByName.computeIfAbsent(fileInfo.physicalName(), name -> new ArrayList<>()).add(fileInfo.metadata());
                 }
             }
-        }
-        final Map<String, List<StoreFileMetadata>> filesByName = new HashMap<>();
-        for (StoreFileMetadata file : filesByBlobName.values()) {
-            filesByName.computeIfAbsent(file.name(), name -> new ArrayList<>()).add(file);
         }
         return new ShardBaseline(Map.copyOf(Maps.transformValues(filesByName, List::copyOf)), Set.copyOf(stateIds));
     }
@@ -84,8 +101,10 @@ final class ShardBaseline implements Accountable {
     }
 
     /**
-     * Whether the repository has a file of the given name and length. Only then can it hold a commit file of that name and length, and
-     * {@link #holds} needs the commit file's checksum to tell.
+     * Whether the repository has a file of the given name and length. If not, it does not hold a commit file of that name and length:
+     * {@link StoreFileMetadata#isSame} only matches files of the same length, apart from a file whose hash is its whole contents, which
+     * only matches a file with the same hash, and the commit files a snapshot uploads have no hash. If so, {@link #holds} tells from
+     * the commit file's checksum and writer uuid.
      */
     boolean mayHold(String name, long length) {
         for (StoreFileMetadata file : filesByName.getOrDefault(name, List.of())) {
@@ -138,8 +157,9 @@ final class ShardBaseline implements Accountable {
     }
 
     /**
-     * A {@code java.util} collection: its shell, its table of references, and one more array header, because that is how
-     * {@code RamUsageTester} counts these collections.
+     * A {@code java.util} collection: its shell and its table of references, plus one more array header. That header is not on the
+     * heap, but {@code RamUsageTester}, which the tests check the estimate against, counts a collection as its shell and two array
+     * headers, and without it the estimate of an empty or very small baseline would fall below that.
      */
     private static long sizeOfCollection(Object collection, long references) {
         return RamUsageEstimator.shallowSizeOf(collection) + RamUsageEstimator.NUM_BYTES_ARRAY_HEADER + RamUsageEstimator.alignObjectSize(

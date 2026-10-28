@@ -28,13 +28,16 @@ import java.util.Objects;
  * </ul>
  * Nothing is read here. The caller first asks which files need their checksum ({@link #filesNeedingChecksum}), reads only those, and
  * passes them to {@link #bytesToUpload}. Only a file the repository has a file of the same name and length for is worth checking.
+ * <p>
+ * The incremental size a snapshot reports also counts the {@code .si} and {@code segments_N} files it adds, so it can be a little more
+ * than this.
  */
 final class ShardBacklog {
 
     private ShardBacklog() {}
 
     /**
-     * A file of a shard's commit, by name and length, before its checksum is read.
+     * A file of a shard's commit, by name and length, before its checksum is read. A commit lists each name once.
      */
     record CommitFile(String name, long length) {
         CommitFile {
@@ -63,15 +66,17 @@ final class ShardBacklog {
     /**
      * @param stateId          the shard state id a snapshot of the commit would have ({@code SnapshotShardsService#getShardStateId}),
      *                         {@code null} if the shard is not in a steady state
-     * @param filesWithChecksum the files that {@link #filesNeedingChecksum} returned, with their checksums, by file name, as a snapshot
-     *                         reads them ({@link Store.MetadataSnapshot#loadFromIndexCommit})
+     * @param commitFileMetadata the metadata of each file that {@link #filesNeedingChecksum} returned, by file name, as a snapshot reads
+     *                         it ({@link Store.MetadataSnapshot#loadFromIndexCommit}): its checksum, and its writer uuid if the commit has
+     *                         one. {@link StoreFileMetadata#isSame} needs both: a file of an index created again under the same name can
+     *                         have the name, length and checksum of a file the repository holds, and only the writer uuid tells them apart.
      * @return the bytes the next snapshot of the commit would upload
      */
     static long bytesToUpload(
         ShardBaseline baseline,
         @Nullable String stateId,
         Collection<CommitFile> commitFiles,
-        Map<String, StoreFileMetadata> filesWithChecksum
+        Map<String, StoreFileMetadata> commitFileMetadata
     ) {
         if (baseline.hasStateId(stateId)) {
             return 0;
@@ -82,13 +87,14 @@ final class ShardBacklog {
                 continue;
             }
             if (baseline.mayHold(file.name(), file.length())) {
-                final StoreFileMetadata fileWithChecksum = filesWithChecksum.get(file.name());
-                if (fileWithChecksum == null) {
+                final StoreFileMetadata metadata = commitFileMetadata.get(file.name());
+                if (metadata == null) {
                     throw new IllegalArgumentException("no checksum for [" + file.name() + "]");
                 }
-                assert fileWithChecksum.name().equals(file.name()) && fileWithChecksum.length() == file.length()
-                    : fileWithChecksum + " vs " + file;
-                if (baseline.holds(fileWithChecksum)) {
+                if (metadata.name().equals(file.name()) == false || metadata.length() != file.length()) {
+                    throw new IllegalArgumentException("[" + metadata + "] is not the metadata of " + file);
+                }
+                if (baseline.holds(metadata)) {
                     continue;
                 }
             }
@@ -99,7 +105,8 @@ final class ShardBacklog {
 
     /**
      * Whether a snapshot uploads the file if the repository does not hold it. It keeps the contents of the {@code .si} and
-     * {@code segments_N} files inside the shard-level metadata instead ({@link StoreFileMetadata#hashEqualsContents}).
+     * {@code segments_N} files inside the shard-level metadata instead. The snapshot checks {@link StoreFileMetadata#hashEqualsContents},
+     * which is true for exactly these files of a commit read by {@link Store.MetadataSnapshot#loadFromIndexCommit}.
      */
     private static boolean isUploaded(CommitFile file) {
         return Store.MetadataSnapshot.isReadAsHash(file.name()) == false;

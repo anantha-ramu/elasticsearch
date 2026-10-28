@@ -36,6 +36,7 @@ import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.CommitFi
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -76,7 +77,7 @@ public class ShardBacklogTests extends ESTestCase {
             final var mergedFiles = commit(stateId, file("_2.cfs", 3000, 13, randomWriterUuid()));
 
             assertBacklog(repository, mergedFiles, 0);
-            assertThat(ShardBacklog.filesNeedingChecksum(baseline(repository), stateId, commitFiles(mergedFiles)), empty());
+            assertThat(ShardBacklog.filesNeedingChecksum(baseline(repository, mergedFiles), stateId, commitFiles(mergedFiles)), empty());
         }
     }
 
@@ -158,21 +159,29 @@ public class ShardBacklogTests extends ESTestCase {
             inlinedFile("_0.si")
         );
 
-        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline(repository), null, commitFiles(commit));
+        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline(repository, commit), null, commitFiles(commit));
 
         assertThat(needingChecksum, equalTo(List.of(commitFile(sameNameAndLength))));
         assertBacklog(repository, commit, 2200);
     }
 
-    public void testAMissingChecksumIsRejected() {
+    public void testMissingOrWrongMetadataIsRejected() {
         final var cfs = file("_0.cfs", 1000, 11, randomWriterUuid());
         final var repository = repository(snapshot("snap-1", null, cfs));
+        final var commit = commit(null, cfs);
 
-        final var e = expectThrows(
+        final var missing = expectThrows(
             IllegalArgumentException.class,
-            () -> ShardBacklog.bytesToUpload(baseline(repository), null, List.of(commitFile(cfs)), Map.of())
+            () -> ShardBacklog.bytesToUpload(baseline(repository, commit), null, commitFiles(commit), Map.of())
         );
-        assertThat(e.getMessage(), containsString("[_0.cfs]"));
+        assertThat(missing.getMessage(), containsString("[_0.cfs]"));
+
+        final var otherFile = randomFrom(file("_0.cfs", 2000, 11, randomWriterUuid()), file("_1.cfs", 1000, 11, randomWriterUuid()));
+        final var wrong = expectThrows(
+            IllegalArgumentException.class,
+            () -> ShardBacklog.bytesToUpload(baseline(repository, commit), null, commitFiles(commit), Map.of("_0.cfs", otherFile))
+        );
+        assertThat(wrong.getMessage(), containsString("is not the metadata of"));
     }
 
     public void testARepositoryChecksumWrittenOtherwiseNeverMatches() {
@@ -188,7 +197,7 @@ public class ShardBacklogTests extends ESTestCase {
         assertBacklog(repository, commit(null, file("_0.cfs", 1000, 11, NO_WRITER_UUID)), 1000);
     }
 
-    public void testARepositoryFileWithAHashOnlyMatchesTheSameHash() {
+    public void testARepositoryFileWithAPartialHashNeverMatches() {
         // a hash that is not the whole file: isSame compares it, and a commit file a snapshot uploads has none
         final var withHash = new StoreFileMetadata(
             "_0.cfs",
@@ -203,10 +212,40 @@ public class ShardBacklogTests extends ESTestCase {
         assertBacklog(repository, commit(null, file("_0.cfs", 1000, 11, NO_WRITER_UUID)), 1000);
     }
 
+    public void testABaselineIsForItsCommitAndTheLaterOnes() {
+        final var merged = file("_2.cfs", 3000, 13, randomWriterUuid());
+        // _0.cfs and _1.cfs were merged into _2.cfs after the first snapshot
+        final var repository = repository(
+            snapshot("snap-1", null, file("_0.cfs", 1000, 11, randomWriterUuid()), file("_1.cfs", 2000, 12, randomWriterUuid())),
+            snapshot("snap-2", null, merged)
+        );
+        final var baselineCommit = commit(null, merged);
+
+        assertBacklog(repository, baselineCommit, baselineCommit, 0);
+        assertBacklog(repository, baselineCommit, commit(null, merged, file("_3.cfs", 500, 14, randomWriterUuid())), 500);
+    }
+
+    public void testARecreatedIndexCanCountAFileTheSnapshotWouldReuse() {
+        // the old index's files, recorded without writer uuid as older versions did
+        final var repository = repository(
+            snapshot("snap-1", null, file("_0.cfs", 1000, 11, NO_WRITER_UUID), file("_1.cfs", 2000, 12, NO_WRITER_UUID))
+        );
+        // the index is created again under the same name, and the baseline for its first commit leaves out the old _1.cfs
+        final var newCfs = file("_0.cfs", 500, 21, randomWriterUuid());
+        final var baseline = baseline(repository, commit(null, newCfs));
+        // by chance its new _1.cfs has the length and checksum of the old one, which the snapshot would then reuse
+        final var later = commit(null, newCfs, file("_1.cfs", 2000, 12, randomWriterUuid()));
+
+        assertThat(uploadedBytes(repository, later), equalTo(500L));
+        assertThat(ShardBacklog.bytesToUpload(baseline, null, commitFiles(later), Map.of()), equalTo(2500L));
+    }
+
     /**
      * Builds a repository the way snapshots do, from a history of random commits of a few file names, each with a few versions that
      * often share their length and checksum, sometimes without writer uuid, plus files only older versions write (a hash, a checksum
      * written otherwise). Then removes some of the snapshots as retention does and reads the shard-level metadata back as a node would.
+     * A random commit is checked after every snapshot and a few at the end. These commits are not those of one Lucene index, so each
+     * check builds the baseline for the commit it checks.
      */
     public void testRandomHistoriesMatchWhatTheSnapshotWouldUpload() throws IOException {
         final var versions = randomFileVersions();
@@ -219,36 +258,49 @@ public class ShardBacklogTests extends ESTestCase {
             final var commit = randomCommit(versions, stateIds);
             snapshots = snapshotShard(snapshots, snapshotId.getName(), randomBoolean() ? commit : withOlderVersionFiles(commit));
             snapshotIds.add(snapshotId);
+            assertMatchesWhatTheSnapshotWouldUpload(snapshots, randomCommit(versions, stateIds));
         }
         if (snapshotIds.isEmpty() == false && randomBoolean()) {
             snapshots = snapshots.withRetainedSnapshots(Set.copyOf(randomSubsetOf(snapshotIds)));
         }
 
-        assertMatchesWhatTheSnapshotWouldUpload(readBack(snapshots), randomCommit(versions, stateIds));
+        final var readBack = readBack(snapshots);
+        for (int i = between(1, 5); i > 0; i--) {
+            assertMatchesWhatTheSnapshotWouldUpload(readBack, randomCommit(versions, stateIds));
+        }
     }
 
     /**
      * Commits as Lucene writes them and a snapshot reads them ({@link Store.MetadataSnapshot#loadFromIndexCommit}), with deletes and
-     * merges, and then an index created again under the same file names. Also checks what {@link ShardBacklog} assumes of such commits:
-     * only the files it leaves out by name have a hash.
+     * merges, and then an index created again under the same file names. As on a node, the baseline is built for the first commit of
+     * each index and again after each snapshot, and then used for the later commits until the next snapshot. The first index never
+     * gives a later file the name of a file the baseline left out; the recreated one does, as it reaches the old index's names. Also
+     * checks what {@link ShardBacklog} assumes of such commits: only the files it leaves out by name have a hash.
      */
     public void testLuceneCommitsMatchWhatTheSnapshotWouldUpload() throws IOException {
         var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
-        final int recreateAt = between(1, 6);
+        // both indices use the same file format, so that their file names can be the same
+        final boolean useCompoundFile = randomBoolean();
+        final int recreateAt = between(2, 6);
+        boolean reusedALeftOutName = false;
         for (int index = 0; index < 2; index++) {
             try (var directory = newDirectory()) {
-                final var config = new IndexWriterConfig().setUseCompoundFile(randomBoolean())
+                final var config = new IndexWriterConfig().setUseCompoundFile(useCompoundFile)
                     .setMergeScheduler(new SerialMergeScheduler());
                 try (var writer = new IndexWriter(directory, config)) {
+                    Commit baselineCommit = null;
+                    Set<String> leftOut = Set.of();
                     int docs = 0;
-                    for (int step = 0; step < (index == 0 ? recreateAt : 6); step++) {
-                        for (int i = between(1, 20); i > 0; i--) {
+                    final int steps = index == 0 ? recreateAt : 6;
+                    for (int step = 0; step < steps; step++) {
+                        for (int i = between(5, 20); i > 0; i--) {
                             writer.addDocument(List.of(new StringField("id", Integer.toString(docs++), Field.Store.NO)));
                         }
                         if (randomBoolean()) {
                             writer.deleteDocuments(new Term("id", Integer.toString(between(0, docs - 1))));
                         }
-                        if (rarely()) {
+                        // the first index keeps its segments, so that the recreated one reaches their names
+                        if (index == 1 && rarely()) {
                             writer.forceMerge(1);
                         }
                         writer.commit();
@@ -256,21 +308,37 @@ public class ShardBacklogTests extends ESTestCase {
                         for (StoreFileMetadata file : Store.MetadataSnapshot.loadFromIndexCommit(null, directory, logger)) {
                             // what ShardBacklog and its caller rely on: the files it leaves out by name are exactly those kept
                             // as their hash, and the others have no hash
-                            final boolean leftOut = Store.MetadataSnapshot.isReadAsHash(file.name());
-                            assertThat(file.name(), file.hashEqualsContents(), equalTo(leftOut));
-                            assertThat(file.name(), file.hash().length == 0, equalTo(leftOut == false));
+                            final boolean inlined = Store.MetadataSnapshot.isReadAsHash(file.name());
+                            assertThat(file.name(), file.hashEqualsContents(), equalTo(inlined));
+                            assertThat(file.name(), file.hash().length == 0, equalTo(inlined == false));
                             files.add(file);
                         }
                         final var commit = new Commit(null, files);
+                        if (baselineCommit == null) {
+                            baselineCommit = commit;
+                            leftOut = leftOutNames(snapshots, baselineCommit);
+                        }
+                        boolean reusesALeftOutName = false;
+                        for (StoreFileMetadata file : files) {
+                            reusesALeftOutName |= leftOut.contains(file.name());
+                        }
+                        if (index == 0) {
+                            assertFalse("a later commit of an index has the name of a file merged away", reusesALeftOutName);
+                        } else {
+                            reusedALeftOutName |= reusesALeftOutName;
+                        }
 
-                        assertMatchesWhatTheSnapshotWouldUpload(snapshots, commit);
-                        if (randomBoolean()) {
+                        assertMatchesWhatTheSnapshotWouldUpload(snapshots, baselineCommit, commit);
+                        if ((index == 0 && step == steps - 1) || randomBoolean()) {
                             snapshots = readBack(snapshotShard(snapshots, "snap-" + index + "-" + step, commit));
+                            baselineCommit = commit;
+                            leftOut = leftOutNames(snapshots, baselineCommit);
                         }
                     }
                 }
             }
         }
+        assertTrue("the recreated index reached a name of the old index that its baseline left out", reusedALeftOutName);
     }
 
     private record Commit(@Nullable String stateId, List<StoreFileMetadata> files) {}
@@ -293,33 +361,45 @@ public class ShardBacklogTests extends ESTestCase {
         return shardSnapshots;
     }
 
-    private static ShardBaseline baseline(BlobStoreIndexShardSnapshots snapshots) {
-        return ShardBaseline.of(snapshots);
+    private static ShardBaseline baseline(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
+        return ShardBaseline.of(snapshots, commitFiles(commit));
     }
 
     private static void assertBacklog(BlobStoreIndexShardSnapshots snapshots, Commit commit, long expectedBytes) {
+        assertBacklog(snapshots, commit, commit, expectedBytes);
+    }
+
+    private static void assertBacklog(BlobStoreIndexShardSnapshots snapshots, Commit baselineCommit, Commit commit, long expectedBytes) {
         assertThat("what the snapshot would upload", uploadedBytes(snapshots, commit), equalTo(expectedBytes));
-        assertMatchesWhatTheSnapshotWouldUpload(snapshots, commit);
+        assertMatchesWhatTheSnapshotWouldUpload(snapshots, baselineCommit, commit);
+    }
+
+    private static void assertMatchesWhatTheSnapshotWouldUpload(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
+        assertMatchesWhatTheSnapshotWouldUpload(snapshots, commit, commit);
     }
 
     /**
-     * Checks the backlog against the snapshot's own matching ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}): it must ask
-     * for the checksums of exactly the files that have a repository file of the same name and length, and given only those, it must
-     * count what the snapshot would upload.
+     * Checks a baseline built for one commit, used for that commit or a later one, against the snapshot's own matching
+     * ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}): it must ask for the checksums of exactly the files that have a
+     * repository file of the same name and length that it kept, and given only those, it must count what the snapshot would upload.
      */
-    private static void assertMatchesWhatTheSnapshotWouldUpload(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
-        final var baseline = ShardBaseline.of(snapshots);
+    private static void assertMatchesWhatTheSnapshotWouldUpload(
+        BlobStoreIndexShardSnapshots snapshots,
+        Commit baselineCommit,
+        Commit commit
+    ) {
+        final var baseline = baseline(snapshots, baselineCommit);
         final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), commitFiles(commit));
-        assertThat("files needing a checksum", needingChecksum, equalTo(filesOfTheSameNameAndLength(snapshots, commit)));
-        final Map<String, StoreFileMetadata> filesWithChecksum = new HashMap<>();
+        assertThat("files needing a checksum", needingChecksum, equalTo(filesOfTheSameNameAndLength(snapshots, baselineCommit, commit)));
+        final Map<String, StoreFileMetadata> metadata = new HashMap<>();
         for (StoreFileMetadata file : commit.files()) {
             if (needingChecksum.contains(commitFile(file))) {
-                filesWithChecksum.put(file.name(), file);
+                metadata.put(file.name(), file);
             }
         }
         assertThat(
             "bytes to upload",
-            ShardBacklog.bytesToUpload(baseline, commit.stateId(), commitFiles(commit), filesWithChecksum),
+            ShardBacklog.bytesToUpload(baseline, commit.stateId(), commitFiles(commit), metadata),
             equalTo(uploadedBytes(snapshots, commit))
         );
     }
@@ -375,9 +455,17 @@ public class ShardBacklogTests extends ESTestCase {
 
     /**
      * The commit files a snapshot would upload unless the repository holds them, and that have a repository file of the same name and
-     * length. None if a snapshot has the commit's state id.
+     * length, among those named in the commit the baseline was built for. None if a snapshot has the commit's state id.
      */
-    private static List<CommitFile> filesOfTheSameNameAndLength(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
+    private static List<CommitFile> filesOfTheSameNameAndLength(
+        BlobStoreIndexShardSnapshots snapshots,
+        Commit baselineCommit,
+        Commit commit
+    ) {
+        final Set<String> kept = new HashSet<>();
+        for (StoreFileMetadata file : baselineCommit.files()) {
+            kept.add(file.name());
+        }
         if (commit.stateId() != null && snapshots.snapshots().stream().anyMatch(s -> commit.stateId().equals(s.shardStateIdentifier()))) {
             return List.of();
         }
@@ -387,11 +475,33 @@ public class ShardBacklogTests extends ESTestCase {
                 && snapshots.snapshots()
                     .stream()
                     .flatMap(snapshot -> snapshot.indexFiles().stream())
-                    .anyMatch(held -> held.physicalName().equals(file.name()) && held.length() == file.length())) {
+                    .anyMatch(
+                        held -> kept.contains(held.physicalName())
+                            && held.physicalName().equals(file.name())
+                            && held.length() == file.length()
+                    )) {
                 files.add(commitFile(file));
             }
         }
         return files;
+    }
+
+    /**
+     * The names of the files the repository holds that the commit does not have, which a baseline for the commit leaves out.
+     */
+    private static Set<String> leftOutNames(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
+        final Set<String> names = new HashSet<>();
+        for (SnapshotFiles snapshot : snapshots.snapshots()) {
+            for (FileInfo file : snapshot.indexFiles()) {
+                if (Store.MetadataSnapshot.isReadAsHash(file.physicalName()) == false) {
+                    names.add(file.physicalName());
+                }
+            }
+        }
+        for (StoreFileMetadata file : commit.files()) {
+            names.remove(file.name());
+        }
+        return names;
     }
 
     /**
