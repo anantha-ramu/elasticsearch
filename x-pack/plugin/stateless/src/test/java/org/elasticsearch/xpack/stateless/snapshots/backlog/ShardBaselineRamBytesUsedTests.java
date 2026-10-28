@@ -19,7 +19,7 @@ import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.index.store.Store;
 import org.elasticsearch.index.store.StoreFileMetadata;
 import org.elasticsearch.test.AbstractAccountableFieldsTestCase;
-import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.CommitFile;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.LuceneFile;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -39,12 +39,12 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
 
     @Override
     protected Set<String> fieldsAccountedForInRamBytesUsed() {
-        return Set.of("filesByName", "stateId");
+        return Set.of("backedUpFilesByName", "latestStateId");
     }
 
     @Override
     protected Accountable createRandomTestInstance() {
-        final List<FileInfo> files = randomFiles(0, between(0, 50));
+        final List<FileInfo> files = randomBackedUpFiles(0, between(0, 50));
         // some files of an index created again under the same name
         for (FileInfo file : randomSubsetOf(files)) {
             files.add(new FileInfo("__" + UUIDs.randomBase64UUID(random()), metadata(file.physicalName(), randomWriterUuid()), null));
@@ -55,11 +55,11 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
                 new SnapshotFiles("snap-" + i, randomSubsetOf(files), randomBoolean() ? null : randomStateId())
             );
         }
-        return ShardBaseline.of(readBack(snapshots), commitFiles(randomSubsetOf(files)));
+        return ShardBaseline.of(readBack(snapshots), luceneFiles(randomSubsetOf(files)));
     }
 
     public void testFilesOfSeveralSnapshotsAreKeptOnce() {
-        final List<FileInfo> files = randomFiles(0, between(1, 50));
+        final List<FileInfo> files = randomBackedUpFiles(0, between(1, 50));
         final var stateId = randomStateId();
         final var oneSnapshot = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-0", files, stateId));
         var manySnapshots = oneSnapshot;
@@ -69,26 +69,26 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         }
 
         assertThat(
-            ShardBaseline.of(manySnapshots, commitFiles(files)).ramBytesUsed(),
-            equalTo(ShardBaseline.of(oneSnapshot, commitFiles(files)).ramBytesUsed())
+            ShardBaseline.of(manySnapshots, luceneFiles(files)).ramBytesUsed(),
+            equalTo(ShardBaseline.of(oneSnapshot, luceneFiles(files)).ramBytesUsed())
         );
     }
 
     public void testFilesOnlyOlderSnapshotsHaveCostNothing() {
-        final List<FileInfo> mergedAway = randomFiles(0, between(1, 50));
-        final List<FileInfo> current = randomFiles(mergedAway.size(), between(1, 50));
+        final List<FileInfo> mergedAway = randomBackedUpFiles(0, between(1, 50));
+        final List<FileInfo> current = randomBackedUpFiles(mergedAway.size(), between(1, 50));
         final var olderAndLatest = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-0", mergedAway, null))
             .withAddedSnapshot(new SnapshotFiles("snap-1", current, null));
         final var latest = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-1", current, null));
 
         assertThat(
-            ShardBaseline.of(olderAndLatest, commitFiles(current)).ramBytesUsed(),
-            equalTo(ShardBaseline.of(latest, commitFiles(current)).ramBytesUsed())
+            ShardBaseline.of(olderAndLatest, luceneFiles(current)).ramBytesUsed(),
+            equalTo(ShardBaseline.of(latest, luceneFiles(current)).ramBytesUsed())
         );
     }
 
     public void testOnlyTheLatestStateIdIsKept() {
-        final List<FileInfo> files = randomFiles(0, between(1, 50));
+        final List<FileInfo> files = randomBackedUpFiles(0, between(1, 50));
         // the latest after a force merge, so that its state id is longer than the others and keeping any other one costs less
         final var latest = new SnapshotFiles("snap-latest", files, stateId(true));
         var manySnapshots = BlobStoreIndexShardSnapshots.EMPTY;
@@ -99,13 +99,13 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         manySnapshots = manySnapshots.withAddedSnapshot(latest);
 
         assertThat(
-            ShardBaseline.of(manySnapshots, commitFiles(files)).ramBytesUsed(),
-            equalTo(ShardBaseline.of(BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(latest), commitFiles(files)).ramBytesUsed())
+            ShardBaseline.of(manySnapshots, luceneFiles(files)).ramBytesUsed(),
+            equalTo(ShardBaseline.of(BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(latest), luceneFiles(files)).ramBytesUsed())
         );
     }
 
     public void testFilesOfTheSameNameAndAnotherLengthCostNothing() {
-        final List<FileInfo> current = randomFiles(0, between(1, 50));
+        final List<FileInfo> current = randomBackedUpFiles(0, between(1, 50));
         // files of an earlier copy of the index, deleted and created again under the same name
         final List<FileInfo> earlier = new ArrayList<>();
         for (FileInfo file : current) {
@@ -122,8 +122,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         final var onlyCurrent = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-1", current, null));
 
         assertThat(
-            ShardBaseline.of(earlierAndCurrent, commitFiles(current)).ramBytesUsed(),
-            equalTo(ShardBaseline.of(onlyCurrent, commitFiles(current)).ramBytesUsed())
+            ShardBaseline.of(earlierAndCurrent, luceneFiles(current)).ramBytesUsed(),
+            equalTo(ShardBaseline.of(onlyCurrent, luceneFiles(current)).ramBytesUsed())
         );
     }
 
@@ -134,7 +134,7 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         }
         final var snapshots = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap", files, null));
 
-        assertThat(ShardBaseline.of(snapshots, commitFiles(files)).ramBytesUsed(), equalTo(ShardBaseline.EMPTY.ramBytesUsed()));
+        assertThat(ShardBaseline.of(snapshots, luceneFiles(files)).ramBytesUsed(), equalTo(ShardBaseline.EMPTY.ramBytesUsed()));
     }
 
     /**
@@ -146,11 +146,11 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     public void testBytesPerFile() {
         assumeTrue("measured with compressed object pointers", RamUsageEstimator.COMPRESSED_REFS_ENABLED);
         final int fileCount = 1000;
-        final List<FileInfo> files = randomFiles(0, fileCount);
+        final List<FileInfo> files = randomBackedUpFiles(0, fileCount);
         final long nameBytes = files.stream().mapToLong(file -> RamUsageEstimator.sizeOf(file.physicalName())).sum();
         final var baseline = ShardBaseline.of(
             readBack(BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap", files, null))),
-            commitFiles(files)
+            luceneFiles(files)
         );
 
         final long measured = RamUsageTester.ramUsed(baseline) - RamUsageTester.ramUsed(ShardBaseline.EMPTY);
@@ -164,7 +164,7 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
      * Files as a shard has them, named from {@code _<first>} on: names of about 6 to 45 characters, the longer ones of per-field
      * formats, and the files of a segment sharing its writer uuid.
      */
-    private static List<FileInfo> randomFiles(int first, int count) {
+    private static List<FileInfo> randomBackedUpFiles(int first, int count) {
         final List<FileInfo> files = new ArrayList<>(count);
         BytesRef writerUuid = null;
         for (int i = first; i < first + count; i++) {
@@ -179,8 +179,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         return files;
     }
 
-    private static List<CommitFile> commitFiles(List<FileInfo> files) {
-        return files.stream().map(file -> new CommitFile(file.physicalName(), file.length())).toList();
+    private static List<LuceneFile> luceneFiles(List<FileInfo> files) {
+        return files.stream().map(file -> new LuceneFile(file.physicalName(), file.length())).toList();
     }
 
     private static BytesRef randomWriterUuid() {

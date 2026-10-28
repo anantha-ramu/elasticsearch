@@ -31,7 +31,7 @@ import org.elasticsearch.repositories.ProjectRepo;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xcontent.NamedXContentRegistry;
-import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.CommitFile;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.LuceneFile;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -77,7 +77,7 @@ public class ShardBacklogTests extends ESTestCase {
         final var merged = commit("state-2", file("_2.cfs", 3000, 13, randomWriterUuid()));
 
         assertBacklog(repository, merged, 0);
-        assertThat(ShardBacklog.filesNeedingChecksum(baseline(repository, merged), "state-2", commitFiles(merged)), empty());
+        assertThat(ShardBacklog.filesNeedingChecksum(baseline(repository, merged), "state-2", luceneFiles(merged)), empty());
     }
 
     public void testTheLatestSnapshotWithAStateIdCounts() {
@@ -104,7 +104,7 @@ public class ShardBacklogTests extends ESTestCase {
 
         assertThat(uploadedBytes(repository, merged), equalTo(0L));
         // the clone put state-1 last, so the backlog counts the merged file
-        assertThat(ShardBacklog.bytesToUpload(baseline(repository, merged), "state-2", commitFiles(merged), Map.of()), equalTo(3000L));
+        assertThat(ShardBacklog.bytesToUpload(baseline(repository, merged), "state-2", luceneFiles(merged), Map.of()), equalTo(3000L));
         // the next snapshot takes the shortcut and puts state-2 last again
         assertBacklog(snapshotShard(repository, "snap-3", merged), merged, 0);
     }
@@ -201,9 +201,9 @@ public class ShardBacklogTests extends ESTestCase {
             inlinedFile("_0.si")
         );
 
-        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline(repository, commit), null, commitFiles(commit));
+        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline(repository, commit), null, luceneFiles(commit));
 
-        assertThat(needingChecksum, equalTo(List.of(commitFile(sameNameAndLength))));
+        assertThat(needingChecksum, equalTo(List.of(luceneFile(sameNameAndLength))));
         assertBacklog(repository, commit, 2200);
     }
 
@@ -214,14 +214,14 @@ public class ShardBacklogTests extends ESTestCase {
 
         final var missing = expectThrows(
             IllegalArgumentException.class,
-            () -> ShardBacklog.bytesToUpload(baseline(repository, commit), null, commitFiles(commit), Map.of())
+            () -> ShardBacklog.bytesToUpload(baseline(repository, commit), null, luceneFiles(commit), Map.of())
         );
         assertThat(missing.getMessage(), containsString("[_0.cfs]"));
 
         final var otherFile = randomFrom(file("_0.cfs", 2000, 11, randomWriterUuid()), file("_1.cfs", 1000, 11, randomWriterUuid()));
         final var wrong = expectThrows(
             IllegalArgumentException.class,
-            () -> ShardBacklog.bytesToUpload(baseline(repository, commit), null, commitFiles(commit), Map.of("_0.cfs", otherFile))
+            () -> ShardBacklog.bytesToUpload(baseline(repository, commit), null, luceneFiles(commit), Map.of("_0.cfs", otherFile))
         );
         assertThat(wrong.getMessage(), containsString("is not the metadata of"));
     }
@@ -279,7 +279,7 @@ public class ShardBacklogTests extends ESTestCase {
         final var later = commit(null, newCfs, file("_1.cfs", 2000, 12, randomWriterUuid()));
 
         assertThat(uploadedBytes(repository, later), equalTo(500L));
-        assertThat(ShardBacklog.bytesToUpload(baseline, null, commitFiles(later), Map.of()), equalTo(2500L));
+        assertThat(ShardBacklog.bytesToUpload(baseline, null, luceneFiles(later), Map.of()), equalTo(2500L));
     }
 
     /**
@@ -301,14 +301,14 @@ public class ShardBacklogTests extends ESTestCase {
         // snapshot names are never reused, even after retention removed the snapshot
         int names = 0;
         int writes = 0;
-        var live = new Commit(historyStateId(writes), randomFiles(versions));
+        var live = new Commit(stateIdAfterWrites(writes), randomFiles(versions));
         commits.add(live);
         boolean disordered = false;
         for (int step = between(1, 12); step > 0; step--) {
             switch (between(0, 4)) {
                 case 0 -> {
                     writes++;
-                    live = new Commit(historyStateId(writes), randomFiles(versions));
+                    live = new Commit(stateIdAfterWrites(writes), randomFiles(versions));
                     commits.add(live);
                 }
                 case 1 -> {
@@ -345,12 +345,12 @@ public class ShardBacklogTests extends ESTestCase {
                 }
                 default -> throw new AssertionError();
             }
-            assertNeverBelowWhatTheSnapshotWouldUpload(snapshots, randomSettled(live), isExact(snapshots, clones, disordered));
+            assertNeverBelowWhatTheSnapshotWouldUpload(snapshots, maybeWithoutStateId(live), isExact(snapshots, clones, disordered));
         }
 
         final var readBack = readBack(snapshots);
         for (int i = between(1, 3); i > 0; i--) {
-            assertNeverBelowWhatTheSnapshotWouldUpload(readBack, randomSettled(live), isExact(readBack, clones, disordered));
+            assertNeverBelowWhatTheSnapshotWouldUpload(readBack, maybeWithoutStateId(live), isExact(readBack, clones, disordered));
         }
     }
 
@@ -446,7 +446,7 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     private static ShardBaseline baseline(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
-        return ShardBaseline.of(snapshots, commitFiles(commit));
+        return ShardBaseline.of(snapshots, luceneFiles(commit));
     }
 
     private static void assertBacklog(BlobStoreIndexShardSnapshots snapshots, Commit commit, long expectedBytes) {
@@ -473,17 +473,17 @@ public class ShardBacklogTests extends ESTestCase {
         Commit commit
     ) {
         final var baseline = baseline(snapshots, baselineCommit);
-        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), commitFiles(commit));
-        assertThat("files needing a checksum", needingChecksum, equalTo(filesOfTheSameNameAndLength(snapshots, baselineCommit, commit)));
+        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), luceneFiles(commit));
+        assertThat("files needing a checksum", needingChecksum, equalTo(expectedFilesNeedingChecksum(snapshots, baselineCommit, commit)));
         final Map<String, StoreFileMetadata> metadata = new HashMap<>();
         for (StoreFileMetadata file : commit.files()) {
-            if (needingChecksum.contains(commitFile(file))) {
+            if (needingChecksum.contains(luceneFile(file))) {
                 metadata.put(file.name(), file);
             }
         }
         assertThat(
             "bytes to upload",
-            ShardBacklog.bytesToUpload(baseline, commit.stateId(), commitFiles(commit), metadata),
+            ShardBacklog.bytesToUpload(baseline, commit.stateId(), luceneFiles(commit), metadata),
             equalTo(uploadedBytes(snapshots, commit))
         );
     }
@@ -542,7 +542,7 @@ public class ShardBacklogTests extends ESTestCase {
      * files with the name and length of a file of the commit the baseline was built for. None if the latest snapshot with a state id
      * has the commit's.
      */
-    private static List<CommitFile> filesOfTheSameNameAndLength(
+    private static List<LuceneFile> expectedFilesNeedingChecksum(
         BlobStoreIndexShardSnapshots snapshots,
         Commit baselineCommit,
         Commit commit
@@ -554,7 +554,7 @@ public class ShardBacklogTests extends ESTestCase {
         if (commit.stateId() != null && commit.stateId().equals(latestStateId(snapshots))) {
             return List.of();
         }
-        final List<CommitFile> files = new ArrayList<>();
+        final List<LuceneFile> files = new ArrayList<>();
         for (StoreFileMetadata file : commit.files()) {
             if (file.hashEqualsContents() == false
                 && snapshots.snapshots()
@@ -563,7 +563,7 @@ public class ShardBacklogTests extends ESTestCase {
                     .anyMatch(
                         held -> held.physicalName().equals(file.name()) && Long.valueOf(held.length()).equals(kept.get(held.physicalName()))
                     )) {
-                files.add(commitFile(file));
+                files.add(luceneFile(file));
             }
         }
         return files;
@@ -571,20 +571,20 @@ public class ShardBacklogTests extends ESTestCase {
 
     /**
      * Checks a baseline built for the commit it is used for: the files needing a checksum must be those that {@link
-     * #filesOfTheSameNameAndLength} names, and the bytes, given the checksums of only those, must never be below what the snapshot would
+     * #expectedFilesNeedingChecksum} names, and the bytes, given the checksums of only those, must never be below what the snapshot would
      * upload, and equal to it if {@code exact}.
      */
     private static void assertNeverBelowWhatTheSnapshotWouldUpload(BlobStoreIndexShardSnapshots snapshots, Commit commit, boolean exact) {
         final var baseline = baseline(snapshots, commit);
-        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), commitFiles(commit));
-        assertThat("files needing a checksum", needingChecksum, equalTo(filesOfTheSameNameAndLength(snapshots, commit, commit)));
+        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), luceneFiles(commit));
+        assertThat("files needing a checksum", needingChecksum, equalTo(expectedFilesNeedingChecksum(snapshots, commit, commit)));
         final Map<String, StoreFileMetadata> metadata = new HashMap<>();
         for (StoreFileMetadata file : commit.files()) {
-            if (needingChecksum.contains(commitFile(file))) {
+            if (needingChecksum.contains(luceneFile(file))) {
                 metadata.put(file.name(), file);
             }
         }
-        final long bytes = ShardBacklog.bytesToUpload(baseline, commit.stateId(), commitFiles(commit), metadata);
+        final long bytes = ShardBacklog.bytesToUpload(baseline, commit.stateId(), luceneFiles(commit), metadata);
         final long uploaded = uploadedBytes(snapshots, commit);
         assertThat("bytes to upload", bytes, greaterThanOrEqualTo(uploaded));
         if (exact) {
@@ -620,14 +620,14 @@ public class ShardBacklogTests extends ESTestCase {
     /**
      * A state id as {@code SnapshotShardsService#getShardStateId} builds it, after the given number of writes.
      */
-    private static String historyStateId(int writes) {
+    private static String stateIdAfterWrites(int writes) {
         return "history-na-" + writes;
     }
 
     /**
      * The commit as checked or snapshotted: with its state id if the shard has settled, without one if not.
      */
-    private static Commit randomSettled(Commit commit) {
+    private static Commit maybeWithoutStateId(Commit commit) {
         return randomBoolean() ? commit : new Commit(null, commit.files());
     }
 
@@ -769,11 +769,11 @@ public class ShardBacklogTests extends ESTestCase {
         return new BytesRef(randomByteArrayOfLength(16));
     }
 
-    private static CommitFile commitFile(StoreFileMetadata file) {
-        return new CommitFile(file.name(), file.length());
+    private static LuceneFile luceneFile(StoreFileMetadata file) {
+        return new LuceneFile(file.name(), file.length());
     }
 
-    private static List<CommitFile> commitFiles(Commit commit) {
-        return commit.files().stream().map(ShardBacklogTests::commitFile).toList();
+    private static List<LuceneFile> luceneFiles(Commit commit) {
+        return commit.files().stream().map(ShardBacklogTests::luceneFile).toList();
     }
 }

@@ -41,63 +41,67 @@ final class ShardBacklog {
     private ShardBacklog() {}
 
     /**
-     * A file of the shard's latest commit, by name and length, before its checksum is read. A commit lists each name once.
+     * A Lucene file the shard has now, by name and length, before its checksum is read. A commit lists each name once.
      */
-    record CommitFile(String name, long length) {
-        CommitFile {
+    record LuceneFile(String name, long length) {
+        LuceneFile {
             Objects.requireNonNull(name);
         }
     }
 
     /**
-     * @param stateId the shard's state id as a snapshot would work it out ({@code SnapshotShardsService#getShardStateId}), or
-     *                {@code null} while writes are still in flight
+     * @param currentStateId the shard's state id as a snapshot would work it out ({@code SnapshotShardsService#getShardStateId}),
+     *                       or {@code null} while writes are still in flight
      * @return the files whose name is in the baseline; {@link #bytesToUpload} needs their checksums
      */
-    static List<CommitFile> filesNeedingChecksum(ShardBaseline baseline, @Nullable String stateId, Collection<CommitFile> commitFiles) {
-        if (baseline.hasStateId(stateId)) {
+    static List<LuceneFile> filesNeedingChecksum(
+        ShardBaseline baseline,
+        @Nullable String currentStateId,
+        Collection<LuceneFile> currentFiles
+    ) {
+        if (baseline.isLatestStateId(currentStateId)) {
             return List.of();
         }
-        final List<CommitFile> files = new ArrayList<>();
-        for (CommitFile file : commitFiles) {
-            if (isUploaded(file) && baseline.mayHold(file.name())) {
-                files.add(file);
+        final List<LuceneFile> needingChecksum = new ArrayList<>();
+        for (LuceneFile file : currentFiles) {
+            if (snapshotUploads(file) && baseline.hasFileNamed(file.name())) {
+                needingChecksum.add(file);
             }
         }
-        return files;
+        return needingChecksum;
     }
 
     /**
-     * @param stateId            the shard's state id, as for {@link #filesNeedingChecksum}
-     * @param commitFileMetadata for each file that {@link #filesNeedingChecksum} returned, its metadata by file name, built the way a
-     *                           snapshot reads it ({@link Store.MetadataSnapshot#loadFromIndexCommit}): with its checksum and, if the
-     *                           commit has one, its writer uuid. Without the writer uuid, a different file with the same name, length
-     *                           and checksum would look backed up.
+     * @param currentStateId      the shard's state id, as for {@link #filesNeedingChecksum}
+     * @param currentFileMetadata for each file that {@link #filesNeedingChecksum} returned, its metadata by file name, built the way a
+     *                            snapshot reads it ({@link Store.MetadataSnapshot#loadFromIndexCommit}): with its checksum and, if
+     *                            the commit has one, its writer uuid. Without the writer uuid, a different file with the same name,
+     *                            length and checksum would look backed up.
      * @return the bytes the next snapshot would upload
      */
     static long bytesToUpload(
         ShardBaseline baseline,
-        @Nullable String stateId,
-        Collection<CommitFile> commitFiles,
-        Map<String, StoreFileMetadata> commitFileMetadata
+        @Nullable String currentStateId,
+        Collection<LuceneFile> currentFiles,
+        Map<String, StoreFileMetadata> currentFileMetadata
     ) {
-        if (baseline.hasStateId(stateId)) {
+        if (baseline.isLatestStateId(currentStateId)) {
             return 0;
         }
         long bytes = 0;
-        for (CommitFile file : commitFiles) {
-            if (isUploaded(file) == false) {
+        for (LuceneFile file : currentFiles) {
+            if (snapshotUploads(file) == false) {
                 continue;
             }
-            if (baseline.mayHold(file.name())) {
-                final StoreFileMetadata metadata = commitFileMetadata.get(file.name());
+            if (baseline.hasFileNamed(file.name())) {
+                final StoreFileMetadata metadata = currentFileMetadata.get(file.name());
                 if (metadata == null) {
                     throw new IllegalArgumentException("no checksum for [" + file.name() + "]");
                 }
                 if (metadata.name().equals(file.name()) == false || metadata.length() != file.length()) {
                     throw new IllegalArgumentException("[" + metadata + "] is not the metadata of " + file);
                 }
-                if (baseline.holds(metadata)) {
+                if (baseline.isBackedUp(metadata)) {
                     continue;
                 }
             }
@@ -111,7 +115,7 @@ final class ShardBacklog {
      * {@code segments_N} files, because it stores their contents in the metadata itself. (The snapshot checks
      * {@link StoreFileMetadata#hashEqualsContents}, which is true for exactly these files.)
      */
-    private static boolean isUploaded(CommitFile file) {
+    private static boolean snapshotUploads(LuceneFile file) {
         return Store.MetadataSnapshot.isReadAsHash(file.name()) == false;
     }
 }
