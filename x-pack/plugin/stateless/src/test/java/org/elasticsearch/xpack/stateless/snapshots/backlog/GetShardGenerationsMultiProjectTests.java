@@ -51,8 +51,9 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.mockito.Mockito.mock;
 
 /**
- * Runs the master side of {@link TransportGetShardGenerationsAction} against a real {@link RepositoriesService} that holds a repository
- * of the same name in two projects. The stateless integration tests run a single project, so this is where the projects are told apart.
+ * Runs the master side of {@link TransportGetShardGenerationsAction} against a real {@link RepositoriesService} with a repository of the
+ * same name in two projects. The stateless integration tests run a single project, so this test is what checks that the answer comes
+ * from the right project.
  */
 public class GetShardGenerationsMultiProjectTests extends ESTestCase {
 
@@ -74,8 +75,8 @@ public class GetShardGenerationsMultiProjectTests extends ESTestCase {
     public void createAction() {
         threadPool = new TestThreadPool(getTestName());
         clusterService = ClusterServiceUtils.createClusterService(threadPool);
-        // the action registers its handler with the transport service, but the tests call the master operation directly, so nothing is
-        // ever sent and the transport itself can be a mock
+        // the action registers its handler with the transport service, but the tests call the master operation directly, so nothing
+        // is ever sent and the transport can be a mock
         final var transportService = new TransportService(
             Settings.EMPTY,
             mock(Transport.class),
@@ -133,7 +134,7 @@ public class GetShardGenerationsMultiProjectTests extends ESTestCase {
     }
 
     /**
-     * Runs the master operation on the pool the action runs it on, as the master would.
+     * Runs the master operation on the same thread pool the action uses, as the master would.
      */
     private void runMasterOperation(ProjectId projectId, List<ShardId> shardIds, ActionListener<GetShardGenerationsResponse> listener) {
         final var request = new GetShardGenerationsRequest(TEST_REQUEST_TIMEOUT, new ProjectRepo(projectId, REPOSITORY), shardIds);
@@ -183,7 +184,7 @@ public class GetShardGenerationsMultiProjectTests extends ESTestCase {
     }
 
     /**
-     * A repository that answers with the repository data the test put for its project.
+     * A repository that answers with the repository data the test set up for its project.
      */
     private class CannedRepository extends RestoreOnlyRepository {
 

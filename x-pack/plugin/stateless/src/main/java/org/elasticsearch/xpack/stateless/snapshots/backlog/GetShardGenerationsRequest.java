@@ -22,7 +22,7 @@ import java.util.Objects;
 import static org.elasticsearch.action.ValidateActions.addValidationError;
 
 /**
- * Asks the master where a repository keeps the shard-level metadata of the given shards, see {@link TransportGetShardGenerationsAction}.
+ * Asks the master where to find the backup metadata of the given shards in one repository. See {@link TransportGetShardGenerationsAction}.
  */
 public class GetShardGenerationsRequest extends MasterNodeRequest<GetShardGenerationsRequest> {
 

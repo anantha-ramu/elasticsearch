@@ -31,16 +31,18 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Tells an index node where a repository keeps the shard-level metadata ({@code index-{generation}}) of its shards, so that the node can
- * read which files the repository already has of them. The generations are in the {@link RepositoryData}, which only the master loads,
- * so index nodes ask the master, as peer recovery does for the latest snapshot of a shard (see
+ * Tells an index node where to find the backup metadata ({@code index-{generation}}) of its shards in a repository, so the node can read
+ * which of their files are already backed up.
+ * <p>
+ * Each shard's current metadata generation is recorded in the repository's top-level data ({@link RepositoryData}). Only the master
+ * loads that, so index nodes ask the master. Peer recovery does the same to find a shard's latest snapshot (see
  * {@link org.elasticsearch.action.admin.cluster.snapshots.get.shard.TransportGetShardSnapshotAction}).
  * <p>
- * The answer only covers snapshots that have been finalized into the {@link RepositoryData}. A running snapshot that has already
- * finished a shard has written newer shard-level metadata for it, which the next snapshot of the shard will start from (see
- * {@link org.elasticsearch.snapshots.InFlightShardSnapshotStates}). That generation is in the {@link
- * org.elasticsearch.cluster.SnapshotsInProgress} of the cluster state, so a node that wants the generation the next snapshot of a shard
- * starts from takes it from there and uses this answer only for shards without one.
+ * The answer only covers finished snapshots, the ones already recorded in the {@link RepositoryData}. A snapshot that is still running
+ * may already have written newer metadata for a shard it has finished, and the shard's next snapshot will start from that (see
+ * {@link org.elasticsearch.snapshots.InFlightShardSnapshotStates}). That generation is in the cluster state
+ * ({@link org.elasticsearch.cluster.SnapshotsInProgress}). So a node that wants the generation the next snapshot will start from takes it
+ * from there when it's present, and uses this answer for the other shards.
  */
 public class TransportGetShardGenerationsAction extends TransportMasterNodeAction<GetShardGenerationsRequest, GetShardGenerationsResponse> {
 
@@ -65,7 +67,8 @@ public class TransportGetShardGenerationsAction extends TransportMasterNodeActio
             actionFilters,
             GetShardGenerationsRequest::new,
             GetShardGenerationsResponse::new,
-            // the repository data may have to be loaded from the repository, and the response can cover thousands of shards
+            // runs on the snapshot-meta pool: loading the repository data can mean reading from the repository, and one answer can
+            // cover thousands of shards
             threadPool.executor(ThreadPool.Names.SNAPSHOT_META)
         );
         this.repositoriesService = repositoriesService;
@@ -80,7 +83,7 @@ public class TransportGetShardGenerationsAction extends TransportMasterNodeActio
     ) {
         assert ThreadPool.assertCurrentThreadPool(ThreadPool.Names.SNAPSHOT_META);
         final var projectRepo = request.projectRepo();
-        // throws if the repository does not exist, which is passed on to the node that asked
+        // throws if the repository doesn't exist, and the node that asked gets that error
         final var repository = repositoriesService.repository(projectRepo.projectId(), projectRepo.name());
         repository.getRepositoryData(
             threadPool.executor(ThreadPool.Names.SNAPSHOT_META),
@@ -100,12 +103,13 @@ public class TransportGetShardGenerationsAction extends TransportMasterNodeActio
     }
 
     /**
-     * The index is looked up by name, as a new snapshot of the index does ({@link RepositoryData#resolveNewIndices}): if an index was
-     * deleted and created again with the same name, its next snapshot is compared against what the repository holds of the old one.
+     * Looks the index up by name, as a new snapshot does ({@link RepositoryData#resolveNewIndices}). So if an index was deleted and
+     * created again under the same name, the answer points at the old index's metadata, which is what its next snapshot compares
+     * against.
      *
-     * @return where the repository keeps the shard-level metadata of the shard, or {@code null} if it has none: the repository does not
-     *         know the index or the shard, or it knows that it holds nothing of the shard yet ({@link ShardGenerations#NEW_SHARD_GEN}) or
-     *         any more ({@link ShardGenerations#DELETED_SHARD_GEN})
+     * @return where the shard's backup metadata is, or {@code null} if there is none: the repository doesn't know the index or the
+     *         shard, or it knows it holds nothing of the shard yet ({@link ShardGenerations#NEW_SHARD_GEN}) or any more
+     *         ({@link ShardGenerations#DELETED_SHARD_GEN})
      */
     private static RepositoryShardGeneration getShardGeneration(RepositoryData repositoryData, ShardId shardId) {
         final IndexId indexId = repositoryData.getIndices().get(shardId.getIndexName());

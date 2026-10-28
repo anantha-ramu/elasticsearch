@@ -17,7 +17,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * The answer to a {@link GetShardGenerationsRequest}.
+ * The master's answer to a {@link GetShardGenerationsRequest}.
  */
 public class GetShardGenerationsResponse extends ActionResponse {
 
@@ -25,10 +25,10 @@ public class GetShardGenerationsResponse extends ActionResponse {
     private final Map<ShardId, RepositoryShardGeneration> shardGenerations;
 
     /**
-     * @param repositoryGeneration the generation of the repository data the answer is from, so that the node that asked can tell whether
-     *                             the answer is older than a repository generation it has seen since
-     * @param shardGenerations     where the repository keeps the shard-level metadata of each shard asked for. A shard that is not in
-     *                             the map has no shard-level metadata in the repository, so the repository holds none of its files.
+     * @param repositoryGeneration the generation of the repository data the answer comes from. The node that asked can use it to tell
+     *                             whether the answer is older than a repository change it has already seen.
+     * @param shardGenerations     for each shard asked about, where its backup metadata is. A shard missing from the map has no backup
+     *                             metadata in the repository, so none of its files are backed up.
      */
     public GetShardGenerationsResponse(long repositoryGeneration, Map<ShardId, RepositoryShardGeneration> shardGenerations) {
         this.repositoryGeneration = repositoryGeneration;
