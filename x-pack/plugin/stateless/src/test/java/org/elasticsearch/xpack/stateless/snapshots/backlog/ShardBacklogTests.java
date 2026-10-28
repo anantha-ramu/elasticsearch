@@ -267,8 +267,8 @@ public class ShardBacklogTests extends ESTestCase {
         assertBacklog(repository, baselineCommit, commit(null, merged, file("_3.cfs", 500, 14, randomWriterUuid())), 500);
     }
 
-    public void testARecreatedIndexCanCountAFileTheSnapshotWouldReuse() {
-        // the old index's files, recorded without writer uuid as older versions did
+    public void testARepositoryWithoutWriterUuidsCanCountAFileTheSnapshotWouldReuse() {
+        // files recorded by a version before 7.16, which kept no writer uuids; serverless repositories are all newer than that
         final var repository = repository(
             snapshot("snap-1", null, file("_0.cfs", 1000, 11, NO_WRITER_UUID), file("_1.cfs", 2000, 12, NO_WRITER_UUID))
         );

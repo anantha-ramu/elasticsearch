@@ -18,27 +18,30 @@ import java.util.Map;
 import java.util.Objects;
 
 /**
- * Works out how many bytes the next snapshot of a shard would upload to a repository, the way the snapshot itself decides it
- * ({@code BlobStoreRepository#doSnapshotShard}), by comparing what the repository holds of the shard ({@link ShardBaseline}) with the
- * shard's latest commit:
+ * Works out how many bytes the next snapshot of a shard would upload, using the same rules as the snapshot itself
+ * ({@code BlobStoreRepository#doSnapshotShard}). It compares the shard's latest commit with what the repository has already backed up
+ * ({@link ShardBaseline}):
  * <ul>
- *     <li>if a snapshot in the repository has the commit's shard state id, nothing is uploaded (the baseline keeps the latest state
- *     id, the only one a commit of the shard can have);</li>
- *     <li>otherwise every commit file the repository doesn't hold is uploaded, apart from the {@code .si} and {@code segments_N} files,
- *     whose contents a snapshot keeps inside the shard-level metadata ({@link Store.MetadataSnapshot#isReadAsHash}).</li>
+ *     <li>if the shard hasn't changed since the latest snapshot (the same state id), nothing is uploaded;</li>
+ *     <li>otherwise every file the repository doesn't already have is uploaded, except the {@code .si} and {@code segments_N} files,
+ *     whose contents a snapshot stores in the metadata itself ({@link Store.MetadataSnapshot#isReadAsHash}).</li>
  * </ul>
- * Nothing is read here. The caller first asks which files need their checksum ({@link #filesNeedingChecksum}), reads only those, and
- * passes them to {@link #bytesToUpload}. Only a file the repository has a file of the same name and length for is worth checking.
+ * Nothing is read here. Checking whether a file is already backed up needs its checksum, which means reading the end of the file, so
+ * this works in two steps: {@link #filesNeedingChecksum} says which files need one, the caller reads just those, and
+ * {@link #bytesToUpload} gives the answer. Only a file whose name is in the baseline needs a checksum, because the baseline already
+ * kept just the files with the right length.
  * <p>
  * The incremental size a snapshot reports also counts the {@code .si} and {@code segments_N} files it adds, so it can be a little more
  * than this.
+ * <p>
+ * {@link ShardBaseline} explains why what it keeps is enough, and how each case is handled.
  */
 final class ShardBacklog {
 
     private ShardBacklog() {}
 
     /**
-     * A file of a shard's commit, by name and length, before its checksum is read. A commit lists each name once.
+     * A file of the shard's latest commit, by name and length, before its checksum is read. A commit lists each name once.
      */
     record CommitFile(String name, long length) {
         CommitFile {
@@ -47,9 +50,9 @@ final class ShardBacklog {
     }
 
     /**
-     * @param stateId the shard state id a snapshot of the commit would have ({@code SnapshotShardsService#getShardStateId}), {@code null}
-     *                if the shard is not in a steady state
-     * @return the commit files the repository has a file of the same name and length for, whose checksums {@link #bytesToUpload} needs
+     * @param stateId the shard's state id as a snapshot would work it out ({@code SnapshotShardsService#getShardStateId}), or
+     *                {@code null} while writes are still in flight
+     * @return the files whose name is in the baseline; {@link #bytesToUpload} needs their checksums
      */
     static List<CommitFile> filesNeedingChecksum(ShardBaseline baseline, @Nullable String stateId, Collection<CommitFile> commitFiles) {
         if (baseline.hasStateId(stateId)) {
@@ -65,13 +68,12 @@ final class ShardBacklog {
     }
 
     /**
-     * @param stateId          the shard state id a snapshot of the commit would have ({@code SnapshotShardsService#getShardStateId}),
-     *                         {@code null} if the shard is not in a steady state
-     * @param commitFileMetadata the metadata of each file that {@link #filesNeedingChecksum} returned, by file name, as a snapshot reads
-     *                         it ({@link Store.MetadataSnapshot#loadFromIndexCommit}): its checksum, and its writer uuid if the commit has
-     *                         one. {@link StoreFileMetadata#isSame} needs both: a file of an index created again under the same name can
-     *                         have the name, length and checksum of a file the repository holds, and only the writer uuid tells them apart.
-     * @return the bytes the next snapshot of the commit would upload
+     * @param stateId            the shard's state id, as for {@link #filesNeedingChecksum}
+     * @param commitFileMetadata for each file that {@link #filesNeedingChecksum} returned, its metadata by file name, built the way a
+     *                           snapshot reads it ({@link Store.MetadataSnapshot#loadFromIndexCommit}): with its checksum and, if the
+     *                           commit has one, its writer uuid. Without the writer uuid, a different file with the same name, length
+     *                           and checksum would look backed up.
+     * @return the bytes the next snapshot would upload
      */
     static long bytesToUpload(
         ShardBaseline baseline,
@@ -105,9 +107,9 @@ final class ShardBacklog {
     }
 
     /**
-     * Whether a snapshot uploads the file if the repository does not hold it. It keeps the contents of the {@code .si} and
-     * {@code segments_N} files inside the shard-level metadata instead. The snapshot checks {@link StoreFileMetadata#hashEqualsContents},
-     * which is true for exactly these files of a commit read by {@link Store.MetadataSnapshot#loadFromIndexCommit}.
+     * Whether a snapshot would upload this file if the repository didn't already have it. It never uploads the {@code .si} and
+     * {@code segments_N} files, because it stores their contents in the metadata itself. (The snapshot checks
+     * {@link StoreFileMetadata#hashEqualsContents}, which is true for exactly these files.)
      */
     private static boolean isUploaded(CommitFile file) {
         return Store.MetadataSnapshot.isReadAsHash(file.name()) == false;

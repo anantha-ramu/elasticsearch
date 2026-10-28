@@ -28,31 +28,66 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * What a repository holds of one shard that still matters for a commit of the shard: the files in the shard-level metadata
- * ({@code index-{generation}}, a {@link BlobStoreIndexShardSnapshots}) with the name and length of one of the commit's files, and the
- * shard state id of the latest snapshot that has one. {@link ShardBacklog} uses it to work out what the next snapshot of the shard
- * would upload. Whether the repository holds a commit file is decided by {@link StoreFileMetadata#isSame}, as the snapshot decides it.
+ * A summary of what a repository has already backed up for one shard. {@link ShardBacklog} compares it with the shard's files to
+ * work out how much the next snapshot would upload.
  * <p>
- * A baseline is for the commit it was built for and every later commit of the shard, until the shard-level metadata changes. What it
- * leaves out can only make the backlog larger, never smaller, and it stays about the size of the shard's commit however long snapshots
- * are retained:
+ * To build it, we read the shard's backup metadata from the repository ({@code index-{generation}}, a
+ * {@link BlobStoreIndexShardSnapshots}) and compare it with the files the shard has right now. We keep two things:
  * <ul>
- *     <li>Files that only older snapshots have, merged away since. Lucene never gives a new file of an index the name of an earlier
- *     one (segment names come from a counter, and the generations of a segment's files only go up), and files never change once
- *     written, so a later commit can only have one of the commit's names with the same length.</li>
- *     <li>Every state id but the latest. Within a shard's history the state id only moves forward (it ends with the max sequence
- *     number), so the latest is the only one a later commit can have. A restore starts a new history, so its state ids match none of
- *     the old ones.</li>
+ *     <li>For each of the shard's current files, the repository's record of any backed-up file with the same name and length (its
+ *     length, checksum, writer uuid and so on), never the file's contents. {@link StoreFileMetadata#isSame} uses this record to tell
+ *     whether the backed-up file really is the same file, just as the snapshot does.</li>
+ *     <li>The state id from the latest snapshot. If the shard still has the same state id, its data hasn't changed since that
+ *     snapshot, even if a background merge rewrote its files, and the next snapshot has nothing to upload.</li>
  * </ul>
- * Two cases differ from the snapshot, and both only make the backlog larger:
+ * <p>
+ * A baseline stays correct as the shard writes new files: they are simply counted as not backed up yet. It only goes out of date when
+ * the repository changes, that is, when a snapshot is taken, deleted or cloned. From then until a new baseline is built, the backlog
+ * worked out from it shouldn't be used, because it can be wrong either way: too high after a new snapshot, or too low if a deleted
+ * snapshot held some of the shard's files.
+ * <p>
+ * The baseline stays small, about the size of the shard's file list, no matter how many snapshots are kept. The only extra entries are
+ * old files with matching names and lengths, left behind when an index was deleted and recreated under the same name. Two rules make
+ * this possible:
  * <ul>
- *     <li>A clone of an older snapshot puts that snapshot's state id last. Until the next snapshot, which puts the shard's own state id
- *     last again, a shard with no new writes whose files were merged counts the merged files.</li>
- *     <li>An index deleted and created again under the same name shares its folder in the repository, and its later files can get
- *     names the old index used. Those files have other writer uuids, so {@link StoreFileMetadata#isSame} tells them apart, unless the
- *     repository has no writer uuid for the old file (older versions did not record one) and the two files have the same length and
- *     checksum by chance.</li>
+ *     <li>Within one index, Lucene never reuses a file name and never changes a file once written. So a file that was merged away
+ *     never comes back, and a file the shard keeps always has the same length.</li>
+ *     <li>The state id only moves forward. It is made of the shard's history uuid, a force merge id and the highest sequence number.
+ *     Within one history the sequence number only grows, and the force merge id only changes to a new random value. So once the
+ *     shard has moved past a snapshot's state id, it never has it again. Snapshots are recorded one at a time, in the order they were
+ *     taken, so the last state id in the metadata is the newest one, and the only one worth keeping.</li>
  * </ul>
+ * These events are handled exactly, with the same result as the snapshot:
+ * <ul>
+ *     <li><b>Snapshots are taken or deleted.</b> Both rules still hold.</li>
+ *     <li><b>A snapshot is taken while writes are in flight.</b> It records no state id, so we use the one from the snapshot before
+ *     it.</li>
+ *     <li><b>The shard's metadata file goes missing and is rebuilt.</b> Elasticsearch rebuilds it from the per-snapshot metadata files,
+ *     and the rebuilt copy has no state ids. Then neither the snapshot nor the backlog can use the "nothing changed" shortcut, and
+ *     both compare files.</li>
+ *     <li><b>A snapshot is restored.</b> The shard gets a new history uuid, so no old state id can match. The restored files match
+ *     their backed-up copies. Files written after the restore may reuse old names, but they have new writer uuids, so they don't
+ *     match.</li>
+ *     <li><b>An index is deleted and created again under the same name.</b> This works like a restore: the same folder in the
+ *     repository, but a new history. Its new files can reuse old names, but they have new writer uuids, so they don't match. (Every
+ *     serverless repository records writer uuids, as every repository written by Elasticsearch 7.16 or later does.)</li>
+ *     <li><b>A primary relocates or fails over</b> in stateless. The history stays the same, the new primary starts from the latest
+ *     uploaded commit, and no snapshot is of a newer commit.</li>
+ *     <li><b>The index is resharded.</b> Each new shard gets its own folder in the repository, and any files an earlier index of the
+ *     same name left there are handled as for a recreated index. The original shard gets a new state id when it deletes the
+ *     documents that moved.</li>
+ * </ul>
+ * With an up-to-date baseline, there is one known case in serverless where the backlog counts more than the snapshot would upload,
+ * and none where it counts less. (A repository last written before Elasticsearch 7.16 would add another, which a test pins down.)
+ * <ul>
+ *     <li><b>An older snapshot is cloned.</b> The clone copies the old snapshot's state id to the end of the list, so we no longer
+ *     keep the newest one. This only matters if the shard has had no new writes but a background merge rewrote its files: the
+ *     snapshot would see the state id is unchanged and upload nothing, while we count the merged files. The next snapshot puts the
+ *     newest state id back at the end.</li>
+ * </ul>
+ * This assumes the caller reads the metadata before looking at the shard's files (see {@link #of}) and builds a new baseline whenever
+ * the metadata changes. Even if a shard somehow went back to an older state without a new history, the backlog would only grow, never
+ * shrink.
  */
 final class ShardBaseline implements Accountable {
 
@@ -62,7 +97,7 @@ final class ShardBaseline implements Accountable {
 
     static final ShardBaseline EMPTY = of(BlobStoreIndexShardSnapshots.EMPTY, List.of());
 
-    // the files by physical name, each once whichever snapshots refer to it
+    // the backed-up files, by file name; a file that several snapshots share is kept once
     private final Map<String, List<StoreFileMetadata>> filesByName;
     @Nullable
     private final String stateId;
@@ -75,25 +110,28 @@ final class ShardBaseline implements Accountable {
     }
 
     /**
-     * Builds the baseline for a commit of the shard. The commit must be taken after the shard-level metadata was read: if a snapshot
-     * finished in between, the metadata would have files of a newer commit, which a baseline for an older commit leaves out.
+     * Builds a baseline from the shard's backup metadata and the files the shard has right now. Read the metadata first and take the
+     * files afterwards. If a snapshot finished in between, the metadata would include files newer than the ones passed in, and the
+     * baseline would wrongly leave them out.
      *
-     * @param commitFiles the files of the commit the baseline is for, normally the shard's latest
+     * @param snapshots   the shard's backup metadata, as read from the repository
+     * @param commitFiles the files of the shard's latest commit
      */
     static ShardBaseline of(BlobStoreIndexShardSnapshots snapshots, Collection<CommitFile> commitFiles) {
-        // the files a snapshot of the commit, or of a later one, looks for in the repository: it keeps the contents of the .si and
-        // segments_N files inside the shard-level metadata instead
+        // the name and length of each file a snapshot would look for in the repository. It never looks for the .si and segments_N
+        // files, because it stores their contents in the metadata itself
         final Map<String, Long> lengths = new HashMap<>();
         for (CommitFile file : commitFiles) {
             if (Store.MetadataSnapshot.isReadAsHash(file.name()) == false) {
                 lengths.put(file.name(), file.length());
             }
         }
-        // each file once, as BlobStoreIndexShardSnapshots#findPhysicalIndexFile does: every snapshot of a file refers to its blob
+        // keep a backed-up file only if it has the same name and length as one of the shard's files, since isSame never matches a
+        // file a snapshot uploads with one of another length. Keep it once: all the snapshots that share a file refer to the same blob
         final Set<String> blobNames = new HashSet<>();
         final Map<String, List<StoreFileMetadata>> filesByName = new HashMap<>();
         String stateId = null;
-        // in the order the snapshots were added, so the last state id is the latest
+        // snapshots are listed in the order they were taken, so the last state id we see is the newest
         for (SnapshotFiles snapshot : snapshots) {
             if (snapshot.shardStateIdentifier() != null) {
                 stateId = snapshot.shardStateIdentifier();
@@ -109,27 +147,26 @@ final class ShardBaseline implements Accountable {
     }
 
     /**
-     * Whether the latest snapshot in the repository that has a state id has the given one, in which case a snapshot of a commit with
-     * that state id uploads no files at all.
+     * Whether the given state id is the newest one in the shard's backup metadata. If it is, the shard's data hasn't changed since that
+     * snapshot, and the next snapshot uploads nothing.
      */
     boolean hasStateId(@Nullable String stateId) {
         return stateId != null && stateId.equals(this.stateId);
     }
 
     /**
-     * Whether the baseline has a repository file of the given name. Those all have the length of the commit's file of that name, which
-     * a later commit of the shard has too. If not, the repository does not hold a commit file of that name: {@link
-     * StoreFileMetadata#isSame} only matches files of the same length, apart from a file whose hash is its whole contents, which only
-     * matches a file with the same hash, and the commit files a snapshot uploads have no hash. If so, {@link #holds} tells from the
-     * commit file's checksum and writer uuid.
+     * Whether the baseline has a backed-up file with this name. If not, the shard's file of that name isn't backed up yet. If it has
+     * one, the file's checksum is needed, and {@link #holds} gives the answer. The name is enough, because the baseline only kept files
+     * with the same length as the shard's, and a file never changes length.
      */
     boolean mayHold(String name) {
         return filesByName.containsKey(name);
     }
 
     /**
-     * Whether the repository holds the given commit file, that is, whether a snapshot would reuse one of the repository's files instead
-     * of uploading it ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}).
+     * Whether the repository already has this file of the shard, that is, whether a snapshot would reuse a backed-up file instead of
+     * uploading it. Like {@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}, it asks {@link StoreFileMetadata#isSame} about
+     * each backed-up file of the same name.
      */
     boolean holds(StoreFileMetadata commitFile) {
         for (StoreFileMetadata file : filesByName.getOrDefault(commitFile.name(), List.of())) {
@@ -147,7 +184,7 @@ final class ShardBaseline implements Accountable {
 
     private static long ramBytesUsed(Map<String, List<StoreFileMetadata>> filesByName, @Nullable String stateId) {
         long bytes = SHALLOW_SIZE + RamUsageEstimator.sizeOf(stateId);
-        // Map.copyOf keeps a table of twice its keys and values
+        // Map.copyOf stores its keys and values in a table with twice as many slots
         bytes += sizeOfCollection(filesByName, 4L * filesByName.size());
         for (List<StoreFileMetadata> files : filesByName.values()) {
             bytes += sizeOfCollection(files, files.size());
@@ -165,9 +202,9 @@ final class ShardBaseline implements Accountable {
     }
 
     /**
-     * A {@code java.util} collection: its shell and its table of references, plus one more array header. That header is not on the
-     * heap, but {@code RamUsageTester}, which the tests check the estimate against, counts a collection as its shell and two array
-     * headers, and without it the estimate of an empty or very small baseline would fall below that.
+     * The size of a {@code java.util} collection: the object, its table of references, and one extra array header. The extra header
+     * isn't real memory. It's there because {@code RamUsageTester}, which the tests compare this estimate with, counts a collection
+     * that way, and without it a very small baseline would come out below the test's figure.
      */
     private static long sizeOfCollection(Object collection, long references) {
         return RamUsageEstimator.shallowSizeOf(collection) + RamUsageEstimator.NUM_BYTES_ARRAY_HEADER + RamUsageEstimator.alignObjectSize(
