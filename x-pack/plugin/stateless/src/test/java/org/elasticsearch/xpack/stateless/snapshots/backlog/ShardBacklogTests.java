@@ -310,18 +310,23 @@ public class ShardBacklogTests extends ESTestCase {
         final var repository = repository(snapshot("snap-1", null, cfs));
         final var commit = commit(null, cfs);
         final var baseline = baseline(repository, commit);
-        // The repository has a file with the same name and length as the shard's _0.cfs, so the backlog asks the caller for the
-        // shard file's metadata, to compare checksums.
+        // The backlog works in two steps, because getting a file's checksum means reading the end of the file. In the first step,
+        // filesNeedingChecksum says which of the shard's files it can't judge from their name and length alone. Here that is
+        // _0.cfs, because the repository has a file with the same name and length. Only the rest of the file's metadata, such as
+        // its checksum and writer uuid, can tell whether it is the same file.
         assertThat(ShardBacklog.filesNeedingChecksum(baseline, null, luceneFiles(commit)), equalTo(List.of(luceneFile(cfs))));
 
-        // Not passing that metadata is a bug in the caller, so the backlog fails instead of guessing.
+        // In the second step, the caller reads the metadata of those files, with their checksums, and passes it to bytesToUpload.
+        // If the caller leaves a file out, that is a bug in the caller. Counting the file anyway, or not counting it, could give a
+        // wrong number and hide the bug, so bytesToUpload throws an exception instead.
         final var missing = expectThrows(
             IllegalArgumentException.class,
             () -> ShardBacklog.bytesToUpload(baseline, null, luceneFiles(commit), Map.of())
         );
         assertThat(missing.getMessage(), containsString("[_0.cfs]"));
 
-        // So is passing the metadata of another file, with another length or another name.
+        // Passing the metadata of a different file is also a bug in the caller, and bytesToUpload throws for it too. Here the
+        // metadata passed for _0.cfs is either of a file with another length, or of a file with another name.
         final var otherFile = randomFrom(file("_0.cfs", 2000, 11, randomWriterUuid()), file("_1.cfs", 1000, 11, randomWriterUuid()));
         final var wrong = expectThrows(
             IllegalArgumentException.class,
