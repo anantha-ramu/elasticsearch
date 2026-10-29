@@ -54,7 +54,8 @@ import static org.hamcrest.Matchers.greaterThanOrEqualTo;
  *     the way a real snapshot does: a file the repository already has is reused, and any other file is uploaded.</li>
  *     <li>{@code commit(...)} is the shard's current commit: its state id, or {@code null} if it has none, and its files.</li>
  *     <li>{@code assertBacklog(repository, commit, bytes)} checks that a snapshot of the commit would upload {@code bytes}, and that the
- *     backlog counts exactly the same.</li>
+ *     backlog counts exactly the same. {@code assertBacklog(repository, baselineCommit, commit, bytes)} does the same, but builds the
+ *     baseline for an earlier commit and uses it for a later one, as a node does between snapshots.</li>
  * </ul>
  * Whether a file of the commit matches a file of the repository is decided by {@link StoreFileMetadata#isSame}: the same name, length
  * and checksum, and the same writer uuid when both files have one. Lengths and checksums are small made-up numbers.
@@ -84,10 +85,12 @@ public class ShardBacklogTests extends ESTestCase {
             snapshot("snap-1", "state-1", file("_0.cfs", 1000, 11, randomWriterUuid())),
             snapshot("snap-2", "state-2", file("_1.cfs", 2000, 12, randomWriterUuid()))
         );
-        // merged since the latest snapshot without any new writes: other files, the same state
+        // There were no writes since snap-2, but a background merge rewrote the files into _2.cfs. The shard is still at state-2,
+        // the state id of the latest snapshot, so the backlog is 0 without comparing any files.
         final var merged = commit("state-2", file("_2.cfs", 3000, 13, randomWriterUuid()));
 
         assertBacklog(repository, merged, 0);
+        // Since the backlog compares no files, it needs no checksums either.
         assertThat(ShardBacklog.filesNeedingChecksum(baseline(repository, merged), "state-2", luceneFiles(merged)), empty());
     }
 
@@ -110,33 +113,25 @@ public class ShardBacklogTests extends ESTestCase {
     public void testACloneOfAnOlderSnapshotCountsUntilTheNextSnapshot() {
         for (boolean originalDeleted : List.of(false, true)) {
             final var repository = repositoryWithACloneOfAnOlderSnapshot(originalDeleted);
-            // merged since snap-2 without new writes: other files, the same state
+            // There were no writes since snap-2, but a background merge rewrote the files into _2.cfs, so the shard is still at
+            // state-2. The snapshot finds snap-2 with that state id and uploads nothing.
             final var merged = commit("state-2", file("_2.cfs", 3000, 13, randomWriterUuid()));
 
             assertThat(uploadedBytes(repository, merged), equalTo(0L));
-            // the clone put state-1 last, so the backlog counts the merged file
+            // The clone is the newest snapshot, so the baseline keeps its state-1, not state-2. The shard's state-2 doesn't match,
+            // so the backlog compares files and counts _2.cfs, which no snapshot has. This is the one known over-count.
             assertThat(ShardBacklog.bytesToUpload(baseline(repository, merged), "state-2", luceneFiles(merged), Map.of()), equalTo(3000L));
-            // the next snapshot, taken once the shard has settled, takes the shortcut and puts state-2 last again
+            // The next snapshot is taken with the shard still at state-2. It uploads nothing and records state-2, which is now the
+            // newest state id again, so the backlog is back to 0.
             assertBacklog(snapshotShard(repository, "snap-3", merged), merged, 0);
-        }
-    }
-
-    public void testACloneOfAnOlderSnapshotIsAlsoFixedByASnapshotTakenMidWrite() {
-        for (boolean originalDeleted : List.of(false, true)) {
-            final var repository = repositoryWithACloneOfAnOlderSnapshot(originalDeleted);
-            final var merged = commit("state-2", file("_2.cfs", 3000, 13, randomWriterUuid()));
-            // the next snapshot is taken while writes are in flight: it records no state id, and uploads the merged file
-            final var afterNextSnapshot = snapshotShard(repository, "snap-3", new Commit(null, merged.files()));
-
-            // the clone's state-1 is still the last state id, but the merged file is now backed up, so comparing files is right
-            assertBacklog(afterNextSnapshot, merged, 0);
         }
     }
 
     public void testACloneOfAnOlderSnapshotStopsMatteringOnceTheShardIsWrittenTo() {
         final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
         final var cfs1 = file("_1.cfs", 2000, 12, randomWriterUuid());
-        // the clone of snap-1 puts state-1 last, as in testACloneOfAnOlderSnapshotCountsUntilTheNextSnapshot
+        // The clone of snap-1 is the newest snapshot, so the baseline keeps state-1, as in
+        // testACloneOfAnOlderSnapshotCountsUntilTheNextSnapshot.
         final var repository = repository(snapshot("snap-1", "state-1", cfs0), snapshot("snap-2", "state-2", cfs0, cfs1)).withClone(
             "snap-1",
             "clone-1"
@@ -150,8 +145,8 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * snap-1 (state-1) and snap-2 (state-2), then a clone of snap-1, which puts state-1 last. If {@code originalDeleted}, snap-1 is
-     * then deleted, as retention does, and keeps only the clone.
+     * Builds snap-1 (state-1) and snap-2 (state-2), then a clone of snap-1, which makes state-1 the newest state id again. If
+     * {@code originalDeleted}, snap-1 is then deleted, as retention might do, so the clone is the only snapshot left with state-1.
      */
     private static BlobStoreIndexShardSnapshots repositoryWithACloneOfAnOlderSnapshot(boolean originalDeleted) {
         final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
@@ -171,21 +166,24 @@ public class ShardBacklogTests extends ESTestCase {
     public void testADeletedSnapshotNoLongerCounts() {
         final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
         final var cfs1 = file("_1.cfs", 2000, 12, randomWriterUuid());
-        // snap-2, the latest snapshot and the only one with _1.cfs, is deleted
+        // snap-2 is deleted. It was the latest snapshot and the only one with _1.cfs.
         final var repository = repository(snapshot("snap-1", "state-1", cfs0), snapshot("snap-2", "state-2", cfs0, cfs1))
             .withRetainedSnapshots(Set.of(new SnapshotId("snap-1", randomUUID())));
 
-        // the shard hasn't changed since snap-2, but its state id is gone with it, and so is the only backed-up copy of _1.cfs
+        // The shard hasn't changed since snap-2, but snap-2's state id was deleted with it, and so was the only copy of _1.cfs in
+        // the repository. The next snapshot would upload _1.cfs again, so the backlog counts it.
         assertBacklog(repository, commit("state-2", cfs0, cfs1), 2000);
     }
 
     public void testRepairedMetadataWithoutStateIdsComparesTheFiles() {
         final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
-        // metadata rebuilt from the per-snapshot metadata files has no state ids at all
+        // Shard-level metadata that was rebuilt from the metadata file of each snapshot has no state ids at all.
         final var repository = repository(snapshot("snap-1", null, cfs0), snapshot("snap-2", null, cfs0));
 
-        // the shard has a state id but no snapshot does, so even a merge with no new writes counts the merged file
+        // The shard has a state id, but no snapshot has one to match it. So the backlog compares files, and even a merge with no
+        // new writes counts the merged file, which the snapshot would upload too.
         assertBacklog(repository, commit("state-2", file("_1.cfs", 3000, 13, randomWriterUuid())), 3000);
+        // Files the repository already has are still not counted.
         assertBacklog(repository, commit("state-2", cfs0), 0);
     }
 
@@ -195,13 +193,16 @@ public class ShardBacklogTests extends ESTestCase {
         final var beforeDeletion = repository(snapshot("snap-1", "state-1", cfs0), snapshot("snap-2", "state-2", cfs0, cfs1));
         final var shard = commit("state-3", cfs0, cfs1, file("_2.cfs", 500, 13, randomWriterUuid()));
         final var outdated = baseline(beforeDeletion, shard);
-        // snap-2, the only snapshot with _1.cfs, is deleted after the baseline was built
+        // After the baseline was built, snap-2 is deleted. It was the only snapshot with _1.cfs.
         final var afterDeletion = beforeDeletion.withRetainedSnapshots(Set.of(new SnapshotId("snap-1", randomUUID())));
 
+        // The snapshot would now upload _1.cfs again, as well as the new _2.cfs.
         assertThat(uploadedBytes(afterDeletion, shard), equalTo(2500L));
-        // this is why the caller must not use a baseline built from metadata that has changed since
+        // The outdated baseline still has _1.cfs, so it counts only _2.cfs, less than the snapshot would upload. This is why the
+        // caller must build a new baseline whenever the shard-level metadata changes.
         final var metadata = Map.of("_0.cfs", cfs0, "_1.cfs", cfs1);
         assertThat(ShardBacklog.bytesToUpload(outdated, "state-3", luceneFiles(shard), metadata), equalTo(500L));
+        // A new baseline counts the right amount.
         assertBacklog(afterDeletion, shard, 2500);
     }
 
@@ -211,11 +212,12 @@ public class ShardBacklogTests extends ESTestCase {
             snapshot("snap-1", "history-1-na-5", cfs0),
             snapshot("snap-2", "history-1-na-9", file("_1.cfs", 2000, 12, randomWriterUuid()))
         );
-        // snap-1 restored: its files again, under a new history
+        // snap-1 is restored. The shard has snap-1's files again, but a restore starts a new history, so the state id is new.
         final var restored = commit("history-2-na-5", cfs0);
 
         assertBacklog(repository, restored, 0);
-        // a new file after the restore gets the name and length of a file of snap-2, but it is another file
+        // After the restore, a new file gets the name and length of snap-2's _1.cfs. Its writer uuid is different, so it is
+        // another file, and the backlog counts it.
         assertBacklog(repository, restored, commit("history-2-na-7", cfs0, file("_1.cfs", 2000, 12, randomWriterUuid())), 2000);
     }
 
@@ -228,7 +230,8 @@ public class ShardBacklogTests extends ESTestCase {
 
     public void testACommitWithoutStateIdComparesTheFiles() {
         final var cfs = file("_0.cfs", 1000, 11, randomWriterUuid());
-        // a snapshot taken while the shard was not in a steady state has no state id either
+        // The shard has no state id, because writes are in flight. snap-1 was also taken during writes, so it has none either.
+        // With no state id to match, the backlog compares files.
         final var repository = repository(snapshot("snap-1", null, cfs));
 
         assertBacklog(repository, commit(null, cfs, file("_1.cfs", 2000, 12, randomWriterUuid())), 2000);
@@ -238,7 +241,8 @@ public class ShardBacklogTests extends ESTestCase {
         final var repository = repository(
             snapshot("snap-1", "state-1", file("_0.cfs", 1000, 11, randomWriterUuid()), file("_0.cfe", 100, 12, randomWriterUuid()))
         );
-        // the new index starts again from _0, with files of the same names and maybe the same lengths, but other contents
+        // The index is deleted and created again under the same name. The new index starts again from _0, so its files have the
+        // same names, and here the same lengths, but other contents. The backlog counts them.
         final var recreated = commit("state-2", file("_0.cfs", 1000, 21, randomWriterUuid()), file("_0.cfe", 100, 22, NO_WRITER_UUID));
 
         assertBacklog(repository, recreated, 1100);
@@ -268,14 +272,16 @@ public class ShardBacklogTests extends ESTestCase {
         final var cfs = file("_1.cfs", 1000, 11, randomWriterUuid());
         final var repository = repository(snapshot("snap-1", null, inlinedFile("_0.si"), inlinedFile("segments_2")));
 
-        // new and changed .si and segments_N files are written into the shard-level metadata, never uploaded
+        // A snapshot keeps the contents of .si and segments_N files in the shard-level metadata, instead of uploading them. So
+        // they are never counted, new or changed. Only _1.cfs is counted.
         assertBacklog(repository, commit(null, inlinedFile("_0.si"), inlinedFile("_1.si"), inlinedFile("segments_3"), cfs), 1000);
     }
 
     public void testAFileOfAnyRetainedSnapshotMatches() {
         final var older = file("_0.cfs", 1000, 11, randomWriterUuid());
         final var newer = file("_0.cfs", 1000, 12, randomWriterUuid());
-        // the index was deleted and created again between the two snapshots, so the repository has two files named _0.cfs
+        // The index was deleted and created again between the two snapshots, so the repository has two different files named
+        // _0.cfs. A file that matches either of them is not counted.
         final var repository = repository(snapshot("snap-1", null, older), snapshot("snap-2", null, newer));
 
         assertBacklog(repository, commit(null, older), 0);
@@ -292,7 +298,9 @@ public class ShardBacklogTests extends ESTestCase {
                 inlinedFile("_0.si")
             )
         );
-        // the checksum is needed whatever the writer uuids, since isSame decides
+        // This file has the name and length of a repository file, so the backlog needs its checksum to compare them, with or
+        // without a writer uuid. Its checksum is different, so it is counted. The other files have another length or a new name,
+        // so they are counted without a checksum. _0.si is kept in the metadata, so it needs no checksum and is not counted.
         final var sameNameAndLength = file("_0.cfs", 1000, 21, randomFrom(randomWriterUuid(), NO_WRITER_UUID));
         final var commit = commit(
             null,
@@ -331,7 +339,7 @@ public class ShardBacklogTests extends ESTestCase {
 
     public void testABaselineIsForItsCommitAndTheLaterOnes() {
         final var merged = file("_2.cfs", 3000, 13, randomWriterUuid());
-        // _0.cfs and _1.cfs were merged into _2.cfs after the first snapshot
+        // After the first snapshot, _0.cfs and _1.cfs were merged into _2.cfs.
         final var repository = repository(
             snapshot("snap-1", null, file("_0.cfs", 1000, 11, randomWriterUuid()), file("_1.cfs", 2000, 12, randomWriterUuid())),
             snapshot("snap-2", null, merged)
@@ -339,18 +347,23 @@ public class ShardBacklogTests extends ESTestCase {
         final var baselineCommit = commit(null, merged);
 
         assertBacklog(repository, baselineCommit, baselineCommit, 0);
+        // The baseline built for that commit also counts a later commit right, as long as the shard-level metadata is the same.
         assertBacklog(repository, baselineCommit, commit(null, merged, file("_3.cfs", 500, 14, randomWriterUuid())), 500);
     }
 
     public void testARepositoryWithoutWriterUuidsCanCountAFileTheSnapshotWouldReuse() {
-        // files recorded by a version before 7.16, which kept no writer uuids; serverless repositories are all newer than that
+        // These files were recorded by a version before 7.16, which kept no writer uuids. Serverless repositories are all newer
+        // than that.
         final var repository = repository(
             snapshot("snap-1", null, file("_0.cfs", 1000, 11, NO_WRITER_UUID), file("_1.cfs", 2000, 12, NO_WRITER_UUID))
         );
-        // the index is created again under the same name, and the baseline for its first commit leaves out the old _1.cfs
+        // The index is created again under the same name. Its first commit has only _0.cfs, so the baseline leaves out the old
+        // _1.cfs.
         final var newCfs = file("_0.cfs", 500, 21, randomWriterUuid());
         final var baseline = baseline(repository, commit(null, newCfs));
-        // by chance its new _1.cfs has the length and checksum of the old one, which the snapshot would then reuse
+        // Later, by chance, the new _1.cfs has the length and checksum of the old one. The old file has no writer uuid, so isSame
+        // can't tell the two files apart, and the snapshot reuses the old file. The baseline no longer has it, so the backlog
+        // counts it: 2500 instead of 500.
         final var later = commit(null, newCfs, file("_1.cfs", 2000, 12, randomWriterUuid()));
 
         assertThat(uploadedBytes(repository, later), equalTo(500L));
@@ -363,14 +376,15 @@ public class ShardBacklogTests extends ESTestCase {
      * stays the same when only the files change, as after a merge. A snapshot taken, or a commit checked, before the shard settled has
      * no state id. Some histories clone older snapshots, and some snapshots are removed as retention does. After every step, and against
      * the shard-level metadata read back at the end, the backlog must never be below what the snapshot would upload, and must equal it
-     * unless the latest state id came from a clone.
+     * unless the latest state id came from a clone. The test also records snapshots without a state id when the shard has settled,
+     * which serverless doesn't do. That only makes the test stricter.
      */
     public void testRandomHistoriesMatchWhatTheSnapshotWouldUpload() throws IOException {
         final var versions = randomFileVersions();
         final Set<String> clones = new HashSet<>();
         final List<SnapshotId> snapshotIds = new ArrayList<>();
         var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
-        // snapshot names are never reused, even after retention removed the snapshot
+        // Snapshot names are never reused, even after retention removed the snapshot.
         int names = 0;
         int writes = 0;
         var live = new Commit(stateIdAfterWrites(writes), randomFiles(versions));
@@ -418,15 +432,16 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * Commits as Lucene writes them and a snapshot reads them ({@link Store.MetadataSnapshot#loadFromIndexCommit}), with deletes and
-     * merges, and then an index created again under the same file names. As on a node, the baseline is built for the first commit of
-     * each index and again after each snapshot, and then used for the later commits until the next snapshot. The first index never
-     * gives a later file the name of a file the baseline left out; the recreated one does, as it reaches the old index's names. Also
-     * checks what {@link ShardBacklog} assumes of such commits: only the files it leaves out by name have a hash.
+     * Uses real Lucene commits, with deletes and merges, read the way a snapshot reads them
+     * ({@link Store.MetadataSnapshot#loadFromIndexCommit}). After the first index, the index is created again and reuses the same file
+     * names. As a node would, the test builds a baseline for the first commit of each index and again after each snapshot, and uses it
+     * for the later commits until the next snapshot. The first index never gives a new file the name of a file the baseline left out.
+     * The recreated index does, because it starts again from the same names. The test also checks an assumption of
+     * {@link ShardBacklog}: only the files it leaves out by name, the .si and segments_N files, have a hash.
      */
     public void testLuceneCommitsMatchWhatTheSnapshotWouldUpload() throws IOException {
         var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
-        // both indices use the same file format, so that their file names can be the same
+        // Both indices use the same file format, compound or not, so that the recreated index can reach the same file names.
         final boolean useCompoundFile = randomBoolean();
         final int recreateAt = between(2, 6);
         boolean reusedALeftOutName = false;
@@ -446,15 +461,16 @@ public class ShardBacklogTests extends ESTestCase {
                         if (randomBoolean()) {
                             writer.deleteDocuments(new Term("id", Integer.toString(between(0, docs - 1))));
                         }
-                        // the first index keeps its segments, so that the recreated one reaches their names
+                        // Only the recreated index is sometimes force merged. The first index keeps its segments, so that the recreated
+                        // index can reach their file names.
                         if (index == 1 && rarely()) {
                             writer.forceMerge(1);
                         }
                         writer.commit();
                         final var files = new ArrayList<StoreFileMetadata>();
                         for (StoreFileMetadata file : Store.MetadataSnapshot.loadFromIndexCommit(null, directory, logger)) {
-                            // what ShardBacklog and its caller rely on: the files it leaves out by name are exactly those kept
-                            // as their hash, and the others have no hash
+                            // ShardBacklog relies on this: the files it leaves out by name, .si and segments_N, are exactly the
+                            // files whose contents are kept as their hash, and the other files have no hash.
                             final boolean inlined = Store.MetadataSnapshot.isReadAsHash(file.name());
                             assertThat(file.name(), file.hashEqualsContents(), equalTo(inlined));
                             assertThat(file.name(), file.hash().length == 0, equalTo(inlined == false));
@@ -522,10 +538,14 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * Checks a baseline built for one commit, used for that commit or a later one, against the snapshot's own matching
-     * ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}). It must ask for the checksums of exactly the files that have a
-     * kept repository file of the same name, and given only those, it must never count less than the snapshot would upload, and
-     * exactly as much if {@code exact}.
+     * Checks the backlog against what the snapshot would upload. The baseline is built for {@code baselineCommit} and used for
+     * {@code commit}, which is the same commit or a later one. Two things are checked:
+     * <ul>
+     *     <li>The backlog asks for the checksums of exactly the files it needs to compare, as worked out by
+     *     {@link #expectedFilesNeedingChecksum}.</li>
+     *     <li>Given the checksums of only those files, it never counts less than the snapshot would upload, and if {@code exact}, it
+     *     counts exactly as much.</li>
+     * </ul>
      */
     private static void assertAgainstWhatTheSnapshotWouldUpload(
         BlobStoreIndexShardSnapshots snapshots,
@@ -555,9 +575,9 @@ public class ShardBacklogTests extends ESTestCase {
     // and consider moving this decision into BlobStoreRepository so that production and these tests share one copy.
 
     /**
-     * The shard-level metadata after a snapshot of the commit, as {@code BlobStoreRepository#doSnapshotShard} writes it: the files of
-     * the snapshot with the same state id, or else for each file the one the repository has ({@link
-     * BlobStoreIndexShardSnapshots#findPhysicalIndexFile}) or a new one.
+     * The shard-level metadata after a snapshot of the commit, as {@code BlobStoreRepository#doSnapshotShard} writes it. If a snapshot
+     * has the commit's state id, the new snapshot reuses that snapshot's files. Otherwise, for each file of the commit, it reuses the
+     * repository's copy if there is one ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}), and uploads the file if not.
      */
     private static BlobStoreIndexShardSnapshots snapshotShard(BlobStoreIndexShardSnapshots snapshots, String name, Commit commit) {
         List<FileInfo> files = null;
@@ -582,9 +602,9 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * What {@code BlobStoreRepository#doSnapshotShard} uploads for the commit: nothing if a snapshot has the commit's state id, else the
-     * files the repository does not have ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}) and whose contents are not their
-     * hash.
+     * The bytes {@code BlobStoreRepository#doSnapshotShard} would upload for the commit. If a snapshot has the commit's state id, that
+     * is nothing. Otherwise it is the files the repository doesn't have ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}),
+     * leaving out the .si and segments_N files, whose contents go into the metadata instead.
      */
     private static long uploadedBytes(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
         if (commit.stateId() != null) {
@@ -604,9 +624,16 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * The commit files a snapshot would upload unless the repository holds them, and whose name the repository has a file of, among the
-     * files with the name and length of a file of the commit the baseline was built for. None if the latest snapshot with a state id
-     * has the commit's.
+     * The files whose checksums the backlog should ask for, worked out independently of {@link ShardBaseline}. If the latest snapshot
+     * with a state id has the commit's state id, there are none. Otherwise they are the commit's files that meet all three of these
+     * conditions:
+     * <ul>
+     *     <li>The file is not a .si or segments_N file.</li>
+     *     <li>The repository has a file of the same name.</li>
+     *     <li>That repository file has the same length as the file of that name in the commit the baseline was built for.</li>
+     * </ul>
+     * The length of the file in the current commit isn't compared. Within one index, a file name always refers to the same file, so
+     * that length is the same as in the baseline's commit.
      */
     private static List<LuceneFile> expectedFilesNeedingChecksum(
         BlobStoreIndexShardSnapshots snapshots,
@@ -668,14 +695,15 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * The commit as checked or snapshotted: with its state id if the shard has settled, without one if not.
+     * Returns the commit as it is or without its state id, at random. A shard has no state id while writes are in flight, so the
+     * backlog must also be right for a commit without one.
      */
     private static Commit maybeWithoutStateId(Commit commit) {
         return randomBoolean() ? commit : new Commit(null, commit.files());
     }
 
     /**
-     * The names of the files the repository holds that the commit does not have, which a baseline for the commit leaves out.
+     * The names of the repository's files that the commit doesn't have. A baseline built for the commit leaves these files out.
      */
     private static Set<String> leftOutNames(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
         final Set<String> names = new HashSet<>();
@@ -693,8 +721,8 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * The shard-level metadata as a node reads it from the repository, written with or without writer uuids as repositories of older
-     * versions are.
+     * The shard-level metadata as a node reads it back from the repository. It is written either with writer uuids, or without them as
+     * a version before 7.16 would write it.
      */
     static BlobStoreIndexShardSnapshots readBack(BlobStoreIndexShardSnapshots snapshots) throws IOException {
         try (var out = new BytesStreamOutput()) {
@@ -714,9 +742,10 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * A few file names, each with one to three versions as an index deleted and created again has. The versions of a name often have
-     * the same length and checksum, and sometimes no writer uuid, so that only the rest of {@link StoreFileMetadata#isSame} tells them
-     * apart. Each writer uuid is used by one version only: equal writer uuids mean equal files.
+     * A few file names, each with one to three versions, as when an index is deleted and created again under the same name. The
+     * versions of one name often have the same length and checksum, and sometimes no writer uuid, so that only the remaining checks
+     * of {@link StoreFileMetadata#isSame} tell them apart. Each writer uuid belongs to one version only, so equal writer uuids mean
+     * equal files.
      */
     private static Map<String, List<StoreFileMetadata>> randomFileVersions() {
         final Map<String, List<StoreFileMetadata>> versions = new HashMap<>();
@@ -755,8 +784,9 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * A file whose contents a snapshot keeps inside the shard-level metadata: its hash is its contents, which end with a Lucene footer
-     * that has its checksum, as {@link Store.MetadataSnapshot#loadFromIndexCommit} reads them.
+     * A .si or segments_N file, whose contents a snapshot keeps inside the shard-level metadata instead of uploading the file. The
+     * hash holds the file's contents, which end with a Lucene footer containing the checksum, the same way
+     * {@link Store.MetadataSnapshot#loadFromIndexCommit} reads such a file.
      */
     private static StoreFileMetadata inlinedFile(String name, BytesRef writerUuid) {
         assert Store.MetadataSnapshot.isReadAsHash(name) : name;

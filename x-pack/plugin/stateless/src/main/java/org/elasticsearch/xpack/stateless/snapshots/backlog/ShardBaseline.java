@@ -94,8 +94,8 @@ final class ShardBaseline implements Accountable {
     private static final long SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(ShardBaseline.class);
     private static final long STORE_FILE_METADATA_SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(StoreFileMetadata.class);
     private static final long BYTES_REF_SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(BytesRef.class);
-    // Map.copyOf puts each key and value in its own slot of one array, and keeps that array half empty
-    // (a JDK detail; the memory test would catch a change)
+    // Map.copyOf puts each key and value in its own slot of one array, and keeps that array half empty, so each entry takes four
+    // slots. This is a JDK detail. If it changes, the memory test fails.
     private static final long MAP_SLOTS_PER_ENTRY = 4;
 
     static final ShardBaseline EMPTY = of(BlobStoreIndexShardSnapshots.EMPTY, List.of());
@@ -130,20 +130,20 @@ final class ShardBaseline implements Accountable {
      * @param currentFiles the files of the shard's latest commit
      */
     static ShardBaseline of(BlobStoreIndexShardSnapshots snapshots, Collection<LuceneFile> currentFiles) {
-        // the name and length of each file a snapshot would look for in the repository. It never looks for the .si and segments_N
-        // files, because it stores their contents in the metadata itself
+        // The name and length of each file a snapshot would look for in the repository. It never looks for .si and segments_N
+        // files, because it keeps their contents in the metadata itself.
         final Map<String, Long> currentFileLengths = new HashMap<>();
         for (LuceneFile file : currentFiles) {
             if (isStoredInBackupMetadata(file) == false) {
                 currentFileLengths.put(file.name(), file.length());
             }
         }
-        // keep a backed-up file only if it has the same name and length as one of the shard's files, since isSame never matches a
-        // file a snapshot uploads with one of another length. Keep it once: all the snapshots that share a file refer to the same blob
+        // Keep a backed-up file only if it has the same name and length as one of the shard's files, since isSame never matches
+        // files of different lengths. Keep it once, since all the snapshots that share a file refer to the same blob.
         final Set<String> seenBlobNames = new HashSet<>();
         final Map<String, List<StoreFileMetadata>> backedUpFilesByName = new HashMap<>();
         String latestStateId = null;
-        // snapshots are listed in the order they were taken, so the last state id we see is the newest
+        // Snapshots are listed in the order they were taken, so the last state id we see is the newest.
         for (SnapshotFiles snapshot : snapshots) {
             if (snapshot.shardStateIdentifier() != null) {
                 latestStateId = snapshot.shardStateIdentifier();
@@ -211,12 +211,12 @@ final class ShardBaseline implements Accountable {
             bytes += sizeOfCollection(files, files.size());
             for (StoreFileMetadata file : files) {
                 bytes += STORE_FILE_METADATA_SHALLOW_SIZE;
-                // the map's key is one of these names, so it isn't counted again
+                // The map's key is the same String as one of these names, so it isn't counted again.
                 bytes += RamUsageEstimator.sizeOf(file.name());
                 bytes += RamUsageEstimator.sizeOf(file.checksum());
                 bytes += RamUsageEstimator.sizeOf(file.writtenBy());
                 bytes += sizeOf(file.hash());
-                // files without a writer uuid all share the same empty one
+                // Files without a writer uuid all share one empty value, so it isn't counted for each file.
                 if (file.writerUuid() != StoreFileMetadata.UNAVAILABLE_WRITER_UUID) {
                     bytes += sizeOf(file.writerUuid());
                 }

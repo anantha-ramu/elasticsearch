@@ -55,7 +55,7 @@ final class ShardBacklog {
         }
         final List<LuceneFile> needingChecksum = new ArrayList<>();
         for (LuceneFile file : currentFiles) {
-            // the baseline never has .si or segments_N files, so those never need a checksum
+            // The baseline never has .si or segments_N files, so those never need a checksum.
             if (baseline.hasFileNamed(file.name())) {
                 needingChecksum.add(file);
             }

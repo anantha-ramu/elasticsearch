@@ -45,7 +45,7 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     @Override
     protected Accountable createRandomTestInstance() {
         final List<FileInfo> files = randomBackedUpFiles(0, between(0, 50));
-        // some files of an index created again under the same name
+        // Add files with the same names as some earlier files, as from an index created again under the same name.
         for (FileInfo file : randomSubsetOf(files)) {
             files.add(new FileInfo("__" + UUIDs.randomBase64UUID(random()), metadata(file.physicalName(), randomWriterUuid()), null));
         }
@@ -64,7 +64,7 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         final var oneSnapshot = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-0", files, stateId));
         var manySnapshots = oneSnapshot;
         for (int i = between(1, 400); i > 0; i--) {
-            // an idle shard: every snapshot has the same files and state id
+            // An idle shard: every snapshot has the same files and the same state id.
             manySnapshots = manySnapshots.withAddedSnapshot(new SnapshotFiles("snap-" + i, files, stateId));
         }
 
@@ -89,11 +89,12 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
 
     public void testOnlyTheLatestStateIdIsKept() {
         final List<FileInfo> files = randomBackedUpFiles(0, between(1, 50));
-        // the latest after a force merge, so that its state id is longer than the others and keeping any other one costs less
+        // The latest snapshot was taken after a force merge, so its state id has a force merge id and is longer than the others.
+        // If the baseline kept any other state id, it would cost less, and the test would fail.
         final var latest = new SnapshotFiles("snap-latest", files, stateId(true));
         var manySnapshots = BlobStoreIndexShardSnapshots.EMPTY;
         for (int i = between(1, 400); i > 0; i--) {
-            // a shard written to between snapshots: a new state id each time
+            // The shard is written to between snapshots, so each snapshot has a new state id.
             manySnapshots = manySnapshots.withAddedSnapshot(new SnapshotFiles("snap-" + i, files, stateId(false)));
         }
         manySnapshots = manySnapshots.withAddedSnapshot(latest);
@@ -106,7 +107,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
 
     public void testFilesOfTheSameNameAndAnotherLengthCostNothing() {
         final List<FileInfo> current = randomBackedUpFiles(0, between(1, 50));
-        // files of an earlier copy of the index, deleted and created again under the same name
+        // Files with the same names and other lengths, from an earlier copy of the index that was deleted and created again under
+        // the same name.
         final List<FileInfo> earlier = new ArrayList<>();
         for (FileInfo file : current) {
             earlier.add(
@@ -161,8 +163,9 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     /**
-     * Files as a shard has them, named from {@code _<first>} on: names of about 6 to 45 characters, the longer ones of per-field
-     * formats, and the files of a segment sharing its writer uuid.
+     * Random backed-up files, named {@code _<first>}, {@code _<first + 1>} and so on, with an extension. The names are about 6 to 45
+     * characters long, since per-field formats add long suffixes. Neighbouring files often share a writer uuid, as the files of one
+     * segment do.
      */
     private static List<FileInfo> randomBackedUpFiles(int first, int count) {
         final List<FileInfo> files = new ArrayList<>(count);
@@ -203,7 +206,7 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     /**
-     * As a node reads the shard-level metadata from the repository.
+     * Reads the shard-level metadata back the way a node reads it from the repository.
      */
     private static BlobStoreIndexShardSnapshots readBack(BlobStoreIndexShardSnapshots snapshots) {
         try {
@@ -214,7 +217,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     /**
-     * As {@code SnapshotShardsService#getShardStateId}: history uuid, force merge uuid ("na" if none) and max seq no.
+     * A random state id in the format of {@code SnapshotShardsService#getShardStateId}: history uuid, force merge uuid ("na" if there
+     * is none) and max seq no.
      */
     private static String randomStateId() {
         return stateId(randomBoolean());
