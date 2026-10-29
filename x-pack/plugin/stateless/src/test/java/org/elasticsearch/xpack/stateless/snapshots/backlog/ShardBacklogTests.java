@@ -488,6 +488,10 @@ public class ShardBacklogTests extends ESTestCase {
         );
     }
 
+    // TODO: snapshotShard and uploadedBytes copy the decision logic of BlobStoreRepository#doSnapshotShard around the server's own
+    // methods. When the backlog is tracked on index nodes, add an integration test that compares it with what real snapshots upload,
+    // and consider moving this decision into BlobStoreRepository so that production and these tests share one copy.
+
     /**
      * The shard-level metadata after a snapshot of the commit, as {@code BlobStoreRepository#doSnapshotShard} writes it: the files of
      * the snapshot with the same state id, or else for each file the one the repository has ({@link
