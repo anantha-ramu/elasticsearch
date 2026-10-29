@@ -70,7 +70,7 @@ import java.util.Set;
  *     match.</li>
  *     <li><b>An index is deleted and created again under the same name.</b> This works like a restore: the same folder in the
  *     repository, but a new history. Its new files can reuse old names, but they have new writer uuids, so they don't match. (Every
- *     serverless repository records writer uuids, as every repository written by Elasticsearch 7.16 or later does.)</li>
+ *     serverless repository records writer uuids, as Elasticsearch has for every file it backed up since 7.16.)</li>
  *     <li><b>A primary relocates or fails over</b> in stateless. The history stays the same, the new primary starts from the latest
  *     uploaded commit, and no snapshot is of a newer commit.</li>
  *     <li><b>The index is resharded.</b> Each new shard gets its own folder in the repository, and any files an earlier index of the
@@ -78,7 +78,8 @@ import java.util.Set;
  *     documents that moved.</li>
  * </ul>
  * With an up-to-date baseline, there is one known case in serverless where the backlog counts more than the snapshot would upload,
- * and none where it counts less. (A repository last written before Elasticsearch 7.16 would add another, which a test pins down.)
+ * and none where it counts less. (A repository with files backed up before Elasticsearch 7.16 would add another, which a test pins
+ * down.)
  * <ul>
  *     <li><b>An older snapshot is cloned.</b> The clone copies the old snapshot's state id to the end of the list, so we no longer
  *     keep the newest one. This only matters if the shard has had no new writes but a background merge rewrote its files: the

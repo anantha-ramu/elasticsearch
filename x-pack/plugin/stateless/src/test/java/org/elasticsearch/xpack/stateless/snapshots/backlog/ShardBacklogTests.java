@@ -269,8 +269,10 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     public void testARepositoryWithoutWriterUuidsCanCountAFileTheSnapshotWouldReuse() {
-        // These files were recorded by a version before 7.16, which kept no writer uuids. Serverless repositories are all newer
-        // than that.
+        // This can't happen in serverless, and is rare anywhere else. It needs two things at once: repository files backed up by
+        // a version before 7.16, which kept no writer uuids (every serverless repository is newer), and, by chance, two different
+        // files with the same name, length and checksum. The test pins down what the backlog does then: it counts too much, never
+        // too little.
         final var repository = repository(
             snapshot("snap-1", null, file("_0.cfs", 1000, 11, NO_WRITER_UUID), file("_1.cfs", 2000, 12, NO_WRITER_UUID))
         );
