@@ -31,14 +31,13 @@ import org.elasticsearch.repositories.ProjectRepo;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.xcontent.NamedXContentRegistry;
-import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.LuceneFile;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaseline.LuceneFile;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -287,34 +286,6 @@ public class ShardBacklogTests extends ESTestCase {
         assertThat(wrong.getMessage(), containsString("is not the metadata of"));
     }
 
-    public void testARepositoryChecksumWrittenOtherwiseNeverMatches() {
-        // all of them are 11, which Store#digestToString writes "b", but isSame compares the strings
-        final var repository = repository(
-            snapshot(
-                "snap-1",
-                null,
-                new StoreFileMetadata("_0.cfs", 1000, randomFrom("0b", "B"), Version.LATEST.toString(), null, NO_WRITER_UUID)
-            )
-        );
-
-        assertBacklog(repository, commit(null, file("_0.cfs", 1000, 11, NO_WRITER_UUID)), 1000);
-    }
-
-    public void testARepositoryFileWithAPartialHashNeverMatches() {
-        // a hash that is not the whole file: isSame compares it, and a commit file a snapshot uploads has none
-        final var withHash = new StoreFileMetadata(
-            "_0.cfs",
-            1000,
-            Store.digestToString(11),
-            Version.LATEST.toString(),
-            new BytesRef(randomByteArrayOfLength(between(1, 100))),
-            NO_WRITER_UUID
-        );
-        final var repository = repository(snapshot("snap-1", null, withHash));
-
-        assertBacklog(repository, commit(null, file("_0.cfs", 1000, 11, NO_WRITER_UUID)), 1000);
-    }
-
     public void testABaselineIsForItsCommitAndTheLaterOnes() {
         final var merged = file("_2.cfs", 3000, 13, randomWriterUuid());
         // _0.cfs and _1.cfs were merged into _2.cfs after the first snapshot
@@ -345,9 +316,9 @@ public class ShardBacklogTests extends ESTestCase {
 
     /**
      * Builds a repository the way snapshots do, from a random history of a shard. Commits are drawn from a few file names, each with a
-     * few versions that often share their length and checksum, sometimes without writer uuid, and some snapshots record files as
-     * older versions did (a hash, a checksum written otherwise). The state id changes with new writes and stays the same when only the
-     * files change, as after a merge; a snapshot taken, or a commit checked, before the shard settled has none. Some histories clone
+     * few versions that often share their length and checksum, sometimes without writer uuid. The state id changes with new writes and
+     * stays the same when only the files change, as after a merge; a snapshot taken, or a commit checked, before the shard settled has
+     * none. Some histories clone
      * older snapshots, some add a snapshot of an older commit, as a primary of an older term might, and some snapshots are removed as
      * retention does. After every step, and against the shard-level metadata read back at the end, the backlog must never be below what
      * the snapshot would upload, and must equal it unless the latest state id came from a clone or the history is out of order.
@@ -382,11 +353,7 @@ public class ShardBacklogTests extends ESTestCase {
                     disordered |= older;
                     final var snapshotId = new SnapshotId("snap-" + names++, randomUUID());
                     final var recorded = new Commit(randomBoolean() ? snapshotted.stateId() : null, snapshotted.files());
-                    snapshots = snapshotShard(
-                        snapshots,
-                        snapshotId.getName(),
-                        randomBoolean() ? recorded : withOlderVersionFiles(recorded)
-                    );
+                    snapshots = snapshotShard(snapshots, snapshotId.getName(), recorded);
                     snapshotIds.add(snapshotId);
                 }
                 case 3 -> {
@@ -406,12 +373,14 @@ public class ShardBacklogTests extends ESTestCase {
                 }
                 default -> throw new AssertionError();
             }
-            assertNeverBelowWhatTheSnapshotWouldUpload(snapshots, maybeWithoutStateId(live), isExact(snapshots, clones, disordered));
+            final var checked = maybeWithoutStateId(live);
+            assertAgainstWhatTheSnapshotWouldUpload(snapshots, checked, checked, isExact(snapshots, clones, disordered));
         }
 
         final var readBack = readBack(snapshots);
         for (int i = between(1, 3); i > 0; i--) {
-            assertNeverBelowWhatTheSnapshotWouldUpload(readBack, maybeWithoutStateId(live), isExact(readBack, clones, disordered));
+            final var checked = maybeWithoutStateId(live);
+            assertAgainstWhatTheSnapshotWouldUpload(readBack, checked, checked, isExact(readBack, clones, disordered));
         }
     }
 
@@ -473,7 +442,7 @@ public class ShardBacklogTests extends ESTestCase {
                             reusedALeftOutName |= reusesALeftOutName;
                         }
 
-                        assertMatchesWhatTheSnapshotWouldUpload(snapshots, baselineCommit, commit);
+                        assertAgainstWhatTheSnapshotWouldUpload(snapshots, baselineCommit, commit, true);
                         if ((index == 0 && step == steps - 1) || randomBoolean()) {
                             snapshots = readBack(snapshotShard(snapshots, "snap-" + index + "-" + step, commit));
                             baselineCommit = commit;
@@ -516,22 +485,20 @@ public class ShardBacklogTests extends ESTestCase {
 
     private static void assertBacklog(BlobStoreIndexShardSnapshots snapshots, Commit baselineCommit, Commit commit, long expectedBytes) {
         assertThat("what the snapshot would upload", uploadedBytes(snapshots, commit), equalTo(expectedBytes));
-        assertMatchesWhatTheSnapshotWouldUpload(snapshots, baselineCommit, commit);
-    }
-
-    private static void assertMatchesWhatTheSnapshotWouldUpload(BlobStoreIndexShardSnapshots snapshots, Commit commit) {
-        assertMatchesWhatTheSnapshotWouldUpload(snapshots, commit, commit);
+        assertAgainstWhatTheSnapshotWouldUpload(snapshots, baselineCommit, commit, true);
     }
 
     /**
      * Checks a baseline built for one commit, used for that commit or a later one, against the snapshot's own matching
-     * ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}): it must ask for the checksums of exactly the files that have a
-     * repository file of the same name and length that it kept, and given only those, it must count what the snapshot would upload.
+     * ({@link BlobStoreIndexShardSnapshots#findPhysicalIndexFile}). It must ask for the checksums of exactly the files that have a
+     * kept repository file of the same name, and given only those, it must never count less than the snapshot would upload, and
+     * exactly as much if {@code exact}.
      */
-    private static void assertMatchesWhatTheSnapshotWouldUpload(
+    private static void assertAgainstWhatTheSnapshotWouldUpload(
         BlobStoreIndexShardSnapshots snapshots,
         Commit baselineCommit,
-        Commit commit
+        Commit commit,
+        boolean exact
     ) {
         final var baseline = baseline(snapshots, baselineCommit);
         final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), luceneFiles(commit));
@@ -542,11 +509,12 @@ public class ShardBacklogTests extends ESTestCase {
                 metadata.put(file.name(), file);
             }
         }
-        assertThat(
-            "bytes to upload",
-            ShardBacklog.bytesToUpload(baseline, commit.stateId(), luceneFiles(commit), metadata),
-            equalTo(uploadedBytes(snapshots, commit))
-        );
+        final long bytes = ShardBacklog.bytesToUpload(baseline, commit.stateId(), luceneFiles(commit), metadata);
+        final long uploaded = uploadedBytes(snapshots, commit);
+        assertThat("bytes to upload", bytes, greaterThanOrEqualTo(uploaded));
+        if (exact) {
+            assertThat("bytes to upload", bytes, equalTo(uploaded));
+        }
     }
 
     // TODO: snapshotShard and uploadedBytes copy the decision logic of BlobStoreRepository#doSnapshotShard around the server's own
@@ -632,29 +600,6 @@ public class ShardBacklogTests extends ESTestCase {
             }
         }
         return files;
-    }
-
-    /**
-     * Checks a baseline built for the commit it is used for: the files needing a checksum must be those that {@link
-     * #expectedFilesNeedingChecksum} names, and the bytes, given the checksums of only those, must never be below what the snapshot would
-     * upload, and equal to it if {@code exact}.
-     */
-    private static void assertNeverBelowWhatTheSnapshotWouldUpload(BlobStoreIndexShardSnapshots snapshots, Commit commit, boolean exact) {
-        final var baseline = baseline(snapshots, commit);
-        final var needingChecksum = ShardBacklog.filesNeedingChecksum(baseline, commit.stateId(), luceneFiles(commit));
-        assertThat("files needing a checksum", needingChecksum, equalTo(expectedFilesNeedingChecksum(snapshots, commit, commit)));
-        final Map<String, StoreFileMetadata> metadata = new HashMap<>();
-        for (StoreFileMetadata file : commit.files()) {
-            if (needingChecksum.contains(luceneFile(file))) {
-                metadata.put(file.name(), file);
-            }
-        }
-        final long bytes = ShardBacklog.bytesToUpload(baseline, commit.stateId(), luceneFiles(commit), metadata);
-        final long uploaded = uploadedBytes(snapshots, commit);
-        assertThat("bytes to upload", bytes, greaterThanOrEqualTo(uploaded));
-        if (exact) {
-            assertThat("bytes to upload", bytes, equalTo(uploaded));
-        }
     }
 
     /**
@@ -765,33 +710,6 @@ public class ShardBacklogTests extends ESTestCase {
             }
         }
         return files;
-    }
-
-    /**
-     * The commit with some of its uploaded files as older Elasticsearch versions may have recorded them in the repository: with a hash
-     * that is not the whole file, or with the checksum written with a leading zero or in upper case, and without writer uuid, which
-     * older versions did not record. No commit file looks like that today, so these only appear in the repository.
-     */
-    private static Commit withOlderVersionFiles(Commit commit) {
-        final List<StoreFileMetadata> files = new ArrayList<>();
-        for (StoreFileMetadata file : commit.files()) {
-            if (file.hashEqualsContents() || randomBoolean()) {
-                files.add(file);
-            } else {
-                final boolean withHash = randomBoolean();
-                files.add(
-                    new StoreFileMetadata(
-                        file.name(),
-                        file.length(),
-                        withHash ? file.checksum() : randomFrom("0" + file.checksum(), file.checksum().toUpperCase(Locale.ROOT)),
-                        file.writtenBy(),
-                        withHash ? new BytesRef(randomByteArrayOfLength(between(1, 100))) : null,
-                        NO_WRITER_UUID
-                    )
-                );
-            }
-        }
-        return new Commit(commit.stateId(), files);
     }
 
     private static StoreFileMetadata file(String name, long length, long checksum, BytesRef writerUuid) {

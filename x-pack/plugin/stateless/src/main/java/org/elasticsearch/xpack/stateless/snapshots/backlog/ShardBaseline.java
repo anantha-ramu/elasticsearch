@@ -15,8 +15,8 @@ import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
 import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
+import org.elasticsearch.index.store.Store;
 import org.elasticsearch.index.store.StoreFileMetadata;
-import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.LuceneFile;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -24,6 +24,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -99,6 +100,15 @@ final class ShardBaseline implements Accountable {
 
     static final ShardBaseline EMPTY = of(BlobStoreIndexShardSnapshots.EMPTY, List.of());
 
+    /**
+     * A Lucene file the shard has now, by name and length, before its checksum is read. A commit lists each name once.
+     */
+    record LuceneFile(String name, long length) {
+        LuceneFile {
+            Objects.requireNonNull(name);
+        }
+    }
+
     // the backed-up files, by file name; a file that several snapshots share is kept once
     private final Map<String, List<StoreFileMetadata>> backedUpFilesByName;
     @Nullable
@@ -124,7 +134,7 @@ final class ShardBaseline implements Accountable {
         // files, because it stores their contents in the metadata itself
         final Map<String, Long> currentFileLengths = new HashMap<>();
         for (LuceneFile file : currentFiles) {
-            if (ShardBacklog.isStoredInBackupMetadata(file) == false) {
+            if (isStoredInBackupMetadata(file) == false) {
                 currentFileLengths.put(file.name(), file.length());
             }
         }
@@ -180,6 +190,15 @@ final class ShardBaseline implements Accountable {
         return false;
     }
 
+    /**
+     * Whether a snapshot stores this file's contents inside the shard's backup metadata instead of uploading it, which is true for
+     * the {@code .si} and {@code segments_N} files. (The snapshot itself checks {@link StoreFileMetadata#hashEqualsContents}, which
+     * is true for exactly these files.)
+     */
+    static boolean isStoredInBackupMetadata(LuceneFile file) {
+        return Store.MetadataSnapshot.isReadAsHash(file.name());
+    }
+
     @Override
     public long ramBytesUsed() {
         return ramBytesUsed;
@@ -191,10 +210,12 @@ final class ShardBaseline implements Accountable {
         for (List<StoreFileMetadata> files : backedUpFilesByName.values()) {
             bytes += sizeOfCollection(files, files.size());
             for (StoreFileMetadata file : files) {
+                bytes += STORE_FILE_METADATA_SHALLOW_SIZE;
                 // the map's key is one of these names, so it isn't counted again
-                bytes += STORE_FILE_METADATA_SHALLOW_SIZE + RamUsageEstimator.sizeOf(file.name()) + RamUsageEstimator.sizeOf(
-                    file.checksum()
-                ) + RamUsageEstimator.sizeOf(file.writtenBy()) + sizeOf(file.hash());
+                bytes += RamUsageEstimator.sizeOf(file.name());
+                bytes += RamUsageEstimator.sizeOf(file.checksum());
+                bytes += RamUsageEstimator.sizeOf(file.writtenBy());
+                bytes += sizeOf(file.hash());
                 // files without a writer uuid all share the same empty one
                 if (file.writerUuid() != StoreFileMetadata.UNAVAILABLE_WRITER_UUID) {
                     bytes += sizeOf(file.writerUuid());
@@ -210,9 +231,10 @@ final class ShardBaseline implements Accountable {
      * that way, and without it a very small baseline would come out below the test's figure.
      */
     private static long sizeOfCollection(Object collection, long references) {
-        return RamUsageEstimator.shallowSizeOf(collection) + RamUsageEstimator.NUM_BYTES_ARRAY_HEADER + RamUsageEstimator.alignObjectSize(
+        final long table = RamUsageEstimator.alignObjectSize(
             RamUsageEstimator.NUM_BYTES_ARRAY_HEADER + references * RamUsageEstimator.NUM_BYTES_OBJECT_REF
         );
+        return RamUsageEstimator.shallowSizeOf(collection) + table + RamUsageEstimator.NUM_BYTES_ARRAY_HEADER;
     }
 
     private static long sizeOf(BytesRef bytesRef) {

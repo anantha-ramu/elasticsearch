@@ -19,7 +19,7 @@ import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.index.store.Store;
 import org.elasticsearch.index.store.StoreFileMetadata;
 import org.elasticsearch.test.AbstractAccountableFieldsTestCase;
-import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.LuceneFile;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaseline.LuceneFile;
 
 import java.io.IOException;
 import java.util.ArrayList;

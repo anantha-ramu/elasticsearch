@@ -10,12 +10,12 @@ package org.elasticsearch.xpack.stateless.snapshots.backlog;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.store.Store;
 import org.elasticsearch.index.store.StoreFileMetadata;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaseline.LuceneFile;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 
 /**
  * Works out how many bytes the next snapshot of a shard would upload, using the same rules as the snapshot itself
@@ -24,7 +24,7 @@ import java.util.Objects;
  * <ul>
  *     <li>if the shard hasn't changed since the latest snapshot (the same state id), nothing is uploaded;</li>
  *     <li>otherwise every file the repository doesn't already have is uploaded, except the {@code .si} and {@code segments_N} files,
- *     whose contents a snapshot stores in the metadata itself ({@link Store.MetadataSnapshot#isReadAsHash}).</li>
+ *     whose contents a snapshot stores in the metadata itself ({@link ShardBaseline#isStoredInBackupMetadata}).</li>
  * </ul>
  * Nothing is read here. Checking whether a file is already backed up needs its checksum, which means reading the end of the file, so
  * this works in two steps: {@link #filesNeedingChecksum} says which files need one, the caller reads just those, and
@@ -39,15 +39,6 @@ import java.util.Objects;
 final class ShardBacklog {
 
     private ShardBacklog() {}
-
-    /**
-     * A Lucene file the shard has now, by name and length, before its checksum is read. A commit lists each name once.
-     */
-    record LuceneFile(String name, long length) {
-        LuceneFile {
-            Objects.requireNonNull(name);
-        }
-    }
 
     /**
      * @param currentStateId the shard's state id as a snapshot would work it out ({@code SnapshotShardsService#getShardStateId}),
@@ -91,7 +82,7 @@ final class ShardBacklog {
         }
         long bytes = 0;
         for (LuceneFile file : currentFiles) {
-            if (isStoredInBackupMetadata(file)) {
+            if (ShardBaseline.isStoredInBackupMetadata(file)) {
                 continue;
             }
             if (baseline.hasFileNamed(file.name())) {
@@ -109,14 +100,5 @@ final class ShardBacklog {
             bytes += file.length();
         }
         return bytes;
-    }
-
-    /**
-     * Whether a snapshot stores this file's contents inside the shard's backup metadata instead of uploading it, which is true for
-     * the {@code .si} and {@code segments_N} files. (The snapshot itself checks {@link StoreFileMetadata#hashEqualsContents}, which
-     * is true for exactly these files.)
-     */
-    static boolean isStoredInBackupMetadata(LuceneFile file) {
-        return Store.MetadataSnapshot.isReadAsHash(file.name());
     }
 }
