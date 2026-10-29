@@ -127,7 +127,7 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         );
     }
 
-    public void testFilesKeptInTheShardLevelMetadataAreLeftOut() {
+    public void testFilesKeptInTheBackupMetadataAreLeftOut() {
         final List<FileInfo> files = new ArrayList<>();
         for (String name : List.of("_0.si", "_1.si", "segments_2")) {
             files.add(new FileInfo("v__" + UUIDs.randomBase64UUID(random()), metadata(name, randomWriterUuid()), null));

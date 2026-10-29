@@ -89,24 +89,85 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     public void testACloneOfAnOlderSnapshotCountsUntilTheNextSnapshot() {
+        for (boolean originalDeleted : List.of(false, true)) {
+            final var repository = repositoryWithACloneOfAnOlderSnapshot(originalDeleted);
+            // merged since snap-2 without new writes: other files, the same state
+            final var merged = commit("state-2", file("_2.cfs", 3000, 13, randomWriterUuid()));
+
+            assertThat(uploadedBytes(repository, merged), equalTo(0L));
+            // the clone put state-1 last, so the backlog counts the merged file
+            assertThat(ShardBacklog.bytesToUpload(baseline(repository, merged), "state-2", luceneFiles(merged), Map.of()), equalTo(3000L));
+            // the next snapshot, taken once the shard has settled, takes the shortcut and puts state-2 last again
+            assertBacklog(snapshotShard(repository, "snap-3", merged), merged, 0);
+        }
+    }
+
+    public void testACloneOfAnOlderSnapshotIsAlsoFixedByASnapshotTakenMidWrite() {
+        for (boolean originalDeleted : List.of(false, true)) {
+            final var repository = repositoryWithACloneOfAnOlderSnapshot(originalDeleted);
+            final var merged = commit("state-2", file("_2.cfs", 3000, 13, randomWriterUuid()));
+            // the next snapshot is taken while writes are in flight: it records no state id, and uploads the merged file
+            final var afterNextSnapshot = snapshotShard(repository, "snap-3", new Commit(null, merged.files()));
+
+            // the clone's state-1 is still the last state id, but the merged file is now backed up, so comparing files is right
+            assertBacklog(afterNextSnapshot, merged, 0);
+        }
+    }
+
+    /**
+     * snap-1 (state-1) and snap-2 (state-2), then a clone of snap-1, which puts state-1 last. If {@code originalDeleted}, snap-1 is
+     * then deleted, as retention does, and keeps only the clone.
+     */
+    private static BlobStoreIndexShardSnapshots repositoryWithACloneOfAnOlderSnapshot(boolean originalDeleted) {
         final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
         final var cfs1 = file("_1.cfs", 2000, 12, randomWriterUuid());
-        var repository = repository(snapshot("snap-1", "state-1", cfs0), snapshot("snap-2", "state-2", cfs0, cfs1));
-        repository = repository.withClone("snap-1", "clone-1");
-        if (randomBoolean()) {
-            // the clone's original deleted, as retention does
-            repository = repository.withRetainedSnapshots(
+        final var repository = repository(snapshot("snap-1", "state-1", cfs0), snapshot("snap-2", "state-2", cfs0, cfs1)).withClone(
+            "snap-1",
+            "clone-1"
+        );
+        if (originalDeleted) {
+            return repository.withRetainedSnapshots(
                 Set.of(new SnapshotId("snap-2", randomUUID()), new SnapshotId("clone-1", randomUUID()))
             );
         }
-        // merged since snap-2 without new writes: other files, the same state
-        final var merged = commit("state-2", file("_2.cfs", 3000, 13, randomWriterUuid()));
+        return repository;
+    }
 
-        assertThat(uploadedBytes(repository, merged), equalTo(0L));
-        // the clone put state-1 last, so the backlog counts the merged file
-        assertThat(ShardBacklog.bytesToUpload(baseline(repository, merged), "state-2", luceneFiles(merged), Map.of()), equalTo(3000L));
-        // the next snapshot takes the shortcut and puts state-2 last again
-        assertBacklog(snapshotShard(repository, "snap-3", merged), merged, 0);
+    public void testADeletedSnapshotNoLongerCounts() {
+        final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
+        final var cfs1 = file("_1.cfs", 2000, 12, randomWriterUuid());
+        // snap-2, the latest snapshot and the only one with _1.cfs, is deleted
+        final var repository = repository(snapshot("snap-1", "state-1", cfs0), snapshot("snap-2", "state-2", cfs0, cfs1))
+            .withRetainedSnapshots(Set.of(new SnapshotId("snap-1", randomUUID())));
+
+        // the shard hasn't changed since snap-2, but its state id is gone with it, and so is the only backed-up copy of _1.cfs
+        assertBacklog(repository, commit("state-2", cfs0, cfs1), 2000);
+    }
+
+    public void testRepairedMetadataWithoutStateIdsComparesTheFiles() {
+        final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
+        // metadata rebuilt from the per-snapshot metadata files has no state ids at all
+        final var repository = repository(snapshot("snap-1", null, cfs0), snapshot("snap-2", null, cfs0));
+
+        // the shard has a state id but no snapshot does, so even a merge with no new writes counts the merged file
+        assertBacklog(repository, commit("state-2", file("_1.cfs", 3000, 13, randomWriterUuid())), 3000);
+        assertBacklog(repository, commit("state-2", cfs0), 0);
+    }
+
+    public void testABaselineBuiltBeforeADeletionCanCountTooLittle() {
+        final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
+        final var cfs1 = file("_1.cfs", 2000, 12, randomWriterUuid());
+        final var beforeDeletion = repository(snapshot("snap-1", "state-1", cfs0), snapshot("snap-2", "state-2", cfs0, cfs1));
+        final var shard = commit("state-3", cfs0, cfs1, file("_2.cfs", 500, 13, randomWriterUuid()));
+        final var outdated = baseline(beforeDeletion, shard);
+        // snap-2, the only snapshot with _1.cfs, is deleted after the baseline was built
+        final var afterDeletion = beforeDeletion.withRetainedSnapshots(Set.of(new SnapshotId("snap-1", randomUUID())));
+
+        assertThat(uploadedBytes(afterDeletion, shard), equalTo(2500L));
+        // this is why the caller must not use a baseline built from metadata that has changed since
+        final var metadata = Map.of("_0.cfs", cfs0, "_1.cfs", cfs1);
+        assertThat(ShardBacklog.bytesToUpload(outdated, "state-3", luceneFiles(shard), metadata), equalTo(500L));
+        assertBacklog(afterDeletion, shard, 2500);
     }
 
     public void testARestoredSnapshotMatchesByItsFiles() {
@@ -163,7 +224,7 @@ public class ShardBacklogTests extends ESTestCase {
         assertBacklog(repository, commit(null, file("_0.cfe", 100, 12, randomFrom(randomWriterUuid(), NO_WRITER_UUID))), 0);
     }
 
-    public void testFilesKeptInTheShardLevelMetadataAreNotCounted() {
+    public void testFilesKeptInTheBackupMetadataAreNotCounted() {
         final var cfs = file("_1.cfs", 1000, 11, randomWriterUuid());
         final var repository = repository(snapshot("snap-1", null, inlinedFile("_0.si"), inlinedFile("segments_2")));
 
