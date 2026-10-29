@@ -306,22 +306,26 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     public void testMissingOrWrongMetadataIsRejected() {
-        // The caller must pass the metadata of every file that filesNeedingChecksum asked for. Missing or wrong metadata is a bug in
-        // the caller, so the backlog fails instead of guessing.
         final var cfs = file("_0.cfs", 1000, 11, randomWriterUuid());
         final var repository = repository(snapshot("snap-1", null, cfs));
         final var commit = commit(null, cfs);
+        final var baseline = baseline(repository, commit);
+        // The repository has a file with the same name and length as the shard's _0.cfs, so the backlog asks the caller for the
+        // shard file's metadata, to compare checksums.
+        assertThat(ShardBacklog.filesNeedingChecksum(baseline, null, luceneFiles(commit)), equalTo(List.of(luceneFile(cfs))));
 
+        // Not passing that metadata is a bug in the caller, so the backlog fails instead of guessing.
         final var missing = expectThrows(
             IllegalArgumentException.class,
-            () -> ShardBacklog.bytesToUpload(baseline(repository, commit), null, luceneFiles(commit), Map.of())
+            () -> ShardBacklog.bytesToUpload(baseline, null, luceneFiles(commit), Map.of())
         );
         assertThat(missing.getMessage(), containsString("[_0.cfs]"));
 
+        // So is passing the metadata of another file, with another length or another name.
         final var otherFile = randomFrom(file("_0.cfs", 2000, 11, randomWriterUuid()), file("_1.cfs", 1000, 11, randomWriterUuid()));
         final var wrong = expectThrows(
             IllegalArgumentException.class,
-            () -> ShardBacklog.bytesToUpload(baseline(repository, commit), null, luceneFiles(commit), Map.of("_0.cfs", otherFile))
+            () -> ShardBacklog.bytesToUpload(baseline, null, luceneFiles(commit), Map.of("_0.cfs", otherFile))
         );
         assertThat(wrong.getMessage(), containsString("is not the metadata of"));
     }
