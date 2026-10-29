@@ -88,8 +88,10 @@ public class ShardBacklogTests extends ESTestCase {
             snapshot("snap-1", "state-1", file("_1.cfs", 2000, 12, randomWriterUuid()))
         ).withClone("snap-0", "clone-of-snap-0");
 
-        // There were no writes since snap-1, but a merge rewrote _1.cfs into _2.cfs, so no file name matches.
-        // Only the state id of snap-1, the latest snapshot that has one, can show that nothing needs uploading.
+        // The baseline skips snapshots without a state id, so the state id it keeps is state-1, from snap-1.
+        // There were no writes since snap-1, but a background merge rewrote _1.cfs into _2.cfs, for example to drop
+        // deleted documents, so no file name matches. (A force merge would change the state id.)
+        // The shard is still at state-1, so the backlog is 0 without comparing any files.
         assertBacklog(repository, commit("state-1", file("_2.cfs", 2000, 13, randomWriterUuid())), 0);
     }
 
@@ -117,6 +119,22 @@ public class ShardBacklogTests extends ESTestCase {
             // the clone's state-1 is still the last state id, but the merged file is now backed up, so comparing files is right
             assertBacklog(afterNextSnapshot, merged, 0);
         }
+    }
+
+    public void testACloneOfAnOlderSnapshotStopsMatteringOnceTheShardIsWrittenTo() {
+        final var cfs0 = file("_0.cfs", 1000, 11, randomWriterUuid());
+        final var cfs1 = file("_1.cfs", 2000, 12, randomWriterUuid());
+        // the clone of snap-1 puts state-1 last, as in testACloneOfAnOlderSnapshotCountsUntilTheNextSnapshot
+        final var repository = repository(snapshot("snap-1", "state-1", cfs0), snapshot("snap-2", "state-2", cfs0, cfs1)).withClone(
+            "snap-1",
+            "clone-1"
+        );
+        // New writes since snap-2 added the segment _2.cfs. The shard now has the state id state-3, or none while writes are
+        // still in flight. Either way it matches no snapshot, so the backlog and the snapshot both compare files, and the
+        // backlog counts exactly the new segment.
+        final var written = commit(randomBoolean() ? "state-3" : null, cfs0, cfs1, file("_2.cfs", 4000, 13, randomWriterUuid()));
+
+        assertBacklog(repository, written, 4000);
     }
 
     /**
