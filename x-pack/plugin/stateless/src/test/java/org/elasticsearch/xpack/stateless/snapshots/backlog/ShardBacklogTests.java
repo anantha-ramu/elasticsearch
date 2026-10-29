@@ -347,10 +347,9 @@ public class ShardBacklogTests extends ESTestCase {
 
         assertBacklog(repository, baselineCommit, baselineCommit, 0);
         // A node builds the baseline once and keeps using it for later commits, until the shard-level metadata (index-{gen})
-        // changes, for example after a snapshot, a clone or a deletion. A file the baseline left out never comes back as the same
-        // file. Within one index, Lucene never reuses a file name. After a restore, a reused name belongs to a new file with a new
-        // writer uuid (see testARestoredSnapshotMatchesByItsFiles), which the snapshot would upload too. So the baseline is still
-        // right for a later commit: here the new _3.cfs is counted, as the snapshot would count it.
+        // changes, for example after a snapshot, a clone or a deletion. Reusing it is safe here because _0.cfs and _1.cfs, the
+        // repository files the baseline left out, never come back: within one index, Lucene never reuses a file name. So a new
+        // file such as _3.cfs is counted, as the snapshot would count it.
         assertBacklog(repository, baselineCommit, commit(null, merged, file("_3.cfs", 500, 14, randomWriterUuid())), 500);
     }
 
