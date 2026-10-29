@@ -64,7 +64,8 @@ final class ShardBacklog {
         }
         final List<LuceneFile> needingChecksum = new ArrayList<>();
         for (LuceneFile file : currentFiles) {
-            if (snapshotUploads(file) && baseline.hasFileNamed(file.name())) {
+            // the baseline never has .si or segments_N files, so those never need a checksum
+            if (baseline.hasFileNamed(file.name())) {
                 needingChecksum.add(file);
             }
         }
@@ -90,7 +91,7 @@ final class ShardBacklog {
         }
         long bytes = 0;
         for (LuceneFile file : currentFiles) {
-            if (snapshotUploads(file) == false) {
+            if (isStoredInBackupMetadata(file)) {
                 continue;
             }
             if (baseline.hasFileNamed(file.name())) {
@@ -111,11 +112,11 @@ final class ShardBacklog {
     }
 
     /**
-     * Whether a snapshot would upload this file if the repository didn't already have it. It never uploads the {@code .si} and
-     * {@code segments_N} files, because it stores their contents in the metadata itself. (The snapshot checks
-     * {@link StoreFileMetadata#hashEqualsContents}, which is true for exactly these files.)
+     * Whether a snapshot stores this file's contents inside the shard's backup metadata instead of uploading it, which is true for
+     * the {@code .si} and {@code segments_N} files. (The snapshot itself checks {@link StoreFileMetadata#hashEqualsContents}, which
+     * is true for exactly these files.)
      */
-    private static boolean snapshotUploads(LuceneFile file) {
-        return Store.MetadataSnapshot.isReadAsHash(file.name()) == false;
+    static boolean isStoredInBackupMetadata(LuceneFile file) {
+        return Store.MetadataSnapshot.isReadAsHash(file.name());
     }
 }

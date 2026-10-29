@@ -15,7 +15,6 @@ import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
 import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
-import org.elasticsearch.index.store.Store;
 import org.elasticsearch.index.store.StoreFileMetadata;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBacklog.LuceneFile;
 
@@ -50,8 +49,8 @@ import java.util.Set;
  * old files with matching names and lengths, left behind when an index was deleted and recreated under the same name. Two rules make
  * this possible:
  * <ul>
- *     <li>Within one index, Lucene never reuses a file name and never changes a file once written. So a file that was merged away
- *     never comes back, and a file the shard keeps always has the same length.</li>
+ *     <li>Within one shard (each shard is its own Lucene index), Lucene never reuses a file name and never changes a file once
+ *     written. So a file that was merged away never comes back, and a file the shard keeps always has the same length.</li>
  *     <li>The state id only moves forward. It is made of the shard's history uuid, a force merge id and the highest sequence number.
  *     Within one history the sequence number only grows, and the force merge id only changes to a new random value. So once the
  *     shard has moved past a snapshot's state id, it never has it again. Snapshots are recorded one at a time, in the order they were
@@ -94,6 +93,9 @@ final class ShardBaseline implements Accountable {
     private static final long SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(ShardBaseline.class);
     private static final long STORE_FILE_METADATA_SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(StoreFileMetadata.class);
     private static final long BYTES_REF_SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(BytesRef.class);
+    // Map.copyOf puts each key and value in its own slot of one array, and keeps that array half empty
+    // (a JDK detail; the memory test would catch a change)
+    private static final long MAP_SLOTS_PER_ENTRY = 4;
 
     static final ShardBaseline EMPTY = of(BlobStoreIndexShardSnapshots.EMPTY, List.of());
 
@@ -122,7 +124,7 @@ final class ShardBaseline implements Accountable {
         // files, because it stores their contents in the metadata itself
         final Map<String, Long> currentFileLengths = new HashMap<>();
         for (LuceneFile file : currentFiles) {
-            if (Store.MetadataSnapshot.isReadAsHash(file.name()) == false) {
+            if (ShardBacklog.isStoredInBackupMetadata(file) == false) {
                 currentFileLengths.put(file.name(), file.length());
             }
         }
@@ -185,8 +187,7 @@ final class ShardBaseline implements Accountable {
 
     private static long ramBytesUsed(Map<String, List<StoreFileMetadata>> backedUpFilesByName, @Nullable String latestStateId) {
         long bytes = SHALLOW_SIZE + RamUsageEstimator.sizeOf(latestStateId);
-        // Map.copyOf stores its keys and values in a table with twice as many slots
-        bytes += sizeOfCollection(backedUpFilesByName, 4L * backedUpFilesByName.size());
+        bytes += sizeOfCollection(backedUpFilesByName, MAP_SLOTS_PER_ENTRY * backedUpFilesByName.size());
         for (List<StoreFileMetadata> files : backedUpFilesByName.values()) {
             bytes += sizeOfCollection(files, files.size());
             for (StoreFileMetadata file : files) {
