@@ -119,7 +119,8 @@ public class ShardBacklogTests extends ESTestCase {
 
             assertThat(uploadedBytes(repository, merged), equalTo(0L));
             // The clone is the newest snapshot, so the baseline keeps its state-1, not state-2. The shard's state-2 doesn't match,
-            // so the backlog compares files and counts _2.cfs, which no snapshot has. This is the one known over-count.
+            // so the backlog compares files and counts _2.cfs, which no snapshot has. This is the one known over-count. The backlog
+            // and the snapshot disagree here, so this checks each one on its own instead of using assertBacklog.
             assertThat(ShardBacklog.bytesToUpload(baseline(repository, merged), "state-2", luceneFiles(merged), Map.of()), equalTo(3000L));
             // The next snapshot is taken with the shard still at state-2. It uploads nothing and records state-2, which is now the
             // newest state id again, so the backlog is back to 0.
