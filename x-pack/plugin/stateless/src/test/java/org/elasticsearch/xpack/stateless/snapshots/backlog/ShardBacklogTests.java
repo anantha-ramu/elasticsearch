@@ -80,11 +80,17 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     public void testTheLatestSnapshotWithAStateIdCounts() {
-        final var cfs = file("_0.cfs", 1000, 11, randomWriterUuid());
-        // the latest snapshot was taken before the shard had settled, so it has no state id
-        final var repository = repository(snapshot("snap-1", "state-1", cfs), snapshot("snap-2", null, cfs));
+        // snap-0 was taken while writes were still in flight, so it has no state id.
+        // snap-1 was taken after the writes finished and the shard had settled.
+        // A clone copies the state id of its source, so clone-of-snap-0, the newest snapshot, has no state id either.
+        final var repository = repository(
+            snapshot("snap-0", null, file("_0.cfs", 1000, 11, randomWriterUuid())),
+            snapshot("snap-1", "state-1", file("_1.cfs", 2000, 12, randomWriterUuid()))
+        ).withClone("snap-0", "clone-of-snap-0");
 
-        assertBacklog(repository, commit("state-1", file("_1.cfs", 3000, 13, randomWriterUuid())), 0);
+        // There were no writes since snap-1, but a merge rewrote _1.cfs into _2.cfs, so no file name matches.
+        // Only the state id of snap-1, the latest snapshot that has one, can show that nothing needs uploading.
+        assertBacklog(repository, commit("state-1", file("_2.cfs", 2000, 13, randomWriterUuid())), 0);
     }
 
     public void testACloneOfAnOlderSnapshotCountsUntilTheNextSnapshot() {
