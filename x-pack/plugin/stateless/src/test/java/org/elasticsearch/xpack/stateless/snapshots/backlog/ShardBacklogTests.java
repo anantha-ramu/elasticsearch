@@ -390,8 +390,12 @@ public class ShardBacklogTests extends ESTestCase {
      * stays the same when only the files change, as after a merge. A snapshot taken, or a commit checked, before the shard settled has
      * no state id. Some histories clone older snapshots, and some snapshots are removed as retention does. After every step, and against
      * the shard-level metadata read back at the end, the backlog must never be below what the snapshot would upload, and must equal it
-     * unless the latest state id came from a clone. The test also records snapshots without a state id when the shard has settled,
-     * which serverless doesn't do. That only makes the test stricter.
+     * unless the latest state id came from a clone.
+     * <p>
+     * The histories are looser than serverless in two ways: a snapshot of a settled shard sometimes has no state id, and a file name
+     * can come back as a different file within one index, which Lucene never does. Neither breaks the checks, because every check
+     * builds a new baseline for the commit it checks. Reusing a baseline for later commits is covered by
+     * {@link #testLuceneCommitsMatchWhatTheSnapshotWouldUpload}.
      */
     public void testRandomHistoriesMatchWhatTheSnapshotWouldUpload() throws IOException {
         final var versions = randomFileVersions();
