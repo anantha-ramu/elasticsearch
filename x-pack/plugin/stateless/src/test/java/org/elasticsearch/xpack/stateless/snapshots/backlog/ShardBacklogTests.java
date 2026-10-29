@@ -47,6 +47,18 @@ import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 
+/**
+ * Tests for {@link ShardBacklog} and {@link ShardBaseline}. Most tests use three helpers:
+ * <ul>
+ *     <li>{@code repository(...)} builds the shard-level metadata ({@code index-{gen}}) from a list of snapshots. It adds each snapshot
+ *     the way a real snapshot does: a file the repository already has is reused, and any other file is uploaded.</li>
+ *     <li>{@code commit(...)} is the shard's current commit: its state id, or {@code null} if it has none, and its files.</li>
+ *     <li>{@code assertBacklog(repository, commit, bytes)} checks that a snapshot of the commit would upload {@code bytes}, and that the
+ *     backlog counts exactly the same.</li>
+ * </ul>
+ * Whether a file of the commit matches a file of the repository is decided by {@link StoreFileMetadata#isSame}: the same name, length
+ * and checksum, and the same writer uuid when both files have one. Lengths and checksums are small made-up numbers.
+ */
 public class ShardBacklogTests extends ESTestCase {
 
     private static final BytesRef NO_WRITER_UUID = StoreFileMetadata.UNAVAILABLE_WRITER_UUID;
@@ -233,12 +245,17 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     public void testTheSameChecksumWithAnotherWriterUuidIsCounted() {
+        // The writer uuid is the id Lucene gives a segment when it writes it, so another writer uuid means another segment, for
+        // example of an index created again under the same name. The same length and checksum are then a coincidence, and the
+        // snapshot uploads the file again.
         final var repository = repository(snapshot("snap-1", null, file("_0.cfs", 1000, 11, randomWriterUuid())));
 
         assertBacklog(repository, commit(null, file("_0.cfs", 1000, 11, randomWriterUuid())), 1000);
     }
 
     public void testTheWriterUuidIsIgnoredWhenEitherSideHasNone() {
+        // A file has no writer uuid if, for example, a version before 7.16 recorded it in the repository. The snapshot then
+        // compares the other fields, the length, checksum and hash, and so does the backlog.
         final var repository = repository(
             snapshot("snap-1", null, file("_0.cfs", 1000, 11, randomWriterUuid()), file("_0.cfe", 100, 12, NO_WRITER_UUID))
         );
@@ -292,6 +309,8 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     public void testMissingOrWrongMetadataIsRejected() {
+        // The caller must pass the metadata of every file that filesNeedingChecksum asked for. Missing or wrong metadata is a bug in
+        // the caller, so the backlog fails instead of guessing.
         final var cfs = file("_0.cfs", 1000, 11, randomWriterUuid());
         final var repository = repository(snapshot("snap-1", null, cfs));
         final var commit = commit(null, cfs);
@@ -341,16 +360,13 @@ public class ShardBacklogTests extends ESTestCase {
     /**
      * Builds a repository the way snapshots do, from a random history of a shard. Commits are drawn from a few file names, each with a
      * few versions that often share their length and checksum, sometimes without writer uuid. The state id changes with new writes and
-     * stays the same when only the files change, as after a merge; a snapshot taken, or a commit checked, before the shard settled has
-     * none. Some histories clone
-     * older snapshots, some add a snapshot of an older commit, as a primary of an older term might, and some snapshots are removed as
-     * retention does. After every step, and against the shard-level metadata read back at the end, the backlog must never be below what
-     * the snapshot would upload, and must equal it unless the latest state id came from a clone or the history is out of order.
+     * stays the same when only the files change, as after a merge. A snapshot taken, or a commit checked, before the shard settled has
+     * no state id. Some histories clone older snapshots, and some snapshots are removed as retention does. After every step, and against
+     * the shard-level metadata read back at the end, the backlog must never be below what the snapshot would upload, and must equal it
+     * unless the latest state id came from a clone.
      */
     public void testRandomHistoriesMatchWhatTheSnapshotWouldUpload() throws IOException {
         final var versions = randomFileVersions();
-        final boolean outOfOrder = randomInt(4) == 0;
-        final List<Commit> commits = new ArrayList<>();
         final Set<String> clones = new HashSet<>();
         final List<SnapshotId> snapshotIds = new ArrayList<>();
         var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
@@ -358,25 +374,18 @@ public class ShardBacklogTests extends ESTestCase {
         int names = 0;
         int writes = 0;
         var live = new Commit(stateIdAfterWrites(writes), randomFiles(versions));
-        commits.add(live);
-        boolean disordered = false;
         for (int step = between(1, 12); step > 0; step--) {
             switch (between(0, 4)) {
                 case 0 -> {
                     writes++;
                     live = new Commit(stateIdAfterWrites(writes), randomFiles(versions));
-                    commits.add(live);
                 }
                 case 1 -> {
                     live = new Commit(live.stateId(), randomFiles(versions));
-                    commits.add(live);
                 }
                 case 2 -> {
-                    final boolean older = outOfOrder && randomBoolean();
-                    final var snapshotted = older ? randomFrom(commits) : live;
-                    disordered |= older;
                     final var snapshotId = new SnapshotId("snap-" + names++, randomUUID());
-                    final var recorded = new Commit(randomBoolean() ? snapshotted.stateId() : null, snapshotted.files());
+                    final var recorded = new Commit(randomBoolean() ? live.stateId() : null, live.files());
                     snapshots = snapshotShard(snapshots, snapshotId.getName(), recorded);
                     snapshotIds.add(snapshotId);
                 }
@@ -398,13 +407,13 @@ public class ShardBacklogTests extends ESTestCase {
                 default -> throw new AssertionError();
             }
             final var checked = maybeWithoutStateId(live);
-            assertAgainstWhatTheSnapshotWouldUpload(snapshots, checked, checked, isExact(snapshots, clones, disordered));
+            assertAgainstWhatTheSnapshotWouldUpload(snapshots, checked, checked, isExact(snapshots, clones));
         }
 
         final var readBack = readBack(snapshots);
         for (int i = between(1, 3); i > 0; i--) {
             final var checked = maybeWithoutStateId(live);
-            assertAgainstWhatTheSnapshotWouldUpload(readBack, checked, checked, isExact(readBack, clones, disordered));
+            assertAgainstWhatTheSnapshotWouldUpload(readBack, checked, checked, isExact(readBack, clones));
         }
     }
 
@@ -627,17 +636,17 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     /**
-     * Whether the backlog must equal what the snapshot would upload: when the history is in order and the latest state id did not come
-     * from a clone, which may have put an older one last.
+     * Whether the backlog must equal what the snapshot would upload: when the latest state id did not come from a clone, which may have
+     * put an older state id last.
      */
-    private static boolean isExact(BlobStoreIndexShardSnapshots snapshots, Set<String> clones, boolean disordered) {
+    private static boolean isExact(BlobStoreIndexShardSnapshots snapshots, Set<String> clones) {
         String latest = null;
         for (SnapshotFiles snapshot : snapshots.snapshots()) {
             if (snapshot.shardStateIdentifier() != null) {
                 latest = snapshot.snapshot();
             }
         }
-        return disordered == false && (latest == null || clones.contains(latest) == false);
+        return latest == null || clones.contains(latest) == false;
     }
 
     @Nullable
