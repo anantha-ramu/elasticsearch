@@ -81,9 +81,10 @@ public class ShardBacklogTests extends ESTestCase {
     }
 
     public void testTheLatestStateIdMeansNothingToUpload() {
+        final var cfs1 = file("_1.cfs", 2000, 12, randomWriterUuid());
         final var repository = repository(
             snapshot("snap-1", "state-1", file("_0.cfs", 1000, 11, randomWriterUuid())),
-            snapshot("snap-2", "state-2", file("_1.cfs", 2000, 12, randomWriterUuid()))
+            snapshot("snap-2", "state-2", cfs1)
         );
         // There were no writes since snap-2, but a background merge rewrote the files into _2.cfs. The shard is still at state-2,
         // the state id of the latest snapshot, so the backlog is 0 without comparing any files.
@@ -92,6 +93,11 @@ public class ShardBacklogTests extends ESTestCase {
         assertBacklog(repository, merged, 0);
         // Since the backlog compares no files, it needs no checksums either.
         assertThat(ShardBacklog.filesNeedingChecksum(baseline(repository, merged), "state-2", luceneFiles(merged)), empty());
+
+        // Had there been new writes instead, adding _3.cfs, the shard would have another state id, state-3, or none while the
+        // writes are still in flight. Either way it matches no snapshot, so the backlog compares files: _1.cfs is in the
+        // repository, and only _3.cfs is counted.
+        assertBacklog(repository, commit(randomBoolean() ? "state-3" : null, cfs1, file("_3.cfs", 500, 14, randomWriterUuid())), 500);
     }
 
     public void testTheLatestSnapshotWithAStateIdCounts() {
@@ -222,40 +228,22 @@ public class ShardBacklogTests extends ESTestCase {
         assertBacklog(repository, restored, commit("history-2-na-7", cfs0, file("_1.cfs", 2000, 12, randomWriterUuid())), 2000);
     }
 
-    public void testAnotherStateIdComparesTheFiles() {
-        final var cfs = file("_0.cfs", 1000, 11, randomWriterUuid());
-        final var repository = repository(snapshot("snap-1", "state-1", cfs));
-
-        assertBacklog(repository, commit("state-2", cfs, file("_1.cfs", 2000, 12, randomWriterUuid())), 2000);
-    }
-
-    public void testACommitWithoutStateIdComparesTheFiles() {
-        final var cfs = file("_0.cfs", 1000, 11, randomWriterUuid());
-        // The shard has no state id, because writes are in flight. snap-1 was also taken during writes, so it has none either.
-        // With no state id to match, the backlog compares files.
-        final var repository = repository(snapshot("snap-1", null, cfs));
-
-        assertBacklog(repository, commit(null, cfs, file("_1.cfs", 2000, 12, randomWriterUuid())), 2000);
-    }
-
     public void testARecreatedIndexWithTheSameFileNamesIsCounted() {
         final var repository = repository(
             snapshot("snap-1", "state-1", file("_0.cfs", 1000, 11, randomWriterUuid()), file("_0.cfe", 100, 12, randomWriterUuid()))
         );
         // The index is deleted and created again under the same name. The new index starts again from _0, so its files have the
-        // same names, and here the same lengths, but other contents. The backlog counts them.
-        final var recreated = commit("state-2", file("_0.cfs", 1000, 21, randomWriterUuid()), file("_0.cfe", 100, 22, NO_WRITER_UUID));
+        // same names, and here the same lengths, but other contents.
 
-        assertBacklog(repository, recreated, 1100);
-    }
-
-    public void testTheSameChecksumWithAnotherWriterUuidIsCounted() {
-        // The writer uuid is the id Lucene gives a segment when it writes it, so another writer uuid means another segment, for
-        // example of an index created again under the same name. The same length and checksum are then a coincidence, and the
-        // snapshot uploads the file again.
-        final var repository = repository(snapshot("snap-1", null, file("_0.cfs", 1000, 11, randomWriterUuid())));
-
-        assertBacklog(repository, commit(null, file("_0.cfs", 1000, 11, randomWriterUuid())), 1000);
+        // Even the same checksum doesn't make the new _0.cfs the same file. The writer uuid is the id Lucene gives a segment when
+        // it writes it, so another writer uuid means another segment, and the snapshot uploads the file again.
+        assertBacklog(repository, commit("state-2", file("_0.cfs", 1000, 11, randomWriterUuid())), 1000);
+        // Usually the checksums differ as well. They also tell apart a file that has no writer uuid, like the new _0.cfe.
+        assertBacklog(
+            repository,
+            commit("state-2", file("_0.cfs", 1000, 21, randomWriterUuid()), file("_0.cfe", 100, 22, NO_WRITER_UUID)),
+            1100
+        );
     }
 
     public void testTheWriterUuidIsIgnoredWhenEitherSideHasNone() {
