@@ -61,6 +61,22 @@ import static org.hamcrest.Matchers.greaterThanOrEqualTo;
  * Whether a file of the commit matches a file of the repository is decided by {@link StoreFileMetadata#isSame}: the same name, length
  * and checksum, and the same writer uuid when both files have one. Lengths and checksums are small made-up numbers.
  * <p>
+ * Most tests use made-up file metadata rather than real Lucene files. The backlog never reads a file's contents, only its metadata,
+ * so made-up metadata runs the same code. Made-up metadata also lets a test state the expected number of bytes, and build cases that
+ * plain Lucene can't produce on demand:
+ * <ul>
+ *     <li>state ids, which Elasticsearch adds to a commit and plain Lucene doesn't;</li>
+ *     <li>files without a writer uuid, as in a repository with files backed up before 7.16;</li>
+ *     <li>two different files with the same name, length and checksum;</li>
+ *     <li>repository events such as clones, restores and rebuilt metadata.</li>
+ * </ul>
+ * {@link #testLuceneCommitsMatchWhatTheSnapshotWouldUpload} checks two assumptions these tests make about real Lucene metadata: only
+ * .si and segments_N files carry their contents as a hash, and a file name comes back only when the index is created again.
+ * <p>
+ * What a snapshot would upload is worked out by this test's copy of the snapshot's decision logic ({@code snapshotShard} and
+ * {@code uploadedBytes}). Comparing the backlog with what the real snapshot code uploads needs a real shard and repository, and is
+ * left to an integration test (see the TODO above {@code snapshotShard}).
+ * <p>
  * The tests go from simple to complex, in the order of the cases in the {@link ShardBaseline} Javadoc:
  * <ul>
  *     <li>comparing files: which files count and which don't;</li>
