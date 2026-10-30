@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
+import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
@@ -148,24 +149,31 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     /**
-     * Measured with {@link RamUsageTester} on shard-level metadata read back the way a node reads it. Apart from its name, a file costs
-     * about 290 bytes: its {@link StoreFileMetadata} with the checksum, Lucene version, hash and writer uuid, and its place in the map
-     * and list. That figure is for compressed object pointers, which the JVM uses for heaps under 32 GB. The estimate is a little
-     * higher, because it also counts the map's table and the empty hash that files share.
+     * Measured with {@link RamUsageTester} on shard-level metadata read back the way a node reads it, with writer uuids, as every file
+     * in a serverless repository has. Apart from its name, a file costs about 290 bytes: its {@link StoreFileMetadata} with the
+     * checksum, Lucene version, hash and writer uuid, and its place in the map and list. A file without a writer uuid costs about 56
+     * bytes less, because all such files share one empty value. These figures are for compressed object pointers, which the JVM uses
+     * for heaps under 32 GB. The estimate is a little higher, because it also counts the map's table and the empty hash that files
+     * share.
      */
-    public void testBytesPerFile() {
+    public void testBytesPerFile() throws IOException {
         assumeTrue("measured with compressed object pointers", RamUsageEstimator.COMPRESSED_REFS_ENABLED);
         final int fileCount = 1000;
         final List<FileInfo> files = randomBackedUpFiles(0, fileCount);
         final long nameBytes = files.stream().mapToLong(file -> RamUsageEstimator.sizeOf(file.physicalName())).sum();
         final var baseline = ShardBaseline.of(
-            readBack(BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap", files, null))),
+            ShardBacklogTests.readBack(BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap", files, null)), true),
             luceneFiles(files)
         );
 
-        // What the files really cost, apart from their names, stays within 300 bytes per file.
+        // What the files really cost, apart from their names. The bounds keep the figure in this Javadoc, and the memory estimate
+        // built on it, honest: if the cost moves outside them, for example after a JVM change, measure it again and update both.
         final long measured = RamUsageTester.ramUsed(baseline) - RamUsageTester.ramUsed(ShardBaseline.EMPTY);
-        assertThat((measured - nameBytes) / fileCount, lessThanOrEqualTo(300L));
+        assertThat(
+            "bytes per file apart from its name; if this moved, update the documented figure",
+            (measured - nameBytes) / fileCount,
+            allOf(greaterThanOrEqualTo(250L), lessThanOrEqualTo(300L))
+        );
         // The estimate is never below the real cost, and at most a quarter above it.
         final long estimated = baseline.ramBytesUsed() - ShardBaseline.EMPTY.ramBytesUsed();
         assertThat(estimated, greaterThanOrEqualTo(measured));

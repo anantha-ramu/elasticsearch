@@ -789,12 +789,19 @@ public class ShardBacklogTests extends ESTestCase {
      * a version before 7.16 would write it.
      */
     static BlobStoreIndexShardSnapshots readBack(BlobStoreIndexShardSnapshots snapshots) throws IOException {
+        return readBack(snapshots, randomBoolean());
+    }
+
+    /**
+     * The shard-level metadata as a node reads it back from the repository, written with writer uuids or without them.
+     */
+    static BlobStoreIndexShardSnapshots readBack(BlobStoreIndexShardSnapshots snapshots, boolean withWriterUuids) throws IOException {
         try (var out = new BytesStreamOutput()) {
             INDEX_SHARD_SNAPSHOTS_FORMAT.serialize(
                 snapshots,
                 "index-" + randomUUID(),
                 randomBoolean(),
-                Map.of(FileInfo.SERIALIZE_WRITER_UUID, Boolean.toString(randomBoolean())),
+                Map.of(FileInfo.SERIALIZE_WRITER_UUID, Boolean.toString(withWriterUuids)),
                 out
             );
             return INDEX_SHARD_SNAPSHOTS_FORMAT.deserialize(
