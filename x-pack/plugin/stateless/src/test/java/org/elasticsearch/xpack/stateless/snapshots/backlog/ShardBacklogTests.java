@@ -16,6 +16,7 @@ import org.apache.lucene.index.SerialMergeScheduler;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.store.ByteBuffersDataOutput;
 import org.apache.lucene.store.ByteBuffersIndexOutput;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.Version;
 import org.elasticsearch.cluster.metadata.ProjectId;
@@ -461,73 +462,94 @@ public class ShardBacklogTests extends ESTestCase {
      * by the other tests.
      */
     public void testLuceneCommitsMatchWhatTheSnapshotWouldUpload() throws IOException {
-        var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
         // Both indices use the same file format, compound or not, so that the recreated index can reach the same file names.
         final boolean useCompoundFile = randomBoolean();
-        final int recreateAt = between(2, 6);
-        boolean reusedALeftOutName = false;
-        for (int index = 0; index < 2; index++) {
-            try (var directory = newDirectory()) {
-                final var config = new IndexWriterConfig().setUseCompoundFile(useCompoundFile)
-                    .setMergeScheduler(new SerialMergeScheduler());
-                try (var writer = new IndexWriter(directory, config)) {
-                    // Each index gets a new baseline at its first commit, as a node builds one when a shard starts. A recreated
-                    // index is a new shard, so it gets a new baseline too.
-                    Commit baselineCommit = null;
-                    Set<String> leftOut = Set.of();
-                    int docs = 0;
-                    final int steps = index == 0 ? recreateAt : 6;
-                    for (int step = 0; step < steps; step++) {
-                        for (int i = between(5, 20); i > 0; i--) {
-                            writer.addDocument(List.of(new StringField("id", Integer.toString(docs++), Field.Store.NO)));
-                        }
-                        if (randomBoolean()) {
-                            writer.deleteDocuments(new Term("id", Integer.toString(between(0, docs - 1))));
-                        }
-                        // Only the recreated index is sometimes force merged. The first index keeps its segments, so that the recreated
-                        // index can reach their file names.
-                        if (index == 1 && rarely()) {
-                            writer.forceMerge(1);
-                        }
-                        writer.commit();
-                        final var files = new ArrayList<StoreFileMetadata>();
-                        for (StoreFileMetadata file : Store.MetadataSnapshot.loadFromIndexCommit(null, directory, logger)) {
-                            // ShardBacklog relies on this: the files it leaves out by name, .si and segments_N, are exactly the
-                            // files whose contents are kept as their hash, and the other files have no hash.
-                            final boolean inlined = Store.MetadataSnapshot.isReadAsHash(file.name());
-                            assertThat(file.name(), file.hashEqualsContents(), equalTo(inlined));
-                            assertThat(file.name(), file.hash().length == 0, equalTo(inlined == false));
-                            files.add(file);
-                        }
-                        final var commit = new Commit(null, files);
-                        if (baselineCommit == null) {
-                            baselineCommit = commit;
-                            leftOut = leftOutNames(snapshots, baselineCommit);
-                        }
-                        boolean reusesALeftOutName = false;
-                        for (StoreFileMetadata file : files) {
-                            reusesALeftOutName |= leftOut.contains(file.name());
-                        }
-                        if (index == 0) {
-                            assertFalse("a later commit of an index has the name of a file merged away", reusesALeftOutName);
-                        } else {
-                            reusedALeftOutName |= reusesALeftOutName;
-                        }
+        // The first index never brings back a name its baseline left out.
+        final var first = checkCommitsOfOneIndex(BlobStoreIndexShardSnapshots.EMPTY, useCompoundFile, between(2, 6), false);
+        assertFalse("a later commit of an index has the name of a file merged away", first.reusedALeftOutName());
+        // The index is deleted and created again under the same name. Lucene starts again from _0, so the recreated index reaches
+        // the old index's file names, which its baseline left out. Its second commit always has _1, which the first index had too.
+        final var recreated = checkCommitsOfOneIndex(first.snapshots(), useCompoundFile, 6, true);
+        assertTrue("the recreated index reached a name of the old index that its baseline left out", recreated.reusedALeftOutName());
+    }
 
-                        assertAgainstWhatTheSnapshotWouldUpload(snapshots, baselineCommit, commit, true);
-                        // The first index's last commit is always snapshotted, so that the repository holds its files when the
-                        // index is created again. Other commits are snapshotted at random. Each snapshot is read back as a node
-                        // would read it, and the baseline is built again for the snapshotted commit.
-                        if ((index == 0 && step == steps - 1) || randomBoolean()) {
-                            snapshots = readBack(snapshotShard(snapshots, "snap-" + index + "-" + step, commit));
-                            baselineCommit = commit;
-                            leftOut = leftOutNames(snapshots, baselineCommit);
-                        }
-                    }
+    private record CheckedIndex(BlobStoreIndexShardSnapshots snapshots, boolean reusedALeftOutName) {}
+
+    /**
+     * Writes one index in {@code steps} commits, and checks the backlog of each commit against what the snapshot would upload. The
+     * repository is shared with any earlier index of the same name. The baseline is built at the index's first commit, as a node
+     * builds one when a shard starts, and again after each snapshot. Snapshots are taken at random, and always of the last commit,
+     * so that an index created again under the same name finds this index's files in the repository. Only a recreated index may
+     * force merge ({@code mayForceMerge}): the first index keeps its segments, so that the recreated one can reach their names. Even
+     * then, the first two commits are never force merged, so that the second commit always has the segment _1. A merged segment can
+     * be written in another file format than a new one, so after a force merge the names might not match the first index's.
+     */
+    private CheckedIndex checkCommitsOfOneIndex(
+        BlobStoreIndexShardSnapshots snapshots,
+        boolean useCompoundFile,
+        int steps,
+        boolean mayForceMerge
+    ) throws IOException {
+        final var config = new IndexWriterConfig().setUseCompoundFile(useCompoundFile).setMergeScheduler(new SerialMergeScheduler());
+        try (var directory = newDirectory(); var writer = new IndexWriter(directory, config)) {
+            Commit baselineCommit = null;
+            Set<String> leftOut = Set.of();
+            boolean reusedALeftOutName = false;
+            int docs = 0;
+            for (int step = 0; step < steps; step++) {
+                docs = addDocumentsAndMaybeDeleteOne(writer, docs);
+                if (mayForceMerge && step >= 2 && rarely()) {
+                    writer.forceMerge(1);
+                }
+                writer.commit();
+                final var commit = readCommit(directory);
+                if (baselineCommit == null) {
+                    baselineCommit = commit;
+                    leftOut = leftOutNames(snapshots, baselineCommit);
+                }
+                for (StoreFileMetadata file : commit.files()) {
+                    reusedALeftOutName |= leftOut.contains(file.name());
+                }
+
+                assertAgainstWhatTheSnapshotWouldUpload(snapshots, baselineCommit, commit, true);
+                if (step == steps - 1 || randomBoolean()) {
+                    snapshots = readBack(snapshotShard(snapshots, "snap-" + randomUUID(), commit));
+                    baselineCommit = commit;
+                    leftOut = leftOutNames(snapshots, baselineCommit);
                 }
             }
+            return new CheckedIndex(snapshots, reusedALeftOutName);
         }
-        assertTrue("the recreated index reached a name of the old index that its baseline left out", reusedALeftOutName);
+    }
+
+    /**
+     * Adds 5 to 20 documents, numbered on from {@code docs}, and sometimes deletes one of the documents so far. Returns the new number
+     * of documents.
+     */
+    private static int addDocumentsAndMaybeDeleteOne(IndexWriter writer, int docs) throws IOException {
+        for (int i = between(5, 20); i > 0; i--) {
+            writer.addDocument(List.of(new StringField("id", Integer.toString(docs++), Field.Store.NO)));
+        }
+        if (randomBoolean()) {
+            writer.deleteDocuments(new Term("id", Integer.toString(between(0, docs - 1))));
+        }
+        return docs;
+    }
+
+    /**
+     * The files of the latest commit, read the way a snapshot reads them. Also checks what {@link ShardBacklog} relies on: the files
+     * it leaves out by name, .si and segments_N, are exactly the files whose contents are kept as their hash, and the other files
+     * have no hash.
+     */
+    private Commit readCommit(Directory directory) throws IOException {
+        final var files = new ArrayList<StoreFileMetadata>();
+        for (StoreFileMetadata file : Store.MetadataSnapshot.loadFromIndexCommit(null, directory, logger)) {
+            final boolean inlined = Store.MetadataSnapshot.isReadAsHash(file.name());
+            assertThat(file.name(), file.hashEqualsContents(), equalTo(inlined));
+            assertThat(file.name(), file.hash().length == 0, equalTo(inlined == false));
+            files.add(file);
+        }
+        return new Commit(null, files);
     }
 
     private record Commit(@Nullable String stateId, List<StoreFileMetadata> files) {}
