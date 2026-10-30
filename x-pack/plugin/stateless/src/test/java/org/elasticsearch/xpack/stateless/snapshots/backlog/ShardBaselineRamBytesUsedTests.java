@@ -59,6 +59,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     public void testFilesOfSeveralSnapshotsAreKeptOnce() {
+        // The baseline's memory must not grow with the number of snapshots kept. Here the same files are listed in every snapshot,
+        // and the baseline must keep each file once.
         final List<FileInfo> files = randomBackedUpFiles(0, between(1, 50));
         final var stateId = randomStateId();
         final var oneSnapshot = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-0", files, stateId));
@@ -75,6 +77,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     public void testFilesOnlyOlderSnapshotsHaveCostNothing() {
+        // Only the older snapshot has the files in mergedAway: the shard has since merged them away, so it no longer has files with
+        // those names. The baseline must drop them.
         final List<FileInfo> mergedAway = randomBackedUpFiles(0, between(1, 50));
         final List<FileInfo> current = randomBackedUpFiles(mergedAway.size(), between(1, 50));
         final var olderAndLatest = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-0", mergedAway, null))
@@ -94,7 +98,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         final var latest = new SnapshotFiles("snap-latest", files, stateId(true));
         var manySnapshots = BlobStoreIndexShardSnapshots.EMPTY;
         for (int i = between(1, 400); i > 0; i--) {
-            // The shard is written to between snapshots, so each snapshot has a new state id.
+            // The shard is written to between snapshots, so each snapshot has a new state id. The files are kept the same on
+            // purpose, so that only the state ids differ.
             manySnapshots = manySnapshots.withAddedSnapshot(new SnapshotFiles("snap-" + i, files, stateId(false)));
         }
         manySnapshots = manySnapshots.withAddedSnapshot(latest);
@@ -108,7 +113,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     public void testFilesOfTheSameNameAndAnotherLengthCostNothing() {
         final List<FileInfo> current = randomBackedUpFiles(0, between(1, 50));
         // Files with the same names and other lengths, from an earlier copy of the index that was deleted and created again under
-        // the same name.
+        // the same name. isSame never matches files of different lengths, so the baseline must drop these, even though their names
+        // match.
         final List<FileInfo> earlier = new ArrayList<>();
         for (FileInfo file : current) {
             earlier.add(
@@ -130,6 +136,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     public void testFilesKeptInTheBackupMetadataAreLeftOut() {
+        // A snapshot keeps the contents of .si and segments_N files in the shard-level metadata, and the backlog never counts them.
+        // So when the shard's only files are these, the baseline keeps nothing, and costs as much as an empty baseline.
         final List<FileInfo> files = new ArrayList<>();
         for (String name : List.of("_0.si", "_1.si", "segments_2")) {
             files.add(new FileInfo("v__" + UUIDs.randomBase64UUID(random()), metadata(name, randomWriterUuid()), null));
@@ -155,8 +163,10 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
             luceneFiles(files)
         );
 
+        // What the files really cost, apart from their names, stays within 300 bytes per file.
         final long measured = RamUsageTester.ramUsed(baseline) - RamUsageTester.ramUsed(ShardBaseline.EMPTY);
         assertThat((measured - nameBytes) / fileCount, lessThanOrEqualTo(300L));
+        // The estimate is never below the real cost, and at most a quarter above it.
         final long estimated = baseline.ramBytesUsed() - ShardBaseline.EMPTY.ramBytesUsed();
         assertThat(estimated, greaterThanOrEqualTo(measured));
         assertThat(estimated, lessThanOrEqualTo(measured + measured / 4));
