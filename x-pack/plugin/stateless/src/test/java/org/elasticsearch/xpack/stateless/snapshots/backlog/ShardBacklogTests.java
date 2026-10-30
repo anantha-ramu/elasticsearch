@@ -456,6 +456,9 @@ public class ShardBacklogTests extends ESTestCase {
      * for the later commits until the next snapshot. The first index never gives a new file the name of a file the baseline left out.
      * The recreated index does, because it starts again from the same names. The test also checks an assumption of
      * {@link ShardBacklog}: only the files it leaves out by name, the .si and segments_N files, have a hash.
+     * <p>
+     * These are plain Lucene commits, without the user data Elasticsearch adds, so they have no state id. The state id rule is covered
+     * by the other tests.
      */
     public void testLuceneCommitsMatchWhatTheSnapshotWouldUpload() throws IOException {
         var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
@@ -468,6 +471,8 @@ public class ShardBacklogTests extends ESTestCase {
                 final var config = new IndexWriterConfig().setUseCompoundFile(useCompoundFile)
                     .setMergeScheduler(new SerialMergeScheduler());
                 try (var writer = new IndexWriter(directory, config)) {
+                    // Each index gets a new baseline at its first commit, as a node builds one when a shard starts. A recreated
+                    // index is a new shard, so it gets a new baseline too.
                     Commit baselineCommit = null;
                     Set<String> leftOut = Set.of();
                     int docs = 0;
@@ -510,6 +515,9 @@ public class ShardBacklogTests extends ESTestCase {
                         }
 
                         assertAgainstWhatTheSnapshotWouldUpload(snapshots, baselineCommit, commit, true);
+                        // The first index's last commit is always snapshotted, so that the repository holds its files when the
+                        // index is created again. Other commits are snapshotted at random. Each snapshot is read back as a node
+                        // would read it, and the baseline is built again for the snapshotted commit.
                         if ((index == 0 && step == steps - 1) || randomBoolean()) {
                             snapshots = readBack(snapshotShard(snapshots, "snap-" + index + "-" + step, commit));
                             baselineCommit = commit;
