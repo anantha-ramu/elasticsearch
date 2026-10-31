@@ -40,7 +40,7 @@ import java.util.function.Supplier;
 /**
  * Keeps, on the elected master, the latest snapshot backlog report of each index node ({@link SnapshotBacklogTracker},
  * {@link SnapshotBacklogPublisher}), and gives a figure for every primary shard and every repository a snapshot lifecycle (SLM) policy
- * names. It also publishes the totals as master metrics.
+ * names. The service also publishes the totals as master metrics.
  * <p>
  * What it keeps: one report per node, each one the node's whole latest result, replaced as a whole by the node's next report. Nothing
  * per shard is kept in step with the routing table. Instead, when the figures are read ({@link #getFigures}), each primary in the
@@ -53,25 +53,25 @@ import java.util.function.Supplier;
  *     <li>{@link Status#UNASSIGNED}: the primary is not on any node;</li>
  *     <li>{@link Status#NOT_REPORTED}: its node has sent no report that is still kept;</li>
  *     <li>{@link Status#STALE}: its node's latest report is older than {@link #STALE_AFTER}, so the node has stopped reporting;</li>
- *     <li>{@link Status#NOT_REPORTED}: the report has no entry for this copy of the shard, for example because it arrived on the node
- *     after the node's last evaluation;</li>
- *     <li>{@link Status#NOT_MEASURED}: the node reported it, but couldn't measure it yet, for example while it loads the shard's backup
- *     metadata;</li>
- *     <li>{@link Status#MEASURED}: the node measured it. Only this figure is exact, and it keeps the generation of the shard's backup
- *     metadata it was measured against.</li>
+ *     <li>{@link Status#NOT_REPORTED}: the report has no entry for this copy of the shard, for example because the shard arrived on
+ *     the node after the node's last evaluation;</li>
+ *     <li>{@link Status#NOT_MEASURED}: the node reported the shard, but couldn't measure the backlog yet, for example while the node
+ *     loads the shard's backup metadata;</li>
+ *     <li>{@link Status#MEASURED}: the node measured the shard. Only a measured figure is exact. The figure keeps the generation of
+ *     the shard's backup metadata that the node measured against.</li>
  * </ul>
  * Every status but {@link Status#MEASURED} counts 0 bytes and is {@link MetricQuality#MINIMUM}: 0 is the one value that is always low
  * enough, and "minimum" tells the autoscaler not to scale down on it. A figure kept from before a relocation, or from a node that
  * stopped reporting, could count too much, since a snapshot may have finished since.
  * <p>
- * When it is safe to use: it holds nothing unless this node is the elected master, the cluster state is recovered and
- * {@link SnapshotBacklogTracker#ENABLED_SETTING} is on. It forgets everything when any of these stops being true, and forgets a node's
- * report when the node leaves the cluster. A report that arrives while one of these changes is checked again after it is stored, so it
- * never stays behind (see {@link #update}). A new master starts empty, so every shard is {@link Status#NOT_REPORTED} until the nodes'
- * next reports, at most one evaluation interval later.
+ * When the store is safe to use: the store holds nothing unless this node is the elected master, the cluster state is recovered (so
+ * the routing table and the nodes are known), and {@link SnapshotBacklogTracker#ENABLED_SETTING} is on. The store forgets everything
+ * when any of these conditions stops being true, and forgets a node's report when the node leaves the cluster. A report that arrives
+ * while a condition changes is checked again after it is stored, so the report never stays behind (see {@link #update}). A new master
+ * starts empty, so every shard is {@link Status#NOT_REPORTED} until the nodes' next reports, at most one evaluation interval later.
  * <p>
- * It does not apply the SLM policies' schedules, results or index lists. Its caller does that, which is why it gives a figure for every
- * primary of the repository's project.
+ * The store does not apply the SLM policies' schedules, results or index lists. The caller applies those rules, which is why
+ * {@link #getFigures} gives a figure for every primary of the repository's project.
  */
 public class SnapshotBacklogMetricsService implements ClusterStateListener {
 
@@ -171,13 +171,13 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
     }
 
     /**
-     * Keeps a node's report, unless it is older than the one kept, or comes from a node that isn't in the cluster (or from an earlier
-     * run of it), or this node isn't the master that should keep it.
+     * Keeps a node's report, unless the report is older than the kept report, or comes from a node that isn't in the cluster (or from an
+     * earlier run of that node), or this node isn't keeping reports.
      * <p>
-     * After storing it, this checks again with the latest cluster state and setting, and drops the report if they have changed. The
-     * cluster state listener and the setting watcher forget reports only after the new state or setting is in place, so either this
-     * check sees the change, or they run after the report was stored and forget it then. So a report that arrives as a node leaves,
-     * as this node stops being master, or as the setting is turned off, never stays behind.
+     * After storing the report, {@code update} checks the latest cluster state and setting again, and drops the report if either
+     * changed. The cluster state listener and the setting watcher forget reports only after the new state or setting is in place. So
+     * either the second check sees the change, or the listener or watcher runs after the report was stored and forgets the report then.
+     * A report that arrives as a node leaves, as this node stops being master, or as the setting is turned off never stays behind.
      *
      * @return whether the report was kept
      */

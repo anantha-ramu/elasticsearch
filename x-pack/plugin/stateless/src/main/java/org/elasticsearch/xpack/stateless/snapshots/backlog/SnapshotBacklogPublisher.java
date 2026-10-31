@@ -28,9 +28,9 @@ import java.util.function.LongSupplier;
 /**
  * Sends this index node's latest snapshot backlog to the master ({@link TransportPublishSnapshotBacklogAction}).
  * <p>
- * Each report is the node's whole result, so a report that fails is not retried: the next evaluation sends a newer one 30 seconds
- * later. For the same reason, at most one report is in flight: if the previous one hasn't completed yet, a new one is skipped. A report
- * waits at most one evaluation interval for a master.
+ * Each report holds the node's whole result. So a failed report is not retried: the next evaluation sends a newer report 30 seconds
+ * later. For the same reason, at most one report is in flight. If the previous report hasn't completed yet, the new report is skipped.
+ * A report waits at most one evaluation interval for a master.
  * <p>
  * Nothing is sent while the cluster has a node too old to know the action, since the master can be any node.
  */

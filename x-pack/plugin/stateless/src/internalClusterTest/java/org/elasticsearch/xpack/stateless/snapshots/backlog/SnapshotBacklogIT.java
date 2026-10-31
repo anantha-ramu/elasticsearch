@@ -338,8 +338,8 @@ public class SnapshotBacklogIT extends AbstractStatelessPluginIntegTestCase {
         assertFiguresMatchNextSnapshot(indexNode, REPOSITORY, 1, "snap-3");
     }
 
-    // Puts one SLM policy per repository in the default project's metadata.
-    private void putPolicies(String... repositories) {
+    // Puts one SLM policy per repository in the default project's metadata. Also used by SnapshotBacklogMasterIT.
+    static void putPolicies(String... repositories) {
         final Map<String, SnapshotLifecyclePolicyMetadata> policies = new HashMap<>();
         for (String repository : repositories) {
             final String id = "policy-" + repository;

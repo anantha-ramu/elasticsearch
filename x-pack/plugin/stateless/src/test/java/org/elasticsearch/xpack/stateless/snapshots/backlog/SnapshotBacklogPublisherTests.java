@@ -35,7 +35,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
@@ -52,14 +51,13 @@ public class SnapshotBacklogPublisherTests extends ESTestCase {
     private record Sent(PublishSnapshotBacklogRequest request, ActionListener<ActionResponse.Empty> listener) {}
 
     private final List<Sent> sent = new ArrayList<>();
-    private final AtomicLong millis = new AtomicLong();
     private final SnapshotBacklogPublisher publisher = new SnapshotBacklogPublisher(
         (request, listener) -> sent.add(new Sent(request, listener)),
-        millis::get
+        () -> 0L
     );
 
     public void testReportCarriesTheNode() {
-        final ClusterState state = state(TransportVersion.current(), 42);
+        final ClusterState state = state(TransportVersion.current());
         publisher.publish(state, SHARDS);
 
         assertThat(sent, hasSize(1));
@@ -74,33 +72,33 @@ public class SnapshotBacklogPublisherTests extends ESTestCase {
 
     public void testNoReportWhileClusterIsTooOld() {
         final TransportVersion older = TransportVersionUtils.getPreviousVersion(SnapshotBacklogPublisher.PUBLISH_ACTION);
-        publisher.publish(state(older, 1), SHARDS);
+        publisher.publish(state(older), SHARDS);
         assertThat(sent, empty());
 
         // Once every node is upgraded, the report is sent.
-        publisher.publish(state(TransportVersion.current(), 2), SHARDS);
+        publisher.publish(state(TransportVersion.current()), SHARDS);
         assertThat(sent, hasSize(1));
     }
 
     public void testOneReportAtATime() {
-        publisher.publish(state(TransportVersion.current(), 1), SHARDS);
-        publisher.publish(state(TransportVersion.current(), 2), SHARDS);
+        publisher.publish(state(TransportVersion.current()), SHARDS);
+        publisher.publish(state(TransportVersion.current()), SHARDS);
         // the second was skipped, the first is still in flight
         assertThat(sent, hasSize(1));
 
         sent.get(0).listener().onResponse(ActionResponse.Empty.INSTANCE);
-        publisher.publish(state(TransportVersion.current(), 3), SHARDS);
+        publisher.publish(state(TransportVersion.current()), SHARDS);
         assertThat(sent, hasSize(2));
         assertThat(sent.get(1).request().seqNo(), equalTo(2L));
     }
 
     public void testFailureIsNotRetried() {
-        publisher.publish(state(TransportVersion.current(), 1), SHARDS);
+        publisher.publish(state(TransportVersion.current()), SHARDS);
         sent.get(0).listener().onFailure(new IllegalStateException("no master"));
         assertThat(sent, hasSize(1));
 
         // the next evaluation's report goes out as usual
-        publisher.publish(state(TransportVersion.current(), 2), SHARDS);
+        publisher.publish(state(TransportVersion.current()), SHARDS);
         assertThat(sent, hasSize(2));
         assertThat(sent.get(1).request().seqNo(), equalTo(2L));
     }
@@ -112,10 +110,10 @@ public class SnapshotBacklogPublisherTests extends ESTestCase {
                 throw new IllegalStateException("cannot send");
             }
             sent.add(new Sent(request, listener));
-        }, millis::get);
-        throwing.publish(state(TransportVersion.current(), 1), SHARDS);
+        }, () -> 0L);
+        throwing.publish(state(TransportVersion.current()), SHARDS);
         fail.set(false);
-        throwing.publish(state(TransportVersion.current(), 2), SHARDS);
+        throwing.publish(state(TransportVersion.current()), SHARDS);
         assertThat(sent, hasSize(1));
     }
 
@@ -147,13 +145,12 @@ public class SnapshotBacklogPublisherTests extends ESTestCase {
 
         assertTrue(systemContext.get());
         assertThat(headers, empty());
-        // On a secured cluster the system user runs it, and may run every internal action.
+        // On a secured cluster the system user runs the action, and may run every internal action.
         assertTrue(SystemPrivilege.INSTANCE.predicate().test(TransportPublishSnapshotBacklogAction.NAME));
     }
 
-    private static ClusterState state(TransportVersion minTransportVersion, long version) {
+    private static ClusterState state(TransportVersion minTransportVersion) {
         return ClusterState.builder(ClusterName.DEFAULT)
-            .version(version)
             .nodes(DiscoveryNodes.builder().add(LOCAL).localNodeId(LOCAL.getId()))
             .putCompatibilityVersions(LOCAL.getId(), new CompatibilityVersions(minTransportVersion, Map.of()))
             .build();

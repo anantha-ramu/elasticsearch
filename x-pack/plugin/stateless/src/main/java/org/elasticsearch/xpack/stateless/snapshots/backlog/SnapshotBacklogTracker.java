@@ -148,7 +148,8 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
 
     /**
      * @param localPrimaries the primary shards on this node, in any state
-     * @param publisher      gets the results of each evaluation, with the cluster state it used, to send them to the master
+     * @param publisher      receives each evaluation's results and the cluster state the evaluation used, and sends the results to
+     *                       the master
      */
     SnapshotBacklogTracker(
         ThreadPool threadPool,

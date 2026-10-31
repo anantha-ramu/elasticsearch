@@ -128,7 +128,7 @@ public class SnapshotBacklogMetricsServiceTests extends ESTestCase {
         apply(state(List.of(NODE_A), onA));
         assertFalse(service.update(report(NODE_B, 1, SHARD, measured(onB, 100))));
 
-        // B joins and holds the very copy the report named: nothing was kept from before it joined.
+        // B joins and holds the very copy the report named: nothing was kept from before B joined.
         apply(state(List.of(NODE_A, NODE_B), onB));
         assertThat(figures().get(SHARD), equalTo(ShardFigure.without(Status.NOT_REPORTED)));
     }
@@ -138,7 +138,7 @@ public class SnapshotBacklogMetricsServiceTests extends ESTestCase {
         assertFalse(service.update(report("a", "a-run-0", 5, Map.of(REPOSITORY, Map.of(SHARD, measured(onA, 100))))));
         assertThat(figures().get(SHARD), equalTo(ShardFigure.without(Status.NOT_REPORTED)));
 
-        // The node's current run is kept, and when it restarts its seq no starts again from 1.
+        // The report of the node's current run is kept. When the node restarts, its seq no starts again from 1.
         assertTrue(service.update(report(NODE_A, 5, SHARD, measured(onA, 100))));
         final DiscoveryNode restarted = DiscoveryNodeUtils.builder("a").ephemeralId("a-run-2").build();
         final ShardRouting afterRestart = started(SHARD, restarted);
@@ -217,7 +217,7 @@ public class SnapshotBacklogMetricsServiceTests extends ESTestCase {
         final ShardRouting relocating = onA.relocate(NODE_B.getId(), 0, ShardRouting.RecoveryPriority.RELOCATION_CAN_REMAIN_NO);
         apply(state(List.of(NODE_A, NODE_B), relocating));
         assertTrue(service.update(report(NODE_A, 1, SHARD, measured(onA, 100))));
-        // While it relocates, the source copy is still the primary.
+        // While the shard relocates, the source copy is still the primary.
         assertThat(figures().get(SHARD), equalTo(new ShardFigure(Status.MEASURED, GENERATION, 100)));
 
         // Once the target is the primary, the source's figure no longer counts, until the target reports.
@@ -299,7 +299,7 @@ public class SnapshotBacklogMetricsServiceTests extends ESTestCase {
         assertThat(sizeGauge(), anEmptyMap());
         assertFalse(service.update(report(NODE_A, 2, SHARD, measured(onA, 100))));
 
-        // Elected again: it starts empty.
+        // Elected master again: the store starts empty.
         apply(asMaster);
         assertThat(figures().get(SHARD), equalTo(ShardFigure.without(Status.NOT_REPORTED)));
     }
@@ -327,7 +327,7 @@ public class SnapshotBacklogMetricsServiceTests extends ESTestCase {
         assertThat(sizeGauge(), anEmptyMap());
         assertFalse(service.update(report(NODE_A, 2, SHARD, measured(onA, 100))));
 
-        // Turned on again, it starts empty.
+        // Turned on again: the store starts empty.
         service.setEnabled(true);
         assertThat(figures().get(SHARD), equalTo(ShardFigure.without(Status.NOT_REPORTED)));
     }

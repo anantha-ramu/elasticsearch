@@ -1037,7 +1037,8 @@ public class StatelessPlugin extends Plugin
         this.shardsMappingSizeCollector.set(shardsMappingSizeCollector);
         components.add(shardsMappingSizeCollector);
 
-        // on every node, since the action that receives the index nodes' reports needs it; it keeps them only on the elected master
+        // Created on every node, because TransportPublishSnapshotBacklogAction needs the service injected. Only the elected master
+        // keeps reports.
         components.add(new SnapshotBacklogMetricsService(clusterService, threadPool::relativeTimeInNanos, meterRegistry));
 
         if (hasIndexRole) {

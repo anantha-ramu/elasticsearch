@@ -7,10 +7,8 @@
 
 package org.elasticsearch.xpack.stateless.snapshots.backlog;
 
-import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.ClusterStateUpdateTask;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.settings.Settings;
@@ -23,10 +21,6 @@ import org.elasticsearch.telemetry.TestTelemetryPlugin;
 import org.elasticsearch.test.InternalSettingsPlugin;
 import org.elasticsearch.test.transport.MockTransportService;
 import org.elasticsearch.threadpool.ThreadPool;
-import org.elasticsearch.xpack.core.ilm.OperationMode;
-import org.elasticsearch.xpack.core.slm.SnapshotLifecycleMetadata;
-import org.elasticsearch.xpack.core.slm.SnapshotLifecyclePolicy;
-import org.elasticsearch.xpack.core.slm.SnapshotLifecyclePolicyMetadata;
 import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
 import org.elasticsearch.xpack.stateless.MetricQuality;
 import org.elasticsearch.xpack.stateless.commits.HollowShardsService;
@@ -48,13 +42,13 @@ import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.not;
 
 /**
- * Checks that what the index nodes measure reaches the master's {@link SnapshotBacklogMetricsService}: every primary's figure, exactly
- * as the node holding it measured it, and nothing from a copy the routing table no longer names (after a relocation, or once a node has
- * left the cluster).
+ * Checks that the figures the index nodes measure reach the master's {@link SnapshotBacklogMetricsService}. Each primary's figure on
+ * the master is the one the node holding that primary measured. A figure from a copy the routing table no longer names, after a
+ * relocation or once a node has left, is never used.
  * <p>
- * The test runs evaluations itself, so it doesn't wait for the scheduled ones every 30 seconds; those still run, so every check
- * that depends on the latest report is retried. Merges are off, so a figure doesn't change once the index is written. SLM itself
- * isn't loaded: the policies are put into the cluster state directly, as in {@link SnapshotBacklogIT}.
+ * Each test runs evaluations itself instead of waiting for the 30 second schedule. The scheduled evaluations still run, so every
+ * check that reads the latest report is retried with {@code assertBusy}. Merges are off, so a figure doesn't change once the index is
+ * written. SLM itself isn't loaded: the policies are put into the cluster state directly, as in {@link SnapshotBacklogIT}.
  */
 public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCase {
 
@@ -90,7 +84,7 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         final String firstNode = startIndexNode(backlogNodeSettings());
         final String secondNode = startIndexNode(backlogNodeSettings());
         createRepository(REPOSITORY, "fs");
-        putPolicy();
+        SnapshotBacklogIT.putPolicies(REPOSITORY);
         // one primary on each index node
         createIndex(
             INDEX,
@@ -108,9 +102,7 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
             assertThat(figures.size(), equalTo(2));
             for (Map.Entry<ShardId, ShardFigure> shardAndFigure : figures.entrySet()) {
                 // the figure the node holding the primary measured, with its generation, nothing else
-                final Result onNode = nodeResult(nodeHoldingPrimary(shardAndFigure.getKey()), shardAndFigure.getKey());
-                assertThat(onNode, instanceOf(Measured.class));
-                final Measured measured = (Measured) onNode;
+                final Measured measured = measuredOn(nodeHoldingPrimary(shardAndFigure.getKey()), shardAndFigure.getKey());
                 assertThat(shardAndFigure.getValue(), equalTo(new ShardFigure(Status.MEASURED, measured.generation(), measured.bytes())));
                 assertThat(measured.bytes(), greaterThan(0L));
             }
@@ -134,7 +126,7 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         startMasterOnlyNode(backlogNodeSettings());
         final String firstNode = startIndexNode(backlogNodeSettings());
         createRepository(REPOSITORY, "fs");
-        putPolicy();
+        SnapshotBacklogIT.putPolicies(REPOSITORY);
         createIndex(INDEX, indexSettings(1, 0).put(MergePolicyConfig.INDEX_MERGE_ENABLED, false).build());
         ensureGreen(INDEX);
         write();
@@ -166,7 +158,7 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
             evaluate(firstNode);
             evaluate(secondNode);
             assertThat(dropped.get(), greaterThan(0));
-            assertThat(nodeResult(secondNode, shardId), instanceOf(Measured.class));
+            measuredOn(secondNode, shardId);
         });
         assertThat(masterFigures().get(shardId), equalTo(ShardFigure.without(Status.NOT_REPORTED)));
         assertThat(masterFigures().get(shardId).quality(), equalTo(MetricQuality.MINIMUM));
@@ -184,7 +176,7 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         startMasterOnlyNode(backlogNodeSettings());
         final String firstNode = startIndexNode(backlogNodeSettings());
         createRepository(REPOSITORY, "fs");
-        putPolicy();
+        SnapshotBacklogIT.putPolicies(REPOSITORY);
         createIndex(INDEX, indexSettings(1, 0).put(MergePolicyConfig.INDEX_MERGE_ENABLED, false).build());
         ensureGreen(INDEX);
         write();
@@ -221,18 +213,14 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         safeGet(threadPool.executor(ThreadPool.Names.SNAPSHOT_META).submit(tracker::evaluate));
     }
 
-    // The figure the node measured for the shard; fails, so that assertBusy tries again, while it isn't measured.
+    // The figure the node measured for the shard. While the shard isn't measured, the assertion fails, so assertBusy tries again.
     private static Measured measuredOn(String node, ShardId shardId) {
-        final Result result = nodeResult(node, shardId);
-        assertThat(result, instanceOf(Measured.class));
-        return (Measured) result;
-    }
-
-    private static Result nodeResult(String node, ShardId shardId) {
-        return internalCluster().getInstance(SnapshotBacklogTracker.class, node)
+        final Result result = internalCluster().getInstance(SnapshotBacklogTracker.class, node)
             .getResults()
             .getOrDefault(PROJECT_REPO, Map.of())
             .get(shardId);
+        assertThat(result, instanceOf(Measured.class));
+        return (Measured) result;
     }
 
     private static SnapshotBacklogMetricsService masterService() {
@@ -252,39 +240,5 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
 
     private static String nodeId(String node) {
         return internalCluster().getInstance(ClusterService.class, node).localNode().getId();
-    }
-
-    // Puts one SLM policy for the repository in the default project's metadata.
-    private void putPolicy() {
-        final SnapshotLifecyclePolicyMetadata policy = SnapshotLifecyclePolicyMetadata.builder()
-            .setPolicy(new SnapshotLifecyclePolicy("policy", "snap", "0 0/30 * * * ?", REPOSITORY, null, null))
-            .setVersion(1)
-            .setModifiedDate(0)
-            .build();
-        safeAwait(
-            (ActionListener<Void> listener) -> internalCluster().getCurrentMasterNodeInstance(ClusterService.class)
-                .submitUnbatchedStateUpdateTask("put snapshot lifecycle policy", new ClusterStateUpdateTask() {
-                    @Override
-                    public ClusterState execute(ClusterState currentState) {
-                        return currentState.copyAndUpdateProject(
-                            ProjectId.DEFAULT,
-                            project -> project.putCustom(
-                                SnapshotLifecycleMetadata.TYPE,
-                                new SnapshotLifecycleMetadata(Map.of("policy", policy), OperationMode.RUNNING, null)
-                            )
-                        );
-                    }
-
-                    @Override
-                    public void clusterStateProcessed(ClusterState oldState, ClusterState newState) {
-                        listener.onResponse(null);
-                    }
-
-                    @Override
-                    public void onFailure(Exception e) {
-                        listener.onFailure(e);
-                    }
-                })
-        );
     }
 }

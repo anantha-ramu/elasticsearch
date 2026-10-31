@@ -27,7 +27,7 @@ import java.util.Objects;
  * <p>
  * A report is complete for the node: it lists every started primary on the node, for every repository the node measures for that
  * shard's project, either measured or not measured. So the master can tell a measured 0 from a shard the node didn't report, and a
- * newer report simply replaces the older one.
+ * newer report simply replaces the older report.
  */
 public class PublishSnapshotBacklogRequest extends MasterNodeRequest<PublishSnapshotBacklogRequest> {
 
@@ -78,8 +78,8 @@ public class PublishSnapshotBacklogRequest extends MasterNodeRequest<PublishSnap
     private final Map<ProjectRepo, Map<ShardId, ShardBacklog>> shards;
 
     /**
-     * @param nodeId          the id of the node that sends it
-     * @param nodeEphemeralId the ephemeral id of the node that sends it, which changes each time the node restarts
+     * @param nodeId          the id of the node that sends the report
+     * @param nodeEphemeralId the ephemeral id of the node that sends the report, which changes each time the node restarts
      * @param seqNo           goes up by one with each report of this node process
      * @param shards          per repository, per shard, the backlog
      */

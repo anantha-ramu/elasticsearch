@@ -365,7 +365,7 @@ public class SnapshotBacklogTrackerTests extends ESTestCase {
     public void testEvaluationAfterTurningOffPublishesNothing() {
         tracker.setEnabled(true);
         apply(state(TransportVersion.current(), project(PROJECT, List.of("repo"), List.of("repo"), INDEX)));
-        // Measuring is turned off while an evaluation runs: here, as it checks that the shard is started.
+        // Measuring is turned off during an evaluation: here, when the evaluation checks that the shard is started.
         primaries.add(new LocalPrimary(new ShardCopy(SHARD, "copy-0"), () -> {
             tracker.setEnabled(false);
             return true;

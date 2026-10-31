@@ -23,10 +23,12 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportService;
 
 /**
- * Receives an index node's latest snapshot backlog on the master and keeps it in the {@link SnapshotBacklogMetricsService}.
+ * Receives an index node's latest snapshot backlog report on the master, and passes the report to the
+ * {@link SnapshotBacklogMetricsService}, which keeps the latest report of each node.
  * <p>
- * It always answers success: a report the master doesn't keep (from a node that left, an older one, or one that arrives while the
- * feature is off) needs nothing from the node, whose next report follows anyway.
+ * The action always answers success, even when the master drops the report: for example, the report is older than the kept report,
+ * comes from a node that left, or arrives while the feature is off. A dropped report needs no retry, because the node sends a new
+ * report after its next evaluation.
  */
 public class TransportPublishSnapshotBacklogAction extends TransportMasterNodeAction<PublishSnapshotBacklogRequest, ActionResponse.Empty> {
 
