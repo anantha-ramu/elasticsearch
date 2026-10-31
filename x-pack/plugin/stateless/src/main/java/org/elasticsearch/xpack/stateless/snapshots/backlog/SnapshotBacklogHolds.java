@@ -27,36 +27,42 @@ import java.util.function.BiFunction;
 /**
  * The snapshot backlog figures the master holds while backups run, used by {@link SnapshotBacklogMetricsService}.
  * <p>
- * A backup takes the data a shard had when the shard's snapshot started. Data written after that is uploaded by the next backup.
- * So while a shard's snapshot runs, its figure must stay what it was at the start; otherwise new writes would raise the need in the
- * middle of a backup. For each repository and primary shard, using the running snapshots in the cluster state:
+ * Why: a backup uploads the data a shard had when the shard's snapshot started. Data written after that start is uploaded by the
+ * next backup. So while a shard's snapshot runs, the shard's figure must stay what it was at the start. Otherwise new writes would
+ * raise the need in the middle of a backup.
+ * <p>
+ * What it keeps: one hold for each shard that is active in a running snapshot, keyed by the snapshot and the shard. A hold records
+ * the generation of the shard's backup metadata that the snapshot started from (the start generation), and the held figure, or that
+ * there is none yet. Holds are dropped when the shard stops being active, and all are dropped when this node stops holding figures.
+ * <p>
+ * How each shard of a repository is counted, from the running snapshots in the cluster state:
  * <ul>
  *     <li><b>Active</b> in a running snapshot (started, not queued, not finished; {@link ShardSnapshotStatus#isActive()}): the figure
  *     held for that snapshot. A repository runs at most one snapshot of a shard at a time; later snapshots queue the shard.</li>
- *     <li><b>Finished</b> in every running snapshot that includes it: 0 ({@link Status#BACKED_UP}) until those snapshots end. A failed
- *     shard counts as finished: the next backup uploads its data.</li>
- *     <li>Otherwise, including a shard that is only queued: no figure from here, so the caller uses the live figure. A queued shard
- *     has no start generation yet, so there is nothing to hold it against.</li>
+ *     <li><b>Finished</b> in every running snapshot that includes the shard: 0 ({@link Status#BACKED_UP}) until those snapshots end.
+ *     A failed shard counts as finished, because the next backup uploads its data.</li>
+ *     <li>Otherwise, including a shard that is only queued: no figure from the holds, so the caller uses the live figure. A queued
+ *     shard has no start generation yet, so no figure can be matched to the start of its snapshot.</li>
  * </ul>
- * Which figure is held, for a shard that becomes active in a snapshot:
+ * Which figure is held, once a shard becomes active in a snapshot:
  * <ul>
- *     <li>The live figure, if it was measured against the generation of the shard's backup metadata that the snapshot started from
- *     ({@link ShardSnapshotStatus#generation()}). In a single backup this is the last report from before the start.</li>
- *     <li>Otherwise none yet ({@link Status#HOLD_PENDING}: 0, minimum), and the first live figure measured against that generation is
- *     held when it arrives. This happens when snapshots overlap: a queued shard starts in the same cluster state update that finishes
- *     it in the earlier snapshot, from the generation that update wrote, so no figure for that generation exists yet.</li>
+ *     <li>The live figure, if the node measured that figure against the start generation ({@link ShardSnapshotStatus#generation()}).
+ *     When one snapshot runs at a time, that figure comes from the last report before the snapshot started.</li>
+ *     <li>Otherwise none yet ({@link Status#HOLD_PENDING}: 0, minimum). The first live figure measured against the start generation is
+ *     held when a report brings one. Waiting happens when two snapshots of the repository overlap. The cluster state update that
+ *     finishes the shard in the earlier snapshot also starts the shard in the later snapshot, from the generation the earlier
+ *     snapshot just wrote. No report measured against that generation exists yet.</li>
  *     <li>A figure measured against any other generation is never held.</li>
  *     <li>Once held, the figure doesn't change until the shard finishes or the snapshot ends: not on new writes, not when the shard
  *     relocates (the upload may carry on from the old node), not when a node leaves (the upload starts again on another node).</li>
+ *     <li>A shard that is already active when the master starts holding figures (after a master failover, or when the feature is
+ *     turned on) gets no figure ({@link Status#HOLD_LOST}: 0, minimum) until the shard finishes. The master can't know the shard's
+ *     figure from when the snapshot started, and a figure measured later can include data written during the snapshot.</li>
  * </ul>
- * A shard that is already active when the master starts holding figures (after a master failover, or when the feature is turned on)
- * gets no held figure ({@link Status#HOLD_LOST}: 0, minimum) until it finishes. The master can't know what its figure was at the start,
- * and a figure measured now can include data written since.
- * <p>
- * Why the order of updates is safe: a hold is added by the cluster state listener, and filled either there or when a report arrives.
- * Each side first stores what it has (the pending hold, or the report) and then looks for the other, and filling is a compare-and-set
- * from pending to held. So a report and the shard becoming active can arrive in either order without the hold being missed or filled
- * twice.
+ * Why concurrent updates are safe: the cluster state listener adds a hold and may fill it, and a report arriving on another thread
+ * may fill it later. The listener stores the pending hold before it looks up the live figure, and the report handler stores the
+ * report before it looks for pending holds. Filling is a compare-and-set from the pending hold to the held figure. So a report and
+ * the shard becoming active can arrive in either order, and a hold is never missed, filled twice, or brought back after being dropped.
  */
 final class SnapshotBacklogHolds {
 
@@ -82,12 +88,13 @@ final class SnapshotBacklogHolds {
     private final Map<Key, Hold> holds = new ConcurrentHashMap<>();
 
     /**
-     * Follows the running snapshots: forgets the holds of shards that are no longer active, and adds one for each shard that has just
-    * become active. Call it with every cluster state whose running snapshots changed, in order. It follows the snapshots of every
-     * repository, not only those SLM policies name, so a policy added during a snapshot needs nothing special.
+     * Updates the holds to match the running snapshots in the given cluster state: drops the holds of shards that are no longer
+     * active, and adds a hold for each shard that has just become active. Call {@code onClusterState} with every cluster state whose
+     * running snapshots changed, in order. Every repository's snapshots are followed, not only those of repositories SLM policies
+     * name, so a policy added during a snapshot needs no special handling.
      *
-     * @param firstState   whether this is the first state since the master started holding figures; shards already active in it get
-     *                     {@link Status#HOLD_LOST}
+     * @param firstState   whether the given state is the first since the master started holding figures; shards already active in
+     *                     that state get {@link Status#HOLD_LOST}
      * @param liveFigures  the live figure of a shard in a repository, as {@link SnapshotBacklogMetricsService} sees it at that moment
      */
     void onClusterState(ClusterState state, boolean firstState, BiFunction<ProjectRepo, ShardId, ShardFigure> liveFigures) {
@@ -111,8 +118,8 @@ final class SnapshotBacklogHolds {
     }
 
     /**
-     * Fills every pending hold whose shard now has a live figure measured against the snapshot's start generation. Call it after a
-     * report is stored. Pending holds only exist while snapshots overlap, so there are few.
+     * Fills every pending hold whose shard now has a live figure measured against the snapshot's start generation. Call
+     * {@code onReport} after storing a node's report. Pending holds only exist while snapshots overlap, so there are few.
      */
     void onReport(BiFunction<ProjectRepo, ShardId, ShardFigure> liveFigures) {
         for (Map.Entry<Key, Hold> keyAndHold : holds.entrySet()) {
@@ -134,8 +141,8 @@ final class SnapshotBacklogHolds {
      * snapshot, or finished in every snapshot that includes it. A shard left out uses its live figure.
      * <p>
      * Whether a shard is active comes only from the given state. An active shard without a hold yet counts as
-     * {@link Status#HOLD_PENDING}: the given state can be newer than the last one {@link #onClusterState} saw, since the cluster
-     * service makes a new state visible before it calls the listeners.
+     * {@link Status#HOLD_PENDING}: the given cluster state can be newer than the last cluster state passed to
+     * {@link #onClusterState}, because the cluster service makes a new state visible before it calls the listeners.
      */
     Map<ShardId, ShardFigure> getFigures(ClusterState state, ProjectRepo projectRepo) {
         final Map<ShardId, ShardFigure> figures = new HashMap<>();

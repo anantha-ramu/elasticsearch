@@ -52,10 +52,11 @@ import java.util.function.Supplier;
  * Each primary gets one {@link Status}, checked in this order, the first that applies. First, while a snapshot of the repository runs
  * ({@link SnapshotBacklogHolds} explains why and how):
  * <ul>
- *     <li>{@link Status#HELD}: the shard's snapshot is running, and the figure from when it started is held;</li>
- *     <li>{@link Status#HOLD_PENDING}: the shard's snapshot is running, and no figure from its start is known yet;</li>
+ *     <li>{@link Status#HELD}: the shard's snapshot is running, and the figure from when the snapshot started is held;</li>
+ *     <li>{@link Status#HOLD_PENDING}: the shard's snapshot is running, and no figure from when the snapshot started is known yet;</li>
  *     <li>{@link Status#HOLD_LOST}: the shard's snapshot was already running when this node started holding figures;</li>
- *     <li>{@link Status#BACKED_UP}: the shard has finished in every running snapshot that includes it, so it counts 0.</li>
+ *     <li>{@link Status#BACKED_UP}: the shard has finished in every running snapshot that includes the shard, so the shard counts
+ *     0.</li>
  * </ul>
  * Otherwise, the live figure, from the reports:
  * <ul>
@@ -173,8 +174,10 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
     private final Map<String, NodeReport> reports = new ConcurrentHashMap<>();
     private final SnapshotBacklogHolds holds = new SnapshotBacklogHolds();
     private volatile boolean enabled;
-    // Whether the holds follow the running snapshots since an earlier cluster state. False until the first state after this node
-    // became master or the setting was turned on, in which shards already active can't be held. Only changed on the applier thread.
+    // Whether the holds have followed the running snapshots since an earlier cluster state. False until the first cluster state after
+    // this node becomes master or the setting is turned on; shards already active in that first state can't be held. Changed only on
+    // the cluster applier thread, which also applies settings (ClusterApplierService applies the settings before calling the
+    // listeners), so setEnabled and clusterChanged never run at the same time.
     private volatile boolean holding;
 
     @SuppressWarnings("this-escape")
@@ -306,7 +309,7 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
             if (routingTable == null) {
                 continue;
             }
-            // shards that a running snapshot holds, or has finished, take that figure instead of the live one
+            // shards active or finished in a running snapshot get their figure from the holds instead of the live reports
             final Map<ShardId, ShardFigure> backups = holds.getFigures(state, projectRepo);
             final Map<ShardId, ShardFigure> repositoryFigures = new HashMap<>();
             for (IndexRoutingTable indexRoutingTable : routingTable) {
@@ -359,7 +362,7 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
     }
 
     /**
-     * The quality of a total over the given figures: exact only if every one of them is exact.
+     * The quality of a total over the given figures: exact only if every figure is exact.
      */
     public static MetricQuality quality(Collection<ShardFigure> figures) {
         for (ShardFigure figure : figures) {

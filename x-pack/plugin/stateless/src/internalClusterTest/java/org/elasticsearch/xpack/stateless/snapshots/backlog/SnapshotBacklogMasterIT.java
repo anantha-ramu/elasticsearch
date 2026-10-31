@@ -244,7 +244,7 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         final ShardFigure beforeTheStart = masterFigures().get(shardId);
         final String secondNode = startIndexNode(settings);
 
-        // The second snapshot blocks while reading the shard's data on the first node, so the shard stays active in it.
+        // The second snapshot blocks while reading the shard's data on the first node, so the shard stays active in the snapshot.
         final CountDownLatch reading = new CountDownLatch(1);
         final CountDownLatch unblock = new CountDownLatch(1);
         setNodeRepositoryStrategy(firstNode, new StatelessMockRepositoryStrategy() {
@@ -281,28 +281,32 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
             .setWaitForCompletion(true)
             .execute();
         safeAwait(reading);
-        assertBusy(() -> assertThat(masterFigures().get(shardId), equalTo(held(beforeTheStart))));
+        try {
+            assertBusy(() -> assertThat(masterFigures().get(shardId), equalTo(held(beforeTheStart))));
 
-        // New writes raise the node's own figure, but the master keeps the figure from the start.
-        write();
-        assertBusy(() -> {
-            evaluate(firstNode);
-            assertThat(measuredOn(firstNode, shardId).bytes(), greaterThan(beforeTheStart.bytes()));
-        });
-        assertThat(masterFigures().get(shardId), equalTo(held(beforeTheStart)));
+            // New writes raise the node's own figure, but the master keeps the figure from the start.
+            write();
+            assertBusy(() -> {
+                evaluate(firstNode);
+                assertThat(measuredOn(firstNode, shardId).bytes(), greaterThan(beforeTheStart.bytes()));
+            });
+            assertThat(masterFigures().get(shardId), equalTo(held(beforeTheStart)));
 
-        // So does a relocation: the upload carries on from the first node.
-        updateIndexSettings(Settings.builder().put("index.routing.allocation.exclude._name", firstNode), INDEX);
-        internalCluster().awaitNodeVacated(INDEX, firstNode);
-        ensureGreen(INDEX);
-        assertBusy(() -> {
-            evaluate(secondNode);
-            measuredOn(secondNode, shardId);
-        });
-        assertThat(masterFigures().get(shardId), equalTo(held(beforeTheStart)));
+            // The master also keeps that figure when the shard relocates: the upload carries on from the first node.
+            updateIndexSettings(Settings.builder().put("index.routing.allocation.exclude._name", firstNode), INDEX);
+            internalCluster().awaitNodeVacated(INDEX, firstNode);
+            ensureGreen(INDEX);
+            assertBusy(() -> {
+                evaluate(secondNode);
+                measuredOn(secondNode, shardId);
+            });
+            assertThat(masterFigures().get(shardId), equalTo(held(beforeTheStart)));
+        } finally {
+            // released even if a check fails, so the blocked snapshot thread doesn't hold up the cluster's shutdown
+            unblock.countDown();
+        }
 
         // Once the snapshot ends, the figure is live again: measured by the second node against the new generation.
-        unblock.countDown();
         assertThat(safeGet(snapshot).getSnapshotInfo().state(), equalTo(SnapshotState.SUCCESS));
         final ShardGeneration nextGeneration = SnapshotBacklogIT.expectedGeneration(REPOSITORY, shardId);
         assertThat(nextGeneration, not(equalTo(startGeneration)));
