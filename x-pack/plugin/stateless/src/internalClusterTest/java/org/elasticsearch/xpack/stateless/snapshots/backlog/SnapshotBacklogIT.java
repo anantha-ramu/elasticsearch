@@ -258,7 +258,10 @@ public class SnapshotBacklogIT extends AbstractStatelessPluginIntegTestCase {
         writeAndSettle(2);
         assertFiguresMatchNextSnapshot(firstNode, REPOSITORY, 1, "snap-1");
 
-        // A shard relocated with no recent writes arrives hollow.
+        // A shard relocated with no recent writes arrives hollow, once it is hollowable on the node it leaves.
+        final HollowShardsService firstNodeHollowShards = internalCluster().getInstance(HollowShardsService.class, firstNode);
+        final IndexShard firstCopy = findIndexShard(resolveIndex(INDEX), 0);
+        assertBusy(() -> assertTrue(firstNodeHollowShards.isHollowableIndexShard(firstCopy)));
         final String secondNode = startIndexNode(nodeSettings(true));
         updateIndexSettings(Settings.builder().put("index.routing.allocation.exclude._name", firstNode), INDEX);
         internalCluster().awaitNodeVacated(INDEX, firstNode);
@@ -267,11 +270,10 @@ public class SnapshotBacklogIT extends AbstractStatelessPluginIntegTestCase {
         final HollowShardsService hollowShards = internalCluster().getInstance(HollowShardsService.class, secondNode);
         assertBusy(() -> assertTrue(hollowShards.isHollowShard(shardId)));
 
-        final TestTelemetryPlugin telemetry = getTelemetryPlugin(secondNode);
-        telemetry.resetMeter();
+        // The second node never held the shard other than hollow, so it never read its backup metadata, not even in a background
+        // evaluation before this one.
         assertThat(measure(secondNode, REPOSITORY, shardId, expectedGeneration(REPOSITORY, shardId)), equalTo(0L));
-        telemetry.collect();
-        assertThat(telemetry.getLongCounterMeasurement(BlobStoreMetadataReader.READS_METRIC).size(), equalTo(0));
+        assertThat(metadataReads(secondNode), equalTo(0L));
     }
 
     public void testFinishedSnapshotGenerationIsUsedUntilTheMasterAnswers() throws Exception {
