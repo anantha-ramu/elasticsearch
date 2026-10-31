@@ -33,9 +33,10 @@ import java.util.function.BiFunction;
  * next backup. So while a shard's snapshot runs, the shard's figure must stay what it was at the start. Otherwise new writes would
  * raise the need in the middle of a backup.
  * <p>
- * What it keeps: one hold for each shard that is active in a running snapshot, keyed by the snapshot and the shard. A hold records
+ * What the class keeps: one hold for each shard that is active in a running snapshot, keyed by the snapshot and the shard. A hold records
  * the generation of the shard's backup metadata that the snapshot started from (the start generation), and the held figure, or that
- * there is none yet. Holds are dropped when the shard stops being active, and all are dropped when this node stops holding figures.
+ * there is none yet. Holds are dropped when the shard stops being active, and all holds are dropped when this node stops holding
+ * figures.
  * <p>
  * How each shard of a repository is counted, from the running snapshots in the cluster state:
  * <ul>
@@ -55,20 +56,21 @@ import java.util.function.BiFunction;
  *     finishes the shard in the earlier snapshot also starts the shard in the later snapshot, from the generation the earlier
  *     snapshot just wrote. No report measured against that generation exists yet.</li>
  *     <li>A figure measured against any other generation is never held.</li>
- *     <li>The first snapshot of a new index starts from {@link ShardGenerations#NEW_SHARD_GEN}, and so does the node's figure for a
- *     shard the repository doesn't know. A shard the repository doesn't know in an index it does know, such as a new shard after a
- *     split, starts from no generation ({@code null}): the snapshot then starts from nothing, as with {@code NEW_SHARD_GEN}, so a
- *     figure measured against {@code NEW_SHARD_GEN} is held for it.</li>
+ *     <li>The first snapshot of a new index starts from {@link ShardGenerations#NEW_SHARD_GEN}, and the node measures a shard the
+ *     repository doesn't know against {@code NEW_SHARD_GEN} too. A new shard in an index the repository already knows, such as after
+ *     a shard split, starts its snapshot from no generation ({@code null}). That snapshot also uploads the whole shard, so a figure
+ *     measured against {@code NEW_SHARD_GEN} is held for the shard.</li>
  *     <li>Once held, the figure doesn't change until the shard finishes or the snapshot ends: not on new writes, not when the shard
  *     relocates (the upload may carry on from the old node), not when a node leaves (the upload starts again on another node).</li>
  *     <li>A shard that is already active when the master starts holding figures (after a master failover, or when the feature is
  *     turned on) gets no figure ({@link Status#HOLD_LOST}: 0, minimum) until the shard finishes. The master can't know the shard's
  *     figure from when the snapshot started, and a figure measured later can include data written during the snapshot.</li>
  * </ul>
- * Why concurrent updates are safe: the cluster state listener adds a hold and may fill it, and a report arriving on another thread
- * may fill it later. The listener stores the pending hold before it looks up the live figure, and the report handler stores the
- * report before it looks for pending holds. Filling is a compare-and-set from the pending hold to the held figure. So a report and
- * the shard becoming active can arrive in either order, and a hold is never missed, filled twice, or brought back after being dropped.
+ * Why concurrent updates are safe: the cluster state listener adds a hold and may fill the hold at once, or a report arriving on
+ * another thread may fill the hold later. The listener stores the pending hold before it looks up the live figure, and the report
+ * handler stores the report before it looks for pending holds. Filling is a compare-and-set from the pending hold to the held figure.
+ * So a report and the shard becoming active can arrive in either order, and a hold is never missed, filled twice, or brought back
+ * after being dropped.
  */
 final class SnapshotBacklogHolds {
 
