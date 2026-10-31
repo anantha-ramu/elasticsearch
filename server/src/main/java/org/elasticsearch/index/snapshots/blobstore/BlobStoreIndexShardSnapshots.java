@@ -11,6 +11,7 @@ package org.elasticsearch.index.snapshots.blobstore;
 
 import org.elasticsearch.common.util.CollectionUtils;
 import org.elasticsearch.common.xcontent.XContentParserUtils;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
 import org.elasticsearch.index.store.StoreFileMetadata;
@@ -271,15 +272,33 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
         return INTEGRITY_ASSERTIONS_ENABLED;
     }
 
-    public static BlobStoreIndexShardSnapshots fromXContent(XContentParser parser) throws IOException {
+    /**
+     * Receives shard-level snapshot metadata one entry at a time, as {@link #parse} reads it, so that a reader can keep only what it
+     * needs rather than the whole metadata, which grows with the number of snapshots retained.
+     */
+    public interface Visitor {
+        /**
+         * A blob of the shard. The metadata lists each blob once, before the snapshots.
+         */
+        void file(FileInfo fileInfo);
+
+        /**
+         * A snapshot of the shard. The metadata lists them in the order they were added.
+         *
+         * @param fileNames    the names of the blobs the snapshot holds ({@link FileInfo#name}), or {@code null} if none are listed
+         * @param shardStateId the snapshot's shard state id, or {@code null} if it has none
+         */
+        void snapshot(String name, @Nullable List<String> fileNames, @Nullable String shardStateId);
+    }
+
+    /**
+     * Parses shard-level snapshot metadata, as written by {@link #toXContent}, and hands each entry to the visitor as it is read.
+     */
+    public static void parse(XContentParser parser, Visitor visitor) throws IOException {
         XContentParser.Token token = parser.currentToken();
         if (token == null) { // New parser
             token = parser.nextToken();
         }
-        // list of tuples of snapshot name and file ids in the snapshot
-        List<Tuple<String, List<String>>> snapshotsAndFiles = new ArrayList<>();
-        Map<String, String> historyUUIDs = new HashMap<>();
-        Map<String, FileInfo> files = new HashMap<>();
         XContentParserUtils.ensureExpectedToken(XContentParser.Token.START_OBJECT, token, parser);
         String currentFieldName;
         while ((currentFieldName = parser.nextFieldName()) != null) {
@@ -290,8 +309,7 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
                         XContentParserUtils.throwUnknownField(currentFieldName, parser);
                     }
                     while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
-                        FileInfo fileInfo = FileInfo.fromXContent(parser);
-                        files.put(fileInfo.name(), fileInfo);
+                        visitor.file(FileInfo.fromXContent(parser));
                     }
                 }
                 case START_OBJECT -> {
@@ -301,23 +319,47 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
                     String snapshot;
                     while ((snapshot = parser.nextFieldName()) != null) {
                         XContentParserUtils.ensureExpectedToken(XContentParser.Token.START_OBJECT, parser.nextToken(), parser);
+                        List<String> fileNames = null;
+                        String shardStateId = null;
                         while ((currentFieldName = parser.nextFieldName()) != null) {
                             token = parser.nextToken();
                             if (Fields.FILES.equals(currentFieldName)) {
                                 if (token == XContentParser.Token.START_ARRAY) {
-                                    snapshotsAndFiles.add(
-                                        Tuple.tuple(snapshot, XContentParserUtils.parseList(parser, XContentParser::text))
-                                    );
+                                    fileNames = XContentParserUtils.parseList(parser, XContentParser::text);
                                 }
                             } else if (Fields.SHARD_STATE_ID.equals(currentFieldName)) {
-                                historyUUIDs.put(snapshot, parser.text());
+                                shardStateId = parser.text();
                             }
                         }
+                        visitor.snapshot(snapshot, fileNames, shardStateId);
                     }
                 }
                 default -> XContentParserUtils.throwUnknownToken(token, parser);
             }
         }
+    }
+
+    public static BlobStoreIndexShardSnapshots fromXContent(XContentParser parser) throws IOException {
+        // list of tuples of snapshot name and file ids in the snapshot
+        List<Tuple<String, List<String>>> snapshotsAndFiles = new ArrayList<>();
+        Map<String, String> historyUUIDs = new HashMap<>();
+        Map<String, FileInfo> files = new HashMap<>();
+        parse(parser, new Visitor() {
+            @Override
+            public void file(FileInfo fileInfo) {
+                files.put(fileInfo.name(), fileInfo);
+            }
+
+            @Override
+            public void snapshot(String name, List<String> fileNames, String shardStateId) {
+                if (fileNames != null) {
+                    snapshotsAndFiles.add(Tuple.tuple(name, fileNames));
+                }
+                if (shardStateId != null) {
+                    historyUUIDs.put(name, shardStateId);
+                }
+            }
+        });
 
         List<SnapshotFiles> snapshots = new ArrayList<>(snapshotsAndFiles.size());
         for (Tuple<String, List<String>> entry : snapshotsAndFiles) {
