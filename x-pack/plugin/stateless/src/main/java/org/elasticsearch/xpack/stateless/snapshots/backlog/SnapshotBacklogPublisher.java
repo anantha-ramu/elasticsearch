@@ -100,7 +100,6 @@ final class SnapshotBacklogPublisher {
             localNode.getId(),
             localNode.getEphemeralId(),
             seqNo.incrementAndGet(),
-            state.version(),
             shards
         );
         ActionListener.run(

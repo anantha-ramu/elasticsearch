@@ -59,7 +59,6 @@ public class PublishSnapshotBacklogRequestSerializationTests extends AbstractWir
             randomIdentifier(),
             randomUUID(),
             randomNonNegativeLong(),
-            randomNonNegativeLong(),
             randomShards()
         );
     }
@@ -70,15 +69,13 @@ public class PublishSnapshotBacklogRequestSerializationTests extends AbstractWir
         final String nodeId = instance.nodeId();
         final String ephemeralId = instance.nodeEphemeralId();
         final long seqNo = instance.seqNo();
-        final long version = instance.clusterStateVersion();
         final var shards = instance.shards();
-        return switch (between(0, 5)) {
+        return switch (between(0, 4)) {
             case 0 -> new PublishSnapshotBacklogRequest(
                 randomValueOtherThan(timeout, ESTestCase::randomTimeValue),
                 nodeId,
                 ephemeralId,
                 seqNo,
-                version,
                 shards
             );
             case 1 -> new PublishSnapshotBacklogRequest(
@@ -86,7 +83,6 @@ public class PublishSnapshotBacklogRequestSerializationTests extends AbstractWir
                 randomValueOtherThan(nodeId, ESTestCase::randomIdentifier),
                 ephemeralId,
                 seqNo,
-                version,
                 shards
             );
             case 2 -> new PublishSnapshotBacklogRequest(
@@ -94,7 +90,6 @@ public class PublishSnapshotBacklogRequestSerializationTests extends AbstractWir
                 nodeId,
                 randomValueOtherThan(ephemeralId, ESTestCase::randomUUID),
                 seqNo,
-                version,
                 shards
             );
             case 3 -> new PublishSnapshotBacklogRequest(
@@ -102,7 +97,6 @@ public class PublishSnapshotBacklogRequestSerializationTests extends AbstractWir
                 nodeId,
                 ephemeralId,
                 randomValueOtherThan(seqNo, ESTestCase::randomNonNegativeLong),
-                version,
                 shards
             );
             case 4 -> new PublishSnapshotBacklogRequest(
@@ -110,15 +104,6 @@ public class PublishSnapshotBacklogRequestSerializationTests extends AbstractWir
                 nodeId,
                 ephemeralId,
                 seqNo,
-                randomValueOtherThan(version, ESTestCase::randomNonNegativeLong),
-                shards
-            );
-            case 5 -> new PublishSnapshotBacklogRequest(
-                timeout,
-                nodeId,
-                ephemeralId,
-                seqNo,
-                version,
                 randomValueOtherThan(shards, PublishSnapshotBacklogRequestSerializationTests::randomShards)
             );
             default -> throw new AssertionError("unexpected branch");
@@ -136,7 +121,6 @@ public class PublishSnapshotBacklogRequestSerializationTests extends AbstractWir
             TimeValue.THIRTY_SECONDS,
             "node",
             "ephemeral",
-            1,
             1,
             Map.of(
                 repository,
@@ -179,7 +163,6 @@ public class PublishSnapshotBacklogRequestSerializationTests extends AbstractWir
             TimeValue.THIRTY_SECONDS,
             UUIDs.randomBase64UUID(random()),
             UUIDs.randomBase64UUID(random()),
-            1,
             1,
             Map.of(new ProjectRepo(randomProjectIdOrDefault(), "found-snapshots"), byShard)
         );

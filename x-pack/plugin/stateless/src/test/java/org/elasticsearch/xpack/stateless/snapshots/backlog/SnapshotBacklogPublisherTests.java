@@ -58,7 +58,7 @@ public class SnapshotBacklogPublisherTests extends ESTestCase {
         millis::get
     );
 
-    public void testReportCarriesTheNodeAndTheClusterState() {
+    public void testReportCarriesTheNode() {
         final ClusterState state = state(TransportVersion.current(), 42);
         publisher.publish(state, SHARDS);
 
@@ -66,7 +66,6 @@ public class SnapshotBacklogPublisherTests extends ESTestCase {
         final PublishSnapshotBacklogRequest request = sent.get(0).request();
         assertThat(request.nodeId(), equalTo("local"));
         assertThat(request.nodeEphemeralId(), equalTo("local-run"));
-        assertThat(request.clusterStateVersion(), equalTo(42L));
         assertThat(request.seqNo(), equalTo(1L));
         assertThat(request.shards(), equalTo(SHARDS));
         // a report waits at most one evaluation interval for a master
@@ -93,7 +92,6 @@ public class SnapshotBacklogPublisherTests extends ESTestCase {
         publisher.publish(state(TransportVersion.current(), 3), SHARDS);
         assertThat(sent, hasSize(2));
         assertThat(sent.get(1).request().seqNo(), equalTo(2L));
-        assertThat(sent.get(1).request().clusterStateVersion(), equalTo(3L));
     }
 
     public void testFailureIsNotRetried() {
@@ -141,7 +139,7 @@ public class SnapshotBacklogPublisherTests extends ESTestCase {
         try (ThreadContext.StoredContext ignored = threadContext.stashContext()) {
             threadContext.putHeader("caller-header", "value");
             SnapshotBacklogPublisher.systemContextSender(client)
-                .send(new PublishSnapshotBacklogRequest(TEST_REQUEST_TIMEOUT, "local", "local-run", 1, 1, SHARDS), ActionListener.noop());
+                .send(new PublishSnapshotBacklogRequest(TEST_REQUEST_TIMEOUT, "local", "local-run", 1, SHARDS), ActionListener.noop());
             // The caller's context is back afterwards.
             assertFalse(threadContext.isSystemContext());
             assertThat(threadContext.getHeader("caller-header"), equalTo("value"));

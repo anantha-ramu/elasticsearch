@@ -75,30 +75,25 @@ public class PublishSnapshotBacklogRequest extends MasterNodeRequest<PublishSnap
     private final String nodeId;
     private final String nodeEphemeralId;
     private final long seqNo;
-    private final long clusterStateVersion;
     private final Map<ProjectRepo, Map<ShardId, ShardBacklog>> shards;
 
     /**
-     * @param nodeId              the id of the node that sends it
-     * @param nodeEphemeralId     the ephemeral id of the node that sends it, which changes each time the node restarts
-     * @param seqNo               goes up by one with each report of this node process
-     * @param clusterStateVersion the version of the cluster state the evaluation used. The master doesn't use it yet; it is there so the
-     *                            master can tell a report built before a snapshot started from one built after
-     * @param shards              per repository, per shard, the backlog
+     * @param nodeId          the id of the node that sends it
+     * @param nodeEphemeralId the ephemeral id of the node that sends it, which changes each time the node restarts
+     * @param seqNo           goes up by one with each report of this node process
+     * @param shards          per repository, per shard, the backlog
      */
     public PublishSnapshotBacklogRequest(
         TimeValue masterNodeTimeout,
         String nodeId,
         String nodeEphemeralId,
         long seqNo,
-        long clusterStateVersion,
         Map<ProjectRepo, Map<ShardId, ShardBacklog>> shards
     ) {
         super(masterNodeTimeout);
         this.nodeId = Objects.requireNonNull(nodeId);
         this.nodeEphemeralId = Objects.requireNonNull(nodeEphemeralId);
         this.seqNo = seqNo;
-        this.clusterStateVersion = clusterStateVersion;
         this.shards = Map.copyOf(shards);
     }
 
@@ -107,7 +102,6 @@ public class PublishSnapshotBacklogRequest extends MasterNodeRequest<PublishSnap
         this.nodeId = in.readString();
         this.nodeEphemeralId = in.readString();
         this.seqNo = in.readVLong();
-        this.clusterStateVersion = in.readVLong();
         this.shards = in.readImmutableMap(ProjectRepo::new, i -> i.readImmutableMap(ShardId::new, ShardBacklog::readFrom));
     }
 
@@ -117,7 +111,6 @@ public class PublishSnapshotBacklogRequest extends MasterNodeRequest<PublishSnap
         out.writeString(nodeId);
         out.writeString(nodeEphemeralId);
         out.writeVLong(seqNo);
-        out.writeVLong(clusterStateVersion);
         out.writeMap(shards, StreamOutput::writeWriteable, (o, byShard) -> o.writeMap(byShard));
     }
 
@@ -138,10 +131,6 @@ public class PublishSnapshotBacklogRequest extends MasterNodeRequest<PublishSnap
         return seqNo;
     }
 
-    public long clusterStateVersion() {
-        return clusterStateVersion;
-    }
-
     public Map<ProjectRepo, Map<ShardId, ShardBacklog>> shards() {
         return shards;
     }
@@ -152,7 +141,6 @@ public class PublishSnapshotBacklogRequest extends MasterNodeRequest<PublishSnap
         if (o == null || getClass() != o.getClass()) return false;
         PublishSnapshotBacklogRequest that = (PublishSnapshotBacklogRequest) o;
         return seqNo == that.seqNo
-            && clusterStateVersion == that.clusterStateVersion
             && nodeId.equals(that.nodeId)
             && nodeEphemeralId.equals(that.nodeEphemeralId)
             && shards.equals(that.shards)
@@ -161,7 +149,7 @@ public class PublishSnapshotBacklogRequest extends MasterNodeRequest<PublishSnap
 
     @Override
     public int hashCode() {
-        return Objects.hash(nodeId, nodeEphemeralId, seqNo, clusterStateVersion, shards, masterNodeTimeout());
+        return Objects.hash(nodeId, nodeEphemeralId, seqNo, shards, masterNodeTimeout());
     }
 
     @Override

@@ -376,7 +376,7 @@ public class SnapshotBacklogMetricsServiceTests extends ESTestCase {
         long seqNo,
         Map<ProjectRepo, Map<ShardId, ShardBacklog>> shards
     ) {
-        return new PublishSnapshotBacklogRequest(TEST_REQUEST_TIMEOUT, nodeId, ephemeralId, seqNo, 1, shards);
+        return new PublishSnapshotBacklogRequest(TEST_REQUEST_TIMEOUT, nodeId, ephemeralId, seqNo, shards);
     }
 
     private Map<String, Long> sizeGauge() {
