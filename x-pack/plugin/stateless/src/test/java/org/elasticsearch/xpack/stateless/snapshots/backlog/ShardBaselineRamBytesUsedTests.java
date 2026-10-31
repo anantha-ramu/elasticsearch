@@ -40,23 +40,24 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
 
     @Override
     protected Set<String> fieldsAccountedForInRamBytesUsed() {
-        return Set.of("backedUpFilesByName", "latestStateId");
+        return Set.of("backedUpWriterUuids", "latestStateId");
     }
 
     @Override
     protected Accountable createRandomTestInstance() {
-        final List<FileInfo> files = randomBackedUpFiles(0, between(0, 50));
-        // Add files with the same names as some earlier files, as from an index created again under the same name.
-        for (FileInfo file : randomSubsetOf(files)) {
-            files.add(new FileInfo("__" + UUIDs.randomBase64UUID(random()), metadata(file.physicalName(), randomWriterUuid()), null));
+        final List<FileInfo> current = randomBackedUpFiles(0, between(0, 50));
+        final List<FileInfo> backedUp = new ArrayList<>(current);
+        // Add files with the same names and lengths as some of the current ones, as from an index created again under the same name.
+        for (FileInfo file : randomSubsetOf(current)) {
+            backedUp.add(withWriterUuid(file, randomBoolean() ? randomWriterUuid() : StoreFileMetadata.UNAVAILABLE_WRITER_UUID));
         }
         var snapshots = BlobStoreIndexShardSnapshots.EMPTY;
         for (int i = between(0, 5); i > 0; i--) {
             snapshots = snapshots.withAddedSnapshot(
-                new SnapshotFiles("snap-" + i, randomSubsetOf(files), randomBoolean() ? null : randomStateId())
+                new SnapshotFiles("snap-" + i, randomSubsetOf(backedUp), randomBoolean() ? null : randomStateId())
             );
         }
-        return ShardBaseline.of(readBack(snapshots), luceneFiles(randomSubsetOf(files)));
+        return ShardBaseline.of(readBack(snapshots, randomBoolean()), luceneFiles(randomSubsetOf(current)));
     }
 
     public void testFilesOfSeveralSnapshotsAreKeptOnce() {
@@ -111,20 +112,14 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         );
     }
 
-    public void testFilesOfTheSameNameAndAnotherLengthCostNothing() {
+    public void testFilesOfAnEarlierCopyOfTheIndexCostNothing() {
         final List<FileInfo> current = randomBackedUpFiles(0, between(1, 50));
-        // Files with the same names and other lengths, from an earlier copy of the index that was deleted and created again under
-        // the same name. isSame never matches files of different lengths, so the baseline must drop these, even though their names
-        // match.
+        // Files with the same names and lengths, from an earlier copy of the index that was deleted and created again under the same
+        // name. They have other writer uuids, or none if a version before 7.16 backed them up, so they can never match, and the
+        // baseline must drop them.
         final List<FileInfo> earlier = new ArrayList<>();
         for (FileInfo file : current) {
-            earlier.add(
-                new FileInfo(
-                    "__" + UUIDs.randomBase64UUID(random()),
-                    metadata(file.physicalName(), file.length() + between(1, 1000), randomWriterUuid()),
-                    null
-                )
-            );
+            earlier.add(withWriterUuid(file, randomBoolean() ? randomWriterUuid() : StoreFileMetadata.UNAVAILABLE_WRITER_UUID));
         }
         final var earlierAndCurrent = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap-0", earlier, null))
             .withAddedSnapshot(new SnapshotFiles("snap-1", current, null));
@@ -134,6 +129,18 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
             ShardBaseline.of(earlierAndCurrent, luceneFiles(current)).ramBytesUsed(),
             equalTo(ShardBaseline.of(onlyCurrent, luceneFiles(current)).ramBytesUsed())
         );
+    }
+
+    public void testFilesWithoutAWriterUuidCostNothing() {
+        // A file without a writer uuid is always counted, so the baseline keeps nothing for it, even when the repository has a file
+        // with the same name and length and no writer uuid either.
+        final List<FileInfo> files = new ArrayList<>();
+        for (FileInfo file : randomBackedUpFiles(0, between(1, 50))) {
+            files.add(withWriterUuid(file, StoreFileMetadata.UNAVAILABLE_WRITER_UUID));
+        }
+        final var snapshots = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap", files, null));
+
+        assertThat(ShardBaseline.of(snapshots, luceneFiles(files)).ramBytesUsed(), equalTo(ShardBaseline.EMPTY.ramBytesUsed()));
     }
 
     public void testFilesKeptInTheBackupMetadataAreLeftOut() {
@@ -150,11 +157,8 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
 
     /**
      * Measured with {@link RamUsageTester} on shard-level metadata read back the way a node reads it, with writer uuids, as every file
-     * in a serverless repository has. Apart from its name, a file costs about 290 bytes: its {@link StoreFileMetadata} with the
-     * checksum, Lucene version, hash and writer uuid, and its place in the map and list. A file without a writer uuid costs about 56
-     * bytes less, because all such files share one empty value. These figures are for compressed object pointers, which the JVM uses
-     * for heaps under 32 GB. The estimate is a little higher, because it also counts the map's table and the empty hash that files
-     * share.
+     * in a serverless repository has. Apart from its name, a file costs about 56 bytes: its 16-byte writer uuid in a {@link BytesRef},
+     * and its place in the map. These figures are for compressed object pointers, which the JVM uses for heaps under 32 GB.
      */
     public void testBytesPerFile() throws IOException {
         assumeTrue("measured with compressed object pointers", RamUsageEstimator.COMPRESSED_REFS_ENABLED);
@@ -162,7 +166,7 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         final List<FileInfo> files = randomBackedUpFiles(0, fileCount);
         final long nameBytes = files.stream().mapToLong(file -> RamUsageEstimator.sizeOf(file.physicalName())).sum();
         final var baseline = ShardBaseline.of(
-            ShardBacklogTests.readBack(BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap", files, null)), true),
+            ShardBaselineTests.readBack(BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(new SnapshotFiles("snap", files, null)), true),
             luceneFiles(files)
         );
 
@@ -172,7 +176,7 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
         assertThat(
             "bytes per file apart from its name; if this moved, update the documented figure",
             (measured - nameBytes) / fileCount,
-            allOf(greaterThanOrEqualTo(250L), lessThanOrEqualTo(300L))
+            allOf(greaterThanOrEqualTo(50L), lessThanOrEqualTo(70L))
         );
         // The estimate is never below the real cost, and at most a quarter above it.
         final long estimated = baseline.ramBytesUsed() - ShardBaseline.EMPTY.ramBytesUsed();
@@ -201,7 +205,14 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     private static List<LuceneFile> luceneFiles(List<FileInfo> files) {
-        return files.stream().map(file -> new LuceneFile(file.physicalName(), file.length())).toList();
+        return files.stream().map(file -> new LuceneFile(file.physicalName(), file.length(), file.metadata().writerUuid())).toList();
+    }
+
+    /**
+     * A backed-up file with the name and length of the given one, but another blob and the given writer uuid.
+     */
+    private static FileInfo withWriterUuid(FileInfo file, BytesRef writerUuid) {
+        return new FileInfo("__" + UUIDs.randomBase64UUID(random()), metadata(file.physicalName(), file.length(), writerUuid), null);
     }
 
     private static BytesRef randomWriterUuid() {
@@ -224,11 +235,11 @@ public class ShardBaselineRamBytesUsedTests extends AbstractAccountableFieldsTes
     }
 
     /**
-     * Reads the shard-level metadata back the way a node reads it from the repository.
+     * Reads the shard-level metadata back the way a node reads it from the repository, written with writer uuids or without them.
      */
-    private static BlobStoreIndexShardSnapshots readBack(BlobStoreIndexShardSnapshots snapshots) {
+    private static BlobStoreIndexShardSnapshots readBack(BlobStoreIndexShardSnapshots snapshots, boolean withWriterUuids) {
         try {
-            return ShardBacklogTests.readBack(snapshots);
+            return ShardBaselineTests.readBack(snapshots, withWriterUuids);
         } catch (IOException e) {
             throw new AssertionError(e);
         }
