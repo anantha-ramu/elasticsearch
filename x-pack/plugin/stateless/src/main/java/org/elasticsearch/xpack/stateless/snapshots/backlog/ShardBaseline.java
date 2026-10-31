@@ -28,6 +28,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeSet;
 
 /**
  * A summary of what a repository has already backed up for one shard, used to work out how many bytes a snapshot of the shard's latest
@@ -316,6 +317,11 @@ final class ShardBaseline implements Accountable {
     @Override
     public int hashCode() {
         return Objects.hash(backedUpWriterUuids, latestStateId);
+    }
+
+    @Override
+    public String toString() {
+        return "ShardBaseline{latestStateId=" + latestStateId + ", backedUpFiles=" + new TreeSet<>(backedUpWriterUuids.keySet()) + "}";
     }
 
     private static long ramBytesUsed(Map<String, BytesRef> backedUpWriterUuids, @Nullable String latestStateId) {
