@@ -66,7 +66,10 @@ final class ShardBaselineCache implements Accountable, Releasable {
 
     private static final Logger logger = LogManager.getLogger(ShardBaselineCache.class);
 
-    static final int MAX_CONCURRENT_LOADS = 4;
+    // Loads run while a backup is still going (a shard's generation changes when that shard finishes), next to the snapshot's own
+    // parses of the same metadata, up to ten at a time. Two keeps what loads add small: at 7-day retention a typical shard's
+    // metadata takes about 4.4 MB once parsed, and a shard with 2,000 files per snapshot about 44 MB.
+    static final int MAX_CONCURRENT_LOADS = 2;
     static final TimeValue FIRST_RETRY_DELAY = TimeValue.timeValueSeconds(30);
     static final TimeValue MAX_RETRY_DELAY = TimeValue.timeValueMinutes(10);
     static final TimeValue WARNING_INTERVAL = TimeValue.timeValueMinutes(10);
