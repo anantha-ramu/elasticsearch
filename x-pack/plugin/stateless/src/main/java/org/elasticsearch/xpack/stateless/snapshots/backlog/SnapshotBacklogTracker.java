@@ -348,12 +348,11 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
             results.put(projectRepo, Map.copyOf(repositoryResults));
             report.put(projectRepo, Map.copyOf(repositoryReport));
         }
-        // under the same lock as turning off, so nothing is sent once measuring is off
-        synchronized (this) {
-            if (period == current) {
-                current.results = Map.copyOf(results);
-                publisher.accept(state, Map.copyOf(report));
-            }
+        if (period == current) {
+            current.results = Map.copyOf(results);
+            // Not under a lock: a report sent just as measuring is turned off is harmless, since the master stops keeping reports
+            // once the setting is off there too.
+            publisher.accept(state, Map.copyOf(report));
         }
     }
 
