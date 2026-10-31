@@ -187,6 +187,39 @@ public class SnapshotBacklogHoldsTests extends ESTestCase {
         assertThat(holds.getFigures(running, REPOSITORY).get(SHARD), equalTo(new ShardFigure(Status.HELD, SECOND, 50)));
     }
 
+    /**
+     * Two reports can fill the same pending hold at once, on different threads. Here the second fill happens while the first one is
+     * looking up its figure: the fill that lands first wins, and the other one changes nothing.
+     */
+    public void testConcurrentFillsKeepTheFirst() {
+        final SnapshotBacklogHolds holds = new SnapshotBacklogHolds();
+        final ClusterState running = state(snapshot("snap-1", Map.of(SHARD, active(SECOND))));
+        holds.onClusterState(running, false, (projectRepo, shardId) -> ShardFigure.without(Status.NOT_REPORTED));
+
+        holds.onReport((projectRepo, shardId) -> {
+            holds.onReport((p, s) -> new ShardFigure(Status.MEASURED, SECOND, 50));
+            return new ShardFigure(Status.MEASURED, SECOND, 70);
+        });
+
+        assertThat(holds.getFigures(running, REPOSITORY).get(SHARD), equalTo(new ShardFigure(Status.HELD, SECOND, 50)));
+    }
+
+    /**
+     * A hold can be dropped (the master stops keeping figures) while a report is filling it. The dropped hold must not come back.
+     */
+    public void testAHoldDroppedWhileBeingFilledStaysDropped() {
+        final SnapshotBacklogHolds holds = new SnapshotBacklogHolds();
+        final ClusterState running = state(snapshot("snap-1", Map.of(SHARD, active(SECOND))));
+        holds.onClusterState(running, false, (projectRepo, shardId) -> ShardFigure.without(Status.NOT_REPORTED));
+
+        holds.onReport((projectRepo, shardId) -> {
+            holds.clear();
+            return new ShardFigure(Status.MEASURED, SECOND, 50);
+        });
+
+        assertThat(holds.size(), equalTo(0));
+    }
+
     public void testActiveShardWithoutAHoldYetIsPending() {
         apply(state());
         report(FIRST, 100);
