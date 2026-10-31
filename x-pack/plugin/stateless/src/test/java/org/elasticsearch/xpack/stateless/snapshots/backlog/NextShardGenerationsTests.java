@@ -283,6 +283,34 @@ public class NextShardGenerationsTests extends ESTestCase {
         assertThat(sent, hasSize(2));
     }
 
+    public void testARepositoryRegisteredAgainWithoutAUuidYetStartsOver() {
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
+        answer(0, 5, Map.of(SHARD_0, RECORDED));
+
+        // Registered again, for example at another location: no uuid yet, and an unknown generation, so the old answer can't be seen
+        // to be out of date. It must not be used.
+        onClusterState(state(RepositoryData.UNKNOWN_REPO_GEN, RepositoryData.MISSING_UUID), Map.of(REPOSITORY, List.of(SHARD_0)));
+
+        assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
+        generations.maybeRequest(REPOSITORY, List.of(SHARD_0), false);
+        assertThat(sent, hasSize(2));
+    }
+
+    public void testARepositoryWhoseGenerationGoesBackStartsOver() {
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
+        answer(0, 5, Map.of(SHARD_0, RECORDED));
+
+        // Updated in place, keeping its uuid, but with an unknown generation, for example after its read-only setting changed: the
+        // repository may have been written by someone else, so the old answer must not be used.
+        onClusterState(state(RepositoryData.UNKNOWN_REPO_GEN), Map.of(REPOSITORY, List.of(SHARD_0)));
+
+        assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
+        generations.maybeRequest(REPOSITORY, List.of(SHARD_0), false);
+        assertThat(sent, hasSize(2));
+    }
+
     public void testAnswerForARepositoryNoLongerTrackedIsIgnored() {
         onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);

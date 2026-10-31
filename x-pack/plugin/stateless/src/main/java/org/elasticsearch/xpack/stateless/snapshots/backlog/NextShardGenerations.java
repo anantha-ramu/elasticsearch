@@ -28,6 +28,7 @@ import org.elasticsearch.snapshots.InFlightShardSnapshotStates;
 
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -68,7 +69,9 @@ import java.util.function.LongSupplier;
  *     <li><b>The cluster state doesn't know the repository's generation</b> (it is negative, below
  *     {@link RepositoryData#EMPTY_REPO_GEN}). Answers can't be seen to be out of date, so they are used, and asked for again on every
  *     evaluation.</li>
- *     <li><b>A repository is registered again under the same name.</b> Everything known about it is dropped.</li>
+ *     <li><b>A repository is registered again under the same name</b>, which the cluster state shows as a known uuid changing, or as
+ *     the generation going down (a new registration starts with no uuid and an unknown generation). Everything known about it is
+ *     dropped.</li>
  * </ul>
  * Requests: at most one per repository at a time. If the reason for another arises while one is running, another is sent when it
  * returns. If an answer comes back already older than the repository, one more is sent at once. After a failure, or a second answer
@@ -201,7 +204,7 @@ final class NextShardGenerations {
                 }
             }
             repository.remembered.values().removeIf(remembered -> remembered.repositoryGeneration() != generation);
-            repository.remembered.keySet().retainAll(shardIds);
+            repository.remembered.keySet().retainAll(new HashSet<>(shardIds));
             // If the repository's uuid has just become known, it is still the same repository.
             repository.uuid = metadata.uuid();
             repository.generation = generation;
@@ -288,6 +291,8 @@ final class NextShardGenerations {
             }
             repository.requesting = false;
             repository.answer = new Answer(response.repositoryGeneration(), Set.copyOf(request.shardIds()), response.shardGenerations());
+            // The answer covers what was remembered until it reached this repository generation.
+            repository.remembered.values().removeIf(remembered -> remembered.repositoryGeneration() <= response.repositoryGeneration());
             if (isOlderThanRepository(repository.answer, repository)) {
                 repository.olderAnswersInARow += 1;
                 repository.waitForEvaluation = repository.olderAnswersInARow > 1;
@@ -340,8 +345,11 @@ final class NextShardGenerations {
         return repository.generation >= RepositoryData.EMPTY_REPO_GEN && answer.repositoryGeneration() < repository.generation;
     }
 
+    // A new registration starts with no uuid and an unknown generation; a uuid only ever goes from missing to known otherwise, and the
+    // generation only goes up.
     private static boolean isRegisteredAgain(Repository repository, RepositoryMetadata metadata) {
-        return repository.uuid.equals(RepositoryData.MISSING_UUID) == false && repository.uuid.equals(metadata.uuid()) == false;
+        return (repository.uuid.equals(RepositoryData.MISSING_UUID) == false && repository.uuid.equals(metadata.uuid()) == false)
+            || metadata.generation() < repository.generation;
     }
 
     @Nullable
