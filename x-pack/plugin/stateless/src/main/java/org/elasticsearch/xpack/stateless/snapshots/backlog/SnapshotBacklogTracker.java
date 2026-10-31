@@ -41,6 +41,7 @@ import org.elasticsearch.transport.Transports;
 import org.elasticsearch.xpack.core.slm.SnapshotLifecycleMetadata;
 import org.elasticsearch.xpack.core.slm.SnapshotLifecyclePolicyMetadata;
 import org.elasticsearch.xpack.stateless.commits.HollowShardsService;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.PublishSnapshotBacklogRequest.ShardBacklog;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaselineCache.LatestCommits;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaselineCache.Measured;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaselineCache.NotMeasured;
@@ -57,13 +58,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 /**
  * Measures the snapshot backlog on an index node: for each primary shard on the node and each repository a snapshot lifecycle
  * (SLM) policy of the shard's project names, the bytes the next snapshot of the shard would upload. The results are kept in memory
- * ({@link #getResults}) and published as node metrics.
+ * ({@link #getResults}), published as node metrics, and sent to the master after each evaluation ({@link SnapshotBacklogPublisher}).
  * <p>
  * Every {@link #EVALUATION_INTERVAL}, on the snapshot-meta pool, it:
  * <ol>
@@ -138,6 +140,7 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
     private final Supplier<List<LocalPrimary>> localPrimaries;
     private final NextShardGenerations.Sender sender;
     private final ShardBaselineCache.MetadataReader reader;
+    private final BiConsumer<ClusterState, Map<ProjectRepo, Map<ShardId, ShardBacklog>>> publisher;
     private final long budgetBytes;
 
     @Nullable
@@ -145,12 +148,15 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
 
     /**
      * @param localPrimaries the primary shards on this node, in any state
+     * @param publisher      receives each evaluation's results and the cluster state the evaluation used, and sends the results to
+     *                       the master
      */
     SnapshotBacklogTracker(
         ThreadPool threadPool,
         Supplier<List<LocalPrimary>> localPrimaries,
         NextShardGenerations.Sender sender,
         ShardBaselineCache.MetadataReader reader,
+        BiConsumer<ClusterState, Map<ProjectRepo, Map<ShardId, ShardBacklog>>> publisher,
         long budgetBytes,
         MeterRegistry meterRegistry
     ) {
@@ -159,6 +165,7 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
         this.localPrimaries = localPrimaries;
         this.sender = sender;
         this.reader = reader;
+        this.publisher = publisher;
         this.budgetBytes = budgetBytes;
         registerMetrics(meterRegistry);
     }
@@ -181,6 +188,7 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
             () -> localPrimaries(indicesService, hollowShardsService),
             systemContextSender(client),
             new BlobStoreMetadataReader(repositoriesService, meterRegistry),
+            new SnapshotBacklogPublisher(SnapshotBacklogPublisher.systemContextSender(client), threadPool::relativeTimeInMillis)::publish,
             ShardBaselineCache.memoryBudget(JvmInfo.jvmInfo().getMem().getHeapMax().getBytes()),
             meterRegistry
         );
@@ -325,22 +333,35 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
         }
 
         final Map<ProjectRepo, Map<ShardId, Result>> results = new HashMap<>();
+        // the same results, with the allocation id of each shard copy, for the master
+        final Map<ProjectRepo, Map<ShardId, ShardBacklog>> report = new HashMap<>();
         for (Map.Entry<ProjectRepo, List<LocalPrimary>> repositoryAndPrimaries : byRepository.entrySet()) {
             final ProjectRepo projectRepo = repositoryAndPrimaries.getKey();
             final Map<ShardId, Result> repositoryResults = new HashMap<>();
+            final Map<ShardId, ShardBacklog> repositoryReport = new HashMap<>();
             for (LocalPrimary primary : repositoryAndPrimaries.getValue()) {
                 if (primary.started().getAsBoolean()) {
-                    repositoryResults.put(
-                        primary.shardId(),
-                        supported ? measure(current, projectRepo, primary) : notMeasured(Reason.CLUSTER_TOO_OLD)
-                    );
+                    final Result result = supported ? measure(current, projectRepo, primary) : notMeasured(Reason.CLUSTER_TOO_OLD);
+                    repositoryResults.put(primary.shardId(), result);
+                    repositoryReport.put(primary.shardId(), shardBacklog(primary.copy().allocationId(), result));
                 }
             }
             results.put(projectRepo, Map.copyOf(repositoryResults));
+            report.put(projectRepo, Map.copyOf(repositoryReport));
         }
         if (period == current) {
             current.results = Map.copyOf(results);
+            // Not under a lock: a report sent just as measuring is turned off is harmless, since the master stops keeping reports
+            // once the setting is off there too.
+            publisher.accept(state, Map.copyOf(report));
         }
+    }
+
+    private static ShardBacklog shardBacklog(String allocationId, Result result) {
+        return switch (result) {
+            case Measured measured -> new ShardBacklog(allocationId, measured.generation(), measured.bytes());
+            case NotMeasured ignored -> ShardBacklog.notMeasured(allocationId);
+        };
     }
 
     private static Result measure(Period current, ProjectRepo projectRepo, LocalPrimary primary) {

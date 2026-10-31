@@ -44,6 +44,7 @@ import org.elasticsearch.xpack.core.security.authz.privilege.SystemPrivilege;
 import org.elasticsearch.xpack.core.slm.SnapshotLifecycleMetadata;
 import org.elasticsearch.xpack.core.slm.SnapshotLifecyclePolicy;
 import org.elasticsearch.xpack.core.slm.SnapshotLifecyclePolicyMetadata;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.PublishSnapshotBacklogRequest.ShardBacklog;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaseline.LuceneFile;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaselineCache.LatestCommit;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaselineCache.Measured;
@@ -76,12 +77,15 @@ public class SnapshotBacklogTrackerTests extends ESTestCase {
 
     private record Sent(GetShardGenerationsRequest request, ActionListener<GetShardGenerationsResponse> listener) {}
 
+    private record Published(ClusterState state, Map<ProjectRepo, Map<ShardId, ShardBacklog>> report) {}
+
     private final DeterministicTaskQueue taskQueue = new DeterministicTaskQueue();
     private final RecordingMeterRegistry meterRegistry = new RecordingMeterRegistry();
     private final List<Sent> sent = new ArrayList<>();
     private final List<ShardGeneration> reads = new ArrayList<>();
     private final AtomicInteger commitsTaken = new AtomicInteger();
     private final List<LocalPrimary> primaries = new ArrayList<>();
+    private final List<Published> published = new ArrayList<>();
     private final SnapshotBacklogTracker tracker = new SnapshotBacklogTracker(
         taskQueue.getThreadPool(),
         () -> List.copyOf(primaries),
@@ -90,6 +94,7 @@ public class SnapshotBacklogTrackerTests extends ESTestCase {
             reads.add(generation);
             return ShardBaseline.of(BlobStoreIndexShardSnapshots.EMPTY, currentFiles);
         },
+        (state, report) -> published.add(new Published(state, report)),
         Long.MAX_VALUE,
         meterRegistry
     );
@@ -332,6 +337,43 @@ public class SnapshotBacklogTrackerTests extends ESTestCase {
         assertThat(gauge(SnapshotBacklogTracker.BACKLOG_METRIC), equalTo(List.of(2 * FILE_LENGTH)));
         // It needed no read.
         assertThat(reads, equalTo(List.of(RECORDED)));
+    }
+
+    public void testEvaluationPublishesItsResults() {
+        tracker.setEnabled(true);
+        primaries.add(primary(SHARD, false));
+        apply(state(TransportVersion.current(), project(PROJECT, List.of("repo"), List.of("repo"), INDEX)));
+        tracker.evaluate();
+
+        // Not measured yet, but reported, with the shard copy's allocation id and the cluster state the evaluation used.
+        assertThat(published, hasSize(1));
+        assertThat(published.get(0).state(), equalTo(lastState));
+        assertThat(published.get(0).report(), equalTo(Map.of(REPOSITORY, Map.of(SHARD, ShardBacklog.notMeasured("copy-0")))));
+
+        answer(0, Map.of(SHARD, RECORDED));
+        tracker.evaluate();
+        taskQueue.runAllRunnableTasks();
+        tracker.evaluate();
+
+        assertThat(published, hasSize(3));
+        assertThat(
+            published.get(2).report(),
+            equalTo(Map.of(REPOSITORY, Map.of(SHARD, new ShardBacklog("copy-0", RECORDED, FILE_LENGTH))))
+        );
+    }
+
+    public void testEvaluationAfterTurningOffPublishesNothing() {
+        tracker.setEnabled(true);
+        apply(state(TransportVersion.current(), project(PROJECT, List.of("repo"), List.of("repo"), INDEX)));
+        // Measuring is turned off during an evaluation: here, when the evaluation checks that the shard is started.
+        primaries.add(new LocalPrimary(new ShardCopy(SHARD, "copy-0"), () -> {
+            tracker.setEnabled(false);
+            return true;
+        }, () -> false, this::takeCommit));
+        tracker.evaluate();
+
+        assertThat(published, empty());
+        assertThat(tracker.getResults(), anEmptyMap());
     }
 
     private LocalPrimary primary(ShardId shardId, boolean hollow) {
