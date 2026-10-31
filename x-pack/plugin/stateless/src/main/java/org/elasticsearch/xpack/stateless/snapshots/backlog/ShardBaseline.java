@@ -79,8 +79,8 @@ import java.util.Set;
  *     documents that moved.</li>
  * </ul>
  * With an up-to-date baseline, there is one known case in serverless where the backlog counts more than a snapshot of the same
- * commit would upload, and none where it counts less. (A repository with files backed up before Elasticsearch 7.16 would add another, which a test pins
- * down.)
+ * commit would upload, and none where it counts less. (A repository with files backed up before Elasticsearch 7.16 would add
+ * another, which a test pins down.)
  * <ul>
  *     <li><b>An older snapshot is cloned.</b> The clone copies the old snapshot's state id to the end of the list, so we no longer
  *     keep the newest one. This only matters if the shard has had no new writes but a background merge rewrote its files: the
