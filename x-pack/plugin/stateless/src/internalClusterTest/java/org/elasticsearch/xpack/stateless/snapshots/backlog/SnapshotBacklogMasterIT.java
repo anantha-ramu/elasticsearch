@@ -14,11 +14,13 @@ import org.elasticsearch.cluster.ClusterStateUpdateTask;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.index.MergePolicyConfig;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.repositories.ProjectRepo;
 import org.elasticsearch.telemetry.Measurement;
 import org.elasticsearch.telemetry.TestTelemetryPlugin;
+import org.elasticsearch.test.InternalSettingsPlugin;
 import org.elasticsearch.test.transport.MockTransportService;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.core.ilm.OperationMode;
@@ -50,8 +52,9 @@ import static org.hamcrest.Matchers.not;
  * as the node holding it measured it, and nothing from a copy the routing table no longer names (after a relocation, or once a node has
  * left the cluster).
  * <p>
- * Evaluations run when the test asks, rather than every 30 seconds. SLM itself isn't loaded: the policies are put into the cluster
- * state directly, as in {@link SnapshotBacklogIT}.
+ * The test runs evaluations itself, so it doesn't wait for the scheduled ones every 30 seconds; those still run, so every check
+ * that depends on the latest report is retried. Merges are off, so a figure doesn't change once the index is written. SLM itself
+ * isn't loaded: the policies are put into the cluster state directly, as in {@link SnapshotBacklogIT}.
  */
 public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCase {
 
@@ -64,6 +67,8 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         final List<Class<? extends Plugin>> plugins = new ArrayList<>(super.nodePlugins());
         plugins.add(SnapshotBacklogIT.SlmMetadataPlugin.class);
         plugins.add(TestTelemetryPlugin.class);
+        // Registers index.merge.enabled.
+        plugins.add(InternalSettingsPlugin.class);
         return plugins;
     }
 
@@ -87,7 +92,12 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         createRepository(REPOSITORY, "fs");
         putPolicy();
         // one primary on each index node
-        createIndex(INDEX, indexSettings(2, 0).put("index.routing.allocation.total_shards_per_node", 1).build());
+        createIndex(
+            INDEX,
+            indexSettings(2, 0).put("index.routing.allocation.total_shards_per_node", 1)
+                .put(MergePolicyConfig.INDEX_MERGE_ENABLED, false)
+                .build()
+        );
         ensureGreen(INDEX);
         write();
 
@@ -107,15 +117,17 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
             assertThat(SnapshotBacklogMetricsService.quality(figures.values()), equalTo(MetricQuality.EXACT));
         });
 
-        // The master metrics show the same total.
-        final long total = masterFigures().values().stream().mapToLong(ShardFigure::bytes).sum();
+        // The master metrics show the same total. Retried, in case a scheduled report arrives between the two reads.
         final TestTelemetryPlugin telemetry = getTelemetryPlugin(master);
-        telemetry.resetMeter();
-        telemetry.collect();
-        final List<Measurement> size = telemetry.getLongAsyncGaugeMeasurement(SnapshotBacklogMetricsService.SIZE_METRIC);
-        assertThat(size.size(), equalTo(1));
-        assertThat(size.get(0).getLong(), equalTo(total));
-        assertThat(size.get(0).attributes(), equalTo(Map.of("repo_name", REPOSITORY)));
+        assertBusy(() -> {
+            final long total = masterFigures().values().stream().mapToLong(ShardFigure::bytes).sum();
+            telemetry.resetMeter();
+            telemetry.collect();
+            final List<Measurement> size = telemetry.getLongAsyncGaugeMeasurement(SnapshotBacklogMetricsService.SIZE_METRIC);
+            assertThat(size.size(), equalTo(1));
+            assertThat(size.get(0).getLong(), equalTo(total));
+            assertThat(size.get(0).attributes(), equalTo(Map.of("repo_name", REPOSITORY)));
+        });
     }
 
     public void testRelocatedShardIsNotReportedUntilTheNewNodeReports() throws Exception {
@@ -123,7 +135,7 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         final String firstNode = startIndexNode(backlogNodeSettings());
         createRepository(REPOSITORY, "fs");
         putPolicy();
-        createIndex(INDEX, indexSettings(1, 0).build());
+        createIndex(INDEX, indexSettings(1, 0).put(MergePolicyConfig.INDEX_MERGE_ENABLED, false).build());
         ensureGreen(INDEX);
         write();
         final ShardId shardId = new ShardId(resolveIndex(INDEX), 0);
@@ -173,7 +185,7 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         final String firstNode = startIndexNode(backlogNodeSettings());
         createRepository(REPOSITORY, "fs");
         putPolicy();
-        createIndex(INDEX, indexSettings(1, 0).build());
+        createIndex(INDEX, indexSettings(1, 0).put(MergePolicyConfig.INDEX_MERGE_ENABLED, false).build());
         ensureGreen(INDEX);
         write();
         final ShardId shardId = new ShardId(resolveIndex(INDEX), 0);
