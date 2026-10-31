@@ -29,7 +29,7 @@ import java.util.Set;
 
 /**
  * A summary of what a repository has already backed up for one shard. {@link ShardBacklog} compares it with the shard's files to
- * work out how much the next snapshot would upload.
+ * work out how much a snapshot of the shard's latest commit would upload.
  * <p>
  * To build it, we read the shard's backup metadata from the repository ({@code index-{generation}}, a
  * {@link BlobStoreIndexShardSnapshots}) and compare it with the files the shard has right now. We keep two things:
@@ -60,8 +60,9 @@ import java.util.Set;
  * These events are handled exactly, with the same result as the snapshot:
  * <ul>
  *     <li><b>Snapshots are taken or deleted.</b> Both rules still hold.</li>
- *     <li><b>A snapshot is taken while writes are in flight.</b> It records no state id, so we use the one from the snapshot before
- *     it.</li>
+ *     <li><b>A snapshot is taken while writes are in flight.</b> It records no state id, so we keep the one from the snapshot before
+ *     it. The shard has moved past that state id by then, so it doesn't match, and the backlog and the snapshot both compare
+ *     files.</li>
  *     <li><b>The shard's metadata file goes missing and is rebuilt.</b> Elasticsearch rebuilds it from the per-snapshot metadata files,
  *     and the rebuilt copy has no state ids. Then neither the snapshot nor the backlog can use the "nothing changed" shortcut, and
  *     both compare files.</li>
@@ -77,8 +78,8 @@ import java.util.Set;
  *     same name left there are handled as for a recreated index. The original shard gets a new state id when it deletes the
  *     documents that moved.</li>
  * </ul>
- * With an up-to-date baseline, there is one known case in serverless where the backlog counts more than the snapshot would upload,
- * and none where it counts less. (A repository with files backed up before Elasticsearch 7.16 would add another, which a test pins
+ * With an up-to-date baseline, there is one known case in serverless where the backlog counts more than a snapshot of the same
+ * commit would upload, and none where it counts less. (A repository with files backed up before Elasticsearch 7.16 would add another, which a test pins
  * down.)
  * <ul>
  *     <li><b>An older snapshot is cloned.</b> The clone copies the old snapshot's state id to the end of the list, so we no longer
@@ -87,8 +88,8 @@ import java.util.Set;
  *     newest state id back at the end.</li>
  * </ul>
  * This assumes the caller reads the metadata before looking at the shard's files (see {@link #of}) and builds a new baseline whenever
- * the metadata changes. Even if a shard somehow went back to an older state without a new history, the backlog would only grow, never
- * shrink.
+ * the metadata changes. Even if a shard somehow went back to an older state without a new history, the backlog could only count more
+ * than the snapshot would upload, never less.
  */
 final class ShardBaseline implements Accountable {
 
@@ -110,7 +111,7 @@ final class ShardBaseline implements Accountable {
         }
     }
 
-    // the backed-up files, by file name; a file that several snapshots share is kept once
+    // The backed-up files, by file name. A file that several snapshots share is kept once.
     private final Map<String, List<StoreFileMetadata>> backedUpFilesByName;
     @Nullable
     private final String latestStateId;
