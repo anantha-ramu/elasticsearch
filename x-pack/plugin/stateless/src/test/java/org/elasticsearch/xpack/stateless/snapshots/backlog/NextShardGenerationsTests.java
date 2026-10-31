@@ -156,14 +156,16 @@ public class NextShardGenerationsTests extends ESTestCase {
 
     public void testFailedFinalizationIsNotRemembered() {
         generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
-        generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
-        answer(0, 5, Map.of(SHARD_0, RECORDED));
         generations.onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         // The snapshot failed to be recorded and left the cluster state without a write to the repository. Its generation lists files
-        // the next snapshot would upload again, so it must not be used; the master's answer at generation 5 is still right.
+        // the next snapshot would upload again, so it must not be used, even before the node has any answer from the master.
         generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
 
+        // The master's answer at generation 5 is right.
+        generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
+        answer(0, 5, Map.of(SHARD_0, RECORDED));
         assertThat(generations.choose(REPOSITORY, SHARD_0), equalTo(new Choice(INDEX_ID, RECORDED)));
     }
 
