@@ -11,8 +11,10 @@ import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.ClusterStateUpdateTask;
 import org.elasticsearch.cluster.NamedDiff;
+import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectId;
+import org.elasticsearch.cluster.metadata.RepositoriesMetadata;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.blobstore.support.BlobMetadata;
@@ -59,6 +61,7 @@ import static org.elasticsearch.snapshots.AbstractSnapshotIntegTestCase.getRepos
 import static org.elasticsearch.snapshots.AbstractSnapshotIntegTestCase.getRepositoryOnMaster;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.instanceOf;
@@ -233,6 +236,7 @@ public class SnapshotBacklogIT extends AbstractStatelessPluginIntegTestCase {
         ensureGreen(INDEX);
         settle();
         assertFiguresMatchNextSnapshot(secondNode, REPOSITORY, 1, "snap-2");
+        assertThat(metadataReads(secondNode), greaterThan(0L));
 
         // The node restarts: it measures again from nothing.
         writeAndSettle(1);
@@ -240,6 +244,8 @@ public class SnapshotBacklogIT extends AbstractStatelessPluginIntegTestCase {
         ensureGreen(INDEX);
         settle();
         assertFiguresMatchNextSnapshot(secondNode, REPOSITORY, 1, "snap-3");
+        // After the restart the node had nothing in memory, so it read the shard's backup metadata again.
+        assertThat(metadataReads(secondNode), greaterThan(0L));
     }
 
     public void testHollowShardCountsZeroWithoutReading() throws Exception {
@@ -298,8 +304,27 @@ public class SnapshotBacklogIT extends AbstractStatelessPluginIntegTestCase {
         final ShardGeneration afterSnapshot = expectedGeneration(REPOSITORY, shardId);
         assertThat(afterSnapshot, not(equalTo(beforeSnapshot)));
 
-        // The node measures against the generation the finished snapshot wrote, from the cluster state, without a new answer.
+        // Once the index node has applied the state in which the snapshot ended, the snapshot's generation is no longer in its cluster
+        // state, and its answer from the master is out of date: it asked again, and that request is held.
+        final long repositoryGeneration = getRepositoryData(getRepositoryOnMaster(REPOSITORY)).getGenId();
+        final ClusterService indexNodeClusterService = internalCluster().getInstance(ClusterService.class, indexNode);
+        assertBusy(() -> {
+            final ClusterState state = indexNodeClusterService.state();
+            assertThat(SnapshotsInProgress.get(state).forRepo(ProjectId.DEFAULT, REPOSITORY), empty());
+            assertThat(
+                RepositoriesMetadata.get(state.metadata().getProject()).repository(REPOSITORY).generation(),
+                equalTo(repositoryGeneration)
+            );
+            synchronized (held) {
+                assertThat(held, not(empty()));
+            }
+        });
+
+        // The node measures against the generation the finished snapshot wrote, remembered from the cluster state.
         assertThat(measure(indexNode, REPOSITORY, shardId, afterSnapshot), equalTo(0L));
+        synchronized (held) {
+            assertTrue(holding.get());
+        }
 
         synchronized (held) {
             holding.set(false);
@@ -350,6 +375,12 @@ public class SnapshotBacklogIT extends AbstractStatelessPluginIntegTestCase {
                     }
                 })
         );
+    }
+
+    private static long metadataReads(String node) {
+        final TestTelemetryPlugin telemetry = getTelemetryPlugin(node);
+        telemetry.collect();
+        return telemetry.getLongCounterMeasurement(BlobStoreMetadataReader.READS_METRIC).stream().mapToLong(m -> m.getLong()).sum();
     }
 
     private static int committedSegments(IndexShard shard) {
