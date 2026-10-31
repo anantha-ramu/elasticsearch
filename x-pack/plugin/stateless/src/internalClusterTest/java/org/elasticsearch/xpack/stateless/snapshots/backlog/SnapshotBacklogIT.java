@@ -478,7 +478,7 @@ public class SnapshotBacklogIT extends AbstractStatelessPluginIntegTestCase {
      * The generation the next snapshot of the shard starts from, with no snapshot running: the repository's, or
      * {@link ShardGenerations#NEW_SHARD_GEN} if it has nothing of the shard.
      */
-    private static ShardGeneration expectedGeneration(String repository, ShardId shardId) {
+    static ShardGeneration expectedGeneration(String repository, ShardId shardId) {
         final RepositoryData repositoryData = getRepositoryData(getRepositoryOnMaster(repository));
         final IndexId indexId = repositoryData.getIndices().get(shardId.getIndexName());
         if (indexId == null) {
