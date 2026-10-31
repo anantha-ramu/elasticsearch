@@ -240,6 +240,7 @@ import org.elasticsearch.xpack.stateless.reshard.TransportUpdateSplitTargetShard
 import org.elasticsearch.xpack.stateless.snapshots.SnapshotsCommitService;
 import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings;
 import org.elasticsearch.xpack.stateless.snapshots.TransportGetShardSnapshotCommitInfoAction;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.SnapshotBacklogTracker;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.TransportGetShardGenerationsAction;
 import org.elasticsearch.xpack.stateless.utils.SearchShardSizeCollector;
 import org.elasticsearch.xpack.stateless.utils.SearchShardSizeCollectorProvider;
@@ -554,6 +555,7 @@ public class StatelessPlugin extends Plugin
     private final SetOnce<SnapshotsCommitService> snapshotsCommitServiceRef = new SetOnce<>();
     private final SetOnce<StatelessMemoryMetricsService> statelessMemoryMetricsService = new SetOnce<>();
     private final SetOnce<ShardsMappingSizeCollector> shardsMappingSizeCollector = new SetOnce<>();
+    private final SetOnce<SnapshotBacklogTracker> snapshotBacklogTracker = new SetOnce<>();
     private final SetOnce<EstimatedHeapUsageRecoveryGate> estimatedHeapUsageRecoveryGate = new SetOnce<>();
     private final SetOnce<EstimatedHeapSettings> estimatedHeapSettings = new SetOnce<>();
     private final SetOnce<Client> clientRef = new SetOnce<>();
@@ -1031,6 +1033,23 @@ public class StatelessPlugin extends Plugin
         );
         this.shardsMappingSizeCollector.set(shardsMappingSizeCollector);
         components.add(shardsMappingSizeCollector);
+
+        if (hasIndexRole) {
+            components.add(
+                setAndGet(
+                    snapshotBacklogTracker,
+                    SnapshotBacklogTracker.create(
+                        clusterService,
+                        threadPool,
+                        client,
+                        indicesService,
+                        services.repositoriesService(),
+                        hollowShardsService,
+                        meterRegistry
+                    )
+                )
+            );
+        }
 
         if (hasIndexRole) {
             components.add(new IndexingDiskController(nodeEnvironment, settings, threadPool, indicesService, commitService));
@@ -1542,6 +1561,7 @@ public class StatelessPlugin extends Plugin
             ShardsMappingSizeCollector.RETRY_INITIAL_DELAY_SETTING,
             ShardsMappingSizeCollector.FIXED_HOLLOW_SHARD_MEMORY_OVERHEAD_SETTING,
             ShardsMappingSizeCollector.HOLLOW_SHARD_SEGMENT_MEMORY_OVERHEAD_SETTING,
+            SnapshotBacklogTracker.ENABLED_SETTING,
             StatelessSharedBlobCacheService.STATELESS_CACHE_BOOST_PREFERENCE_ENABLED_SETTING,
             StatelessReaderHeapBreaker.LIMIT_SETTING,
             StatelessSharedBlobCacheService.STATELESS_CACHE_EVICT_OBSOLETE_REGIONS_ENABLED_SETTING,
@@ -1592,6 +1612,7 @@ public class StatelessPlugin extends Plugin
             final var snapshotsCommitService = snapshotsCommitServiceRef.get();
 
             indexModule.addIndexEventListener(shardsMappingSizeCollector.get());
+            indexModule.addIndexEventListener(snapshotBacklogTracker.get());
             indexModule.addIndexOperationListener(new StatelessIndexingOperationListener(hollowShardsService.get()));
             indexModule.addIndexEventListener(
                 new StatelessIndexNodeLifecycleListener(

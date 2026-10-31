@@ -327,7 +327,7 @@ public class ShardBaselineCacheTests extends ESTestCase {
         assertThat(measure(cache, shard(0), GENERATION_2, grown), equalTo(new Measured(GENERATION_2, 0)));
 
         // Once the first shard leaves, the second gets its baseline on its next retry.
-        cache.retainShards(Set.of(shard(1)));
+        cache.retain(Set.of(REPOSITORY), Set.of(shard(1)));
         nowMillis += ShardBaselineCache.FIRST_RETRY_DELAY.millis();
         measure(cache, shard(1), GENERATION_1, commit);
         taskQueue.runAllRunnableTasks();
@@ -358,7 +358,7 @@ public class ShardBaselineCacheTests extends ESTestCase {
         taskQueue.runAllRunnableTasks();
         final long both = cache.ramBytesUsed();
 
-        cache.retainShards(Set.of(staying));
+        cache.retain(Set.of(REPOSITORY), Set.of(staying));
 
         assertThat(cache.ramBytesUsed(), equalTo(both / 2));
         assertThat(measure(cache, staying, GENERATION_1, new FakeShard(null)), equalTo(new Measured(GENERATION_1, 0)));
@@ -371,13 +371,57 @@ public class ShardBaselineCacheTests extends ESTestCase {
         final var shard = shard(0);
         repository.metadata.put(GENERATION_1, backedUp());
         // The shard leaves the node while its metadata is being read.
-        repository.duringRead = generation -> cache.retainShards(Set.of());
+        repository.duringRead = generation -> cache.retain(Set.of(REPOSITORY), Set.of());
 
         measure(cache, shard, GENERATION_1, new FakeShard(null));
         taskQueue.runAllRunnableTasks();
 
         assertThat(cache.ramBytesUsed(), equalTo(0L));
         assertThat(measure(cache, shard, GENERATION_1, new FakeShard(null)), equalTo(new NotMeasured(Reason.LOADING)));
+    }
+
+    public void testARepositoryNoLongerMeasuredIsForgotten() {
+        final var cache = cache(Long.MAX_VALUE);
+        repository.metadata.put(GENERATION_1, backedUp());
+        final var otherRepository = new ProjectRepo(ProjectId.DEFAULT, "other-repo");
+        final var shard = shard(0);
+        final var commit = new FakeShard(null, file("_0.cfs", 100));
+        measure(cache, shard, GENERATION_1, commit);
+        taskQueue.runAllRunnableTasks();
+        final long one = cache.ramBytesUsed();
+        // The other repository has nothing of the shard, so its baseline needs no read.
+        cache.measure(otherRepository, shard, INDEX_ID, ShardGenerations.NEW_SHARD_GEN, commit);
+        taskQueue.runAllRunnableTasks();
+        assertThat(cache.ramBytesUsed() > one, equalTo(true));
+
+        // For example, the policy that named the other repository was deleted.
+        cache.retain(Set.of(REPOSITORY), Set.of(shard));
+
+        assertThat(cache.ramBytesUsed(), equalTo(one));
+        assertThat(measure(cache, shard, GENERATION_1, commit), equalTo(new Measured(GENERATION_1, 100)));
+        assertThat(
+            cache.measure(otherRepository, shard, INDEX_ID, ShardGenerations.NEW_SHARD_GEN, commit),
+            equalTo(new NotMeasured(Reason.LOADING))
+        );
+    }
+
+    public void testAClosedShardIsForgottenAtOnce() {
+        final var cache = cache(Long.MAX_VALUE);
+        repository.metadata.put(GENERATION_1, backedUp());
+        final var closed = shard(0);
+        final var open = shard(1);
+        measure(cache, closed, GENERATION_1, new FakeShard(null));
+        measure(cache, open, GENERATION_1, new FakeShard(null));
+        taskQueue.runAllRunnableTasks();
+        final long both = cache.ramBytesUsed();
+
+        cache.removeShard(closed);
+
+        assertThat(cache.ramBytesUsed(), equalTo(both / 2));
+        assertThat(measure(cache, open, GENERATION_1, new FakeShard(null)), equalTo(new Measured(GENERATION_1, 0)));
+        // Another copy of the same shard is a different shard copy, so removing one never drops the other.
+        cache.removeShard(new ShardCopy(open.shardId(), "another-copy"));
+        assertThat(measure(cache, open, GENERATION_1, new FakeShard(null)), equalTo(new Measured(GENERATION_1, 0)));
     }
 
     public void testAnotherCopyOfTheShardStartsAgain() {

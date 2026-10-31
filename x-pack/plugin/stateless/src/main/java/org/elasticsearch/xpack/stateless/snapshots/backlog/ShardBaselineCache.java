@@ -55,8 +55,9 @@ import java.util.function.LongSupplier;
  *     <li><b>The memory budget is used up.</b> A shard copy that has never had a baseline is refused and not measured, and is tried
  *     again with the same delays as a failure. A shard copy that has one always gets its rebuild after a generation change, so a node
  *     near its budget can't flip shards in and out. Nothing is evicted.</li>
- *     <li><b>A shard leaves the node</b> ({@link #retainShards}), or another copy of it takes its place on the node. Its baselines are
- *     dropped, and a load still queued or running for it changes nothing when it finishes.</li>
+ *     <li><b>A shard leaves the node</b> ({@link #retain}, {@link #removeShard}), or another copy of it takes its place on the node.
+ *     Its baselines are dropped, and a load still queued or running for it changes nothing when it finishes. The same happens to
+ *     the baselines of a repository that is no longer measured.</li>
  *     <li><b>Measuring is turned off</b> ({@link #close}). Everything is dropped, and loads still queued or running change nothing.</li>
  * </ul>
  * A load reads the backup metadata one entry at a time, keeping only what the baseline needs ({@link ShardBaselineFormat}), so it
@@ -97,7 +98,14 @@ final class ShardBaselineCache implements Accountable, Releasable {
         /** The shard copy has no baseline yet, and building one would go over the memory budget. */
         OVER_BUDGET,
         /** Measuring is turned off. */
-        CLOSED
+        CLOSED,
+        /**
+         * Set by the caller, never by this cache: the generation the next snapshot of the shard would start from isn't known yet, for
+         * example because the master hasn't answered.
+         */
+        NO_GENERATION,
+        /** Set by the caller, never by this cache: a node in the cluster is too old to answer where the shard's backup metadata is. */
+        CLUSTER_TOO_OLD
     }
 
     /**
@@ -249,12 +257,28 @@ final class ShardBaselineCache implements Accountable, Releasable {
     }
 
     /**
-     * Drops everything about the shard copies on this node that are not in {@code shards}. Call it whenever a shard closes, too: until
-     * then, the cache keeps the shard's {@link LatestCommits}, and with it a reference to the shard.
+     * Drops everything about the repositories not in {@code repositories}, and about the shard copies on this node not in
+     * {@code shards}.
      */
-    synchronized void retainShards(Set<ShardCopy> shards) {
+    synchronized void retain(Set<ProjectRepo> repositories, Set<ShardCopy> shards) {
         entries.entrySet().removeIf(keyAndEntry -> {
-            if (shards.contains(new ShardCopy(keyAndEntry.getKey().shardId(), keyAndEntry.getValue().allocationId))) {
+            if (repositories.contains(keyAndEntry.getKey().repository())
+                && shards.contains(new ShardCopy(keyAndEntry.getKey().shardId(), keyAndEntry.getValue().allocationId))) {
+                return false;
+            }
+            dropBaseline(keyAndEntry.getValue());
+            return true;
+        });
+    }
+
+    /**
+     * Drops everything about one shard copy, for all repositories. Call it when the shard closes: until then, the cache keeps the
+     * shard's {@link LatestCommits}, and with it a reference to the shard.
+     */
+    synchronized void removeShard(ShardCopy shard) {
+        entries.entrySet().removeIf(keyAndEntry -> {
+            if (keyAndEntry.getKey().shardId().equals(shard.shardId()) == false
+                || keyAndEntry.getValue().allocationId.equals(shard.allocationId()) == false) {
                 return false;
             }
             dropBaseline(keyAndEntry.getValue());

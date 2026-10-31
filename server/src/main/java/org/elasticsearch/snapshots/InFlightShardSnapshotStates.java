@@ -127,7 +127,7 @@ public final class InFlightShardSnapshotStates {
      * @return most recent shard generation for the given shard
      */
     @Nullable
-    ShardGeneration generationForShard(IndexId indexId, int shardId, ShardGenerations shardGenerations) {
+    public ShardGeneration generationForShard(IndexId indexId, int shardId, ShardGenerations shardGenerations) {
         final ShardGeneration inFlightBest = generations.getOrDefault(indexId.getName(), Collections.emptyMap()).get(shardId);
         if (inFlightBest != null) {
             return inFlightBest;
