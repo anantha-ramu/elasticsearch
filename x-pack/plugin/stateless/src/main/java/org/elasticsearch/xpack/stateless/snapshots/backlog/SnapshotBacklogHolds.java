@@ -10,9 +10,11 @@ package org.elasticsearch.xpack.stateless.snapshots.backlog;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.SnapshotsInProgress.ShardSnapshotStatus;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.repositories.ProjectRepo;
 import org.elasticsearch.repositories.ShardGeneration;
+import org.elasticsearch.repositories.ShardGenerations;
 import org.elasticsearch.snapshots.Snapshot;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.SnapshotBacklogMetricsService.ShardFigure;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.SnapshotBacklogMetricsService.Status;
@@ -53,6 +55,10 @@ import java.util.function.BiFunction;
  *     finishes the shard in the earlier snapshot also starts the shard in the later snapshot, from the generation the earlier
  *     snapshot just wrote. No report measured against that generation exists yet.</li>
  *     <li>A figure measured against any other generation is never held.</li>
+ *     <li>The first snapshot of a new index starts from {@link ShardGenerations#NEW_SHARD_GEN}, and so does the node's figure for a
+ *     shard the repository doesn't know. A shard the repository doesn't know in an index it does know, such as a new shard after a
+ *     split, starts from no generation ({@code null}): the snapshot then starts from nothing, as with {@code NEW_SHARD_GEN}, so a
+ *     figure measured against {@code NEW_SHARD_GEN} is held for it.</li>
  *     <li>Once held, the figure doesn't change until the shard finishes or the snapshot ends: not on new writes, not when the shard
  *     relocates (the upload may carry on from the old node), not when a node leaves (the upload starts again on another node).</li>
  *     <li>A shard that is already active when the master starts holding figures (after a master failover, or when the feature is
@@ -80,10 +86,16 @@ final class SnapshotBacklogHolds {
     /**
      * What is held for one shard in one snapshot.
      *
-     * @param startGeneration the generation of the shard's backup metadata the snapshot started from
+     * @param startGeneration the generation of the shard's backup metadata the snapshot started from, or {@code null} for none
      * @param figure          {@link Status#HELD}, {@link Status#HOLD_PENDING} or {@link Status#HOLD_LOST}
      */
-    private record Hold(ShardGeneration startGeneration, ShardFigure figure) {}
+    private record Hold(@Nullable ShardGeneration startGeneration, ShardFigure figure) {
+
+        // The generation a figure must have been measured against to be held: a snapshot with no start generation starts from nothing.
+        ShardGeneration matchingGeneration() {
+            return startGeneration == null ? ShardGenerations.NEW_SHARD_GEN : startGeneration;
+        }
+    }
 
     private final Map<Key, Hold> holds = new ConcurrentHashMap<>();
 
@@ -118,20 +130,37 @@ final class SnapshotBacklogHolds {
     }
 
     /**
-     * Fills every pending hold whose shard now has a live figure measured against the snapshot's start generation. Call
-     * {@code onReport} after storing a node's report. Pending holds only exist while snapshots overlap, so there are few.
+     * Fills the pending holds of the shards in a node's report that now have a live figure measured against their snapshot's start
+     * generation. Call {@code onReport} after storing the report. The work is bounded by the report's size and the number of running
+     * snapshots, not by the number of pending holds: holds of a repository no node reports stay pending for a whole snapshot.
+     *
+     * @param state    the latest applied cluster state, read after the report was stored
+     * @param reported the shards in the report, per repository
      */
-    void onReport(BiFunction<ProjectRepo, ShardId, ShardFigure> liveFigures) {
-        for (Map.Entry<Key, Hold> keyAndHold : holds.entrySet()) {
-            if (keyAndHold.getValue().figure().status() == Status.HOLD_PENDING) {
-                tryFill(keyAndHold.getKey(), keyAndHold.getValue(), liveFigures);
+    void onReport(
+        ClusterState state,
+        Map<ProjectRepo, ? extends Map<ShardId, ?>> reported,
+        BiFunction<ProjectRepo, ShardId, ShardFigure> liveFigures
+    ) {
+        for (Map.Entry<ProjectRepo, ? extends Map<ShardId, ?>> repositoryAndShards : reported.entrySet()) {
+            for (SnapshotsInProgress.Entry entry : SnapshotsInProgress.get(state).forRepo(repositoryAndShards.getKey())) {
+                if (entry.isClone()) {
+                    continue;
+                }
+                for (ShardId shardId : repositoryAndShards.getValue().keySet()) {
+                    final Key key = new Key(entry.snapshot(), shardId);
+                    final Hold hold = holds.get(key);
+                    if (hold != null && hold.figure().status() == Status.HOLD_PENDING) {
+                        tryFill(key, hold, liveFigures);
+                    }
+                }
             }
         }
     }
 
     private void tryFill(Key key, Hold pending, BiFunction<ProjectRepo, ShardId, ShardFigure> liveFigures) {
         final ShardFigure live = liveFigures.apply(key.projectRepo(), key.shardId());
-        if (live.status() == Status.MEASURED && live.generation().equals(pending.startGeneration())) {
+        if (live.status() == Status.MEASURED && live.generation().equals(pending.matchingGeneration())) {
             holds.replace(key, pending, new Hold(pending.startGeneration(), new ShardFigure(Status.HELD, live.generation(), live.bytes())));
         }
     }

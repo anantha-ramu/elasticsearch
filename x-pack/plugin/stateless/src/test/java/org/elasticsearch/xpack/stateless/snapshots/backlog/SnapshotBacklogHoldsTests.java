@@ -34,6 +34,7 @@ import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.ProjectRepo;
 import org.elasticsearch.repositories.ShardGeneration;
+import org.elasticsearch.repositories.ShardGenerations;
 import org.elasticsearch.repositories.ShardSnapshotResult;
 import org.elasticsearch.snapshots.Snapshot;
 import org.elasticsearch.snapshots.SnapshotId;
@@ -67,6 +68,8 @@ public class SnapshotBacklogHoldsTests extends ESTestCase {
     private static final ShardId OTHER_SHARD = new ShardId(INDEX, 1);
     private static final ShardGeneration FIRST = new ShardGeneration("first");
     private static final ShardGeneration SECOND = new ShardGeneration("second");
+    // The shards of a report, for calling the holds directly: only the keys are read.
+    private static final Map<ProjectRepo, Map<ShardId, Object>> REPORTED = Map.of(REPOSITORY, Map.of(SHARD, true));
 
     private static final DiscoveryNode MASTER = DiscoveryNodeUtils.builder("master").ephemeralId("master-run").build();
     private static final DiscoveryNode NODE = DiscoveryNodeUtils.builder("node").ephemeralId("node-run").build();
@@ -179,8 +182,8 @@ public class SnapshotBacklogHoldsTests extends ESTestCase {
         holds.onClusterState(running, false, (projectRepo, shardId) -> new ShardFigure(Status.MEASURED, FIRST, 100));
         assertThat(holds.getFigures(running, REPOSITORY).get(SHARD), equalTo(ShardFigure.without(Status.HOLD_PENDING)));
 
-        holds.onReport((projectRepo, shardId) -> new ShardFigure(Status.MEASURED, SECOND, 50));
-        holds.onReport((projectRepo, shardId) -> new ShardFigure(Status.MEASURED, SECOND, 70));
+        holds.onReport(running, REPORTED, (projectRepo, shardId) -> new ShardFigure(Status.MEASURED, SECOND, 50));
+        holds.onReport(running, REPORTED, (projectRepo, shardId) -> new ShardFigure(Status.MEASURED, SECOND, 70));
         // A later state with the same snapshot doesn't fill the hold again either.
         holds.onClusterState(running, false, (projectRepo, shardId) -> new ShardFigure(Status.MEASURED, SECOND, 90));
 
@@ -196,8 +199,8 @@ public class SnapshotBacklogHoldsTests extends ESTestCase {
         final ClusterState running = state(snapshot("snap-1", Map.of(SHARD, active(SECOND))));
         holds.onClusterState(running, false, (projectRepo, shardId) -> ShardFigure.without(Status.NOT_REPORTED));
 
-        holds.onReport((projectRepo, shardId) -> {
-            holds.onReport((p, s) -> new ShardFigure(Status.MEASURED, SECOND, 50));
+        holds.onReport(running, REPORTED, (projectRepo, shardId) -> {
+            holds.onReport(running, REPORTED, (p, s) -> new ShardFigure(Status.MEASURED, SECOND, 50));
             return new ShardFigure(Status.MEASURED, SECOND, 70);
         });
 
@@ -212,12 +215,32 @@ public class SnapshotBacklogHoldsTests extends ESTestCase {
         final ClusterState running = state(snapshot("snap-1", Map.of(SHARD, active(SECOND))));
         holds.onClusterState(running, false, (projectRepo, shardId) -> ShardFigure.without(Status.NOT_REPORTED));
 
-        holds.onReport((projectRepo, shardId) -> {
+        holds.onReport(running, REPORTED, (projectRepo, shardId) -> {
             holds.clear();
             return new ShardFigure(Status.MEASURED, SECOND, 50);
         });
 
         assertThat(holds.size(), equalTo(0));
+    }
+
+    public void testFirstBackupOfANewIndexHoldsTheFigure() {
+        apply(state());
+        // The repository doesn't know the index, so the node measures against NEW_SHARD_GEN, and the snapshot starts from it.
+        report(ShardGenerations.NEW_SHARD_GEN, 100);
+        apply(state(snapshot("snap-1", Map.of(SHARD, active(ShardGenerations.NEW_SHARD_GEN)))));
+
+        assertThat(figure(), equalTo(new ShardFigure(Status.HELD, ShardGenerations.NEW_SHARD_GEN, 100)));
+    }
+
+    public void testShardWithoutAStartGenerationIsHeldAgainstANewShardFigure() {
+        apply(state());
+        report(FIRST, 100);
+        // A shard the repository doesn't know in an index it knows, such as a new shard after a split, starts from no generation.
+        apply(state(snapshot("snap-1", Map.of(SHARD, active(null)))));
+        assertThat(figure(), equalTo(ShardFigure.without(Status.HOLD_PENDING)));
+
+        report(ShardGenerations.NEW_SHARD_GEN, 300);
+        assertThat(figure(), equalTo(new ShardFigure(Status.HELD, ShardGenerations.NEW_SHARD_GEN, 300)));
     }
 
     public void testActiveShardWithoutAHoldYetIsPending() {

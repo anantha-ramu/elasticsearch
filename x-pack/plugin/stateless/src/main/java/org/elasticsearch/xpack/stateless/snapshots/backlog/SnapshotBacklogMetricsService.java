@@ -247,7 +247,7 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
         // the report is stored before looking for pending holds, see SnapshotBacklogHolds
         final ClusterState state = clusterState.get();
         final long now = relativeTimeNanos.getAsLong();
-        holds.onReport((projectRepo, shardId) -> getLiveFigure(state, projectRepo, shardId, now));
+        holds.onReport(state, request.shards(), (projectRepo, shardId) -> getLiveFigure(state, projectRepo, shardId, now));
         return true;
     }
 
