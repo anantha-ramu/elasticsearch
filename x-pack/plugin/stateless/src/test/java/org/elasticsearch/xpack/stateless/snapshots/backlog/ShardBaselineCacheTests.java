@@ -79,6 +79,8 @@ public class ShardBaselineCacheTests extends ESTestCase {
         assertThat(expected, equalTo(2000L));
         assertThat(measure(cache, shard, GENERATION_1, commit), equalTo(new Measured(GENERATION_1, expected)));
         assertThat(cache.ramBytesUsed(), greaterThan(0L));
+        // The load took the commit and then read the metadata straight into a baseline for its files. The measure took it again.
+        assertThat(events, equalTo(List.of("commit", "read " + GENERATION_1, "commit")));
     }
 
     public void testANewShardGenerationNeedsNoRead() {

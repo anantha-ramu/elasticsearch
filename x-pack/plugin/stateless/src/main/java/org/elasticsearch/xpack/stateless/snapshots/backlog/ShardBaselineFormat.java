@@ -21,6 +21,10 @@ import java.util.List;
  * this way takes about as much memory as the baseline it builds, however many snapshots the repository keeps, while reading the whole
  * metadata ({@link BlobStoreRepository#INDEX_SHARD_SNAPSHOTS_FORMAT}) takes memory that grows with them. The blob is read as a
  * snapshot reads it, with the same header, compression and checksum.
+ * <p>
+ * Reading entry by entry can't check what {@code BlobStoreIndexShardSnapshots#fromXContent} checks at the end, that every file a
+ * snapshot refers to is listed, without keeping every file name. A blob that fails that check is corrupt, and a snapshot of the shard
+ * fails on it anyway. A listed file that no snapshot refers to, or one listed after the snapshots, only ever counts as not backed up.
  */
 final class ShardBaselineFormat {
 
@@ -34,6 +38,7 @@ final class ShardBaselineFormat {
      * {@link ShardBaseline#of} for which commit that may be.
      */
     static ChecksumBlobStoreFormat<ShardBaseline> forFiles(Collection<LuceneFile> currentFiles) {
+        // No fallback reader: with one, ChecksumBlobStoreFormat#deserialize reads the whole blob into memory before parsing it.
         return new ChecksumBlobStoreFormat<>(CODEC, BlobStoreRepository.SNAPSHOT_INDEX_NAME_FORMAT, (repository, parser) -> {
             final ShardBaseline.Builder builder = new ShardBaseline.Builder(currentFiles);
             BlobStoreIndexShardSnapshots.parse(parser, new BlobStoreIndexShardSnapshots.Visitor() {

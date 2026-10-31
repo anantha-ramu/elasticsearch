@@ -105,7 +105,9 @@ final class ShardBaselineCache implements Accountable, Releasable {
      */
     interface MetadataReader {
         /**
-         * Reads the blob of exactly this generation, and fails if it doesn't exist.
+         * Reads the blob of exactly this generation, and fails if it doesn't exist. Never the latest blob, or a blob found by listing:
+         * the generation was published after its blob was written in full, which is what makes the commit taken before the read
+         * right (see {@link ShardBaseline#of}).
          *
          * @param currentFiles the files of the shard's build commit, see {@link ShardBaseline#of}
          */
@@ -199,7 +201,10 @@ final class ShardBaselineCache implements Accountable, Releasable {
      * Measuring reads nothing from the repository, but taking the latest commit may read the commit's segment infos from disk, so this
      * must run on a thread that may block.
      *
-     * @param generation the generation the next snapshot of the shard would start from
+     * @param generation the generation the next snapshot of the shard would start from. It must come from the master's
+     *                   {@code RepositoryData} or from {@code SnapshotsInProgress}, which publish a generation only after its blob is
+     *                   written in full: loads take the shard's commit before reading the blob, which is only right for such a
+     *                   generation (see {@link ShardBaseline#of})
      * @param commits    takes the shard's latest commit
      */
     Result measure(ProjectRepo repository, ShardCopy shard, IndexId indexId, ShardGeneration generation, LatestCommits commits) {
@@ -304,8 +309,8 @@ final class ShardBaselineCache implements Accountable, Releasable {
             indexId = entry.indexId;
             commits = entry.commits;
         }
-        // The commit is taken now, after the caller learned the generation, so every snapshot in that generation's metadata is of an
-        // earlier commit, as ShardBaseline#of requires.
+        // The commit is taken now, after the caller learned the generation, so every snapshot in that generation's metadata is of a
+        // commit at or before it, as ShardBaseline#of requires.
         LatestCommit commit = null;
         Exception commitFailure = null;
         try {
