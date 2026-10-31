@@ -145,10 +145,8 @@ final class SnapshotBacklogHolds {
         BiFunction<ProjectRepo, ShardId, ShardFigure> liveFigures
     ) {
         for (Map.Entry<ProjectRepo, ? extends Map<ShardId, ?>> repositoryAndShards : reported.entrySet()) {
+            // a clone has no holds, so its entries find nothing here
             for (SnapshotsInProgress.Entry entry : SnapshotsInProgress.get(state).forRepo(repositoryAndShards.getKey())) {
-                if (entry.isClone()) {
-                    continue;
-                }
                 for (ShardId shardId : repositoryAndShards.getValue().keySet()) {
                     final Key key = new Key(entry.snapshot(), shardId);
                     final Hold hold = holds.get(key);

@@ -290,6 +290,8 @@ public class SnapshotBacklogHoldsTests extends ESTestCase {
             IndexVersion.current()
         );
         apply(state(clone));
+        // a report arriving while the clone runs finds no hold to fill
+        report(FIRST, 100);
 
         assertThat(figure(), equalTo(new ShardFigure(Status.MEASURED, FIRST, 100)));
     }
