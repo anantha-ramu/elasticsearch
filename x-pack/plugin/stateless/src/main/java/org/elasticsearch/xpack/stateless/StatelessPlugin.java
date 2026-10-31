@@ -240,8 +240,10 @@ import org.elasticsearch.xpack.stateless.reshard.TransportUpdateSplitTargetShard
 import org.elasticsearch.xpack.stateless.snapshots.SnapshotsCommitService;
 import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings;
 import org.elasticsearch.xpack.stateless.snapshots.TransportGetShardSnapshotCommitInfoAction;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.SnapshotBacklogMetricsService;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.SnapshotBacklogTracker;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.TransportGetShardGenerationsAction;
+import org.elasticsearch.xpack.stateless.snapshots.backlog.TransportPublishSnapshotBacklogAction;
 import org.elasticsearch.xpack.stateless.utils.SearchShardSizeCollector;
 import org.elasticsearch.xpack.stateless.utils.SearchShardSizeCollectorProvider;
 import org.elasticsearch.xpack.stateless.utils.StatelessCommitServiceProvider;
@@ -716,7 +718,8 @@ public class StatelessPlugin extends Plugin
             ),
             new ActionHandler(TransportPublishMergeMemoryEstimate.INSTANCE, TransportPublishMergeMemoryEstimate.class),
             new ActionHandler(TransportGetShardSnapshotCommitInfoAction.TYPE, TransportGetShardSnapshotCommitInfoAction.class),
-            new ActionHandler(TransportGetShardGenerationsAction.TYPE, TransportGetShardGenerationsAction.class)
+            new ActionHandler(TransportGetShardGenerationsAction.TYPE, TransportGetShardGenerationsAction.class),
+            new ActionHandler(TransportPublishSnapshotBacklogAction.TYPE, TransportPublishSnapshotBacklogAction.class)
         );
     }
 
@@ -1033,6 +1036,9 @@ public class StatelessPlugin extends Plugin
         );
         this.shardsMappingSizeCollector.set(shardsMappingSizeCollector);
         components.add(shardsMappingSizeCollector);
+
+        // on every node, since the action that receives the index nodes' reports needs it; it keeps them only on the elected master
+        components.add(new SnapshotBacklogMetricsService(clusterService, threadPool::relativeTimeInNanos, meterRegistry));
 
         if (hasIndexRole) {
             components.add(
