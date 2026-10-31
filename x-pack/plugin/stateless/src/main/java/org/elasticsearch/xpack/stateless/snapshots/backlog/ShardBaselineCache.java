@@ -261,6 +261,7 @@ final class ShardBaselineCache implements Accountable, Releasable {
      * {@code shards}.
      */
     synchronized void retain(Set<ProjectRepo> repositories, Set<ShardCopy> shards) {
+        warnings.keySet().retainAll(repositories);
         entries.entrySet().removeIf(keyAndEntry -> {
             if (repositories.contains(keyAndEntry.getKey().repository())
                 && shards.contains(new ShardCopy(keyAndEntry.getKey().shardId(), keyAndEntry.getValue().allocationId))) {

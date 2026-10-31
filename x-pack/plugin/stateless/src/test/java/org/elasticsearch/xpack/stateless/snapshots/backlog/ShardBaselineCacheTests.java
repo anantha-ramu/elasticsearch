@@ -277,6 +277,31 @@ public class ShardBaselineCacheTests extends ESTestCase {
         );
     }
 
+    public void testARepositoryMeasuredAgainIsWarnedAboutAtOnce() {
+        final var cache = cache(Long.MAX_VALUE);
+        repository.failure = new IOException("simulated");
+        final var logger = ShardBaselineCache.class.getCanonicalName();
+        measure(cache, shard(0), GENERATION_1, new FakeShard(null));
+        taskQueue.runAllRunnableTasks();
+
+        // The repository stops being measured, for example because its policy was deleted, and is measured again soon after: it
+        // starts again, with no memory of the earlier warning.
+        cache.retain(Set.of(), Set.of(shard(0)));
+        nowMillis += 1;
+        MockLog.assertThatLogger(() -> {
+            measure(cache, shard(0), GENERATION_1, new FakeShard(null));
+            taskQueue.runAllRunnableTasks();
+        },
+            ShardBaselineCache.class,
+            new MockLog.SeenEventExpectation(
+                "warned at once",
+                logger,
+                Level.WARN,
+                "[*repo*] failed to load the backup metadata of 1 shard(s) since the last warning; *"
+            )
+        );
+    }
+
     public void testACommitThatCannotBeTakenDuringALoadIsNotWarnedAbout() {
         final var cache = cache(Long.MAX_VALUE);
         final var shard = shard(0);
