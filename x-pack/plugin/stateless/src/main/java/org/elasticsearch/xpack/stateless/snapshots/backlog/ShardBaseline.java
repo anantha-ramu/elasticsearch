@@ -114,8 +114,8 @@ import java.util.Objects;
  * A snapshot also reports the {@code .si} and {@code segments_N} files it adds in its incremental size, so that size can be a little
  * more than this. A real snapshot also flushes the shard first, so it also uploads writes that aren't in a commit yet.
  * <p>
- * This assumes the caller reads the metadata before taking the build commit (see {@link #of}) and builds a new baseline whenever the
- * metadata changes.
+ * This assumes every snapshot in the metadata is of a commit at or before the build commit (see {@link #of}), and that the caller
+ * builds a new baseline whenever the metadata changes.
  */
 final class ShardBaseline implements Accountable {
 
@@ -180,38 +180,89 @@ final class ShardBaseline implements Accountable {
     }
 
     /**
-     * Builds a baseline from the shard's backup metadata and the files the shard has right now. Read the metadata first and take the
-     * files afterwards. If a snapshot finished in between, the metadata would include files newer than the ones passed in, and the
-     * baseline would wrongly leave them out.
+     * Builds a baseline from the shard's backup metadata and the files of one of the shard's commits, the build commit. Every
+     * snapshot in the metadata must be of a commit at or before the build commit, which holds when the metadata is the blob of a
+     * generation that was known before the commit was taken: a generation's blob is written in full before the generation is
+     * published, and never changes. Otherwise a snapshot newer than the build commit could hold files the baseline leaves out.
      *
-     * @param snapshots    the shard's backup metadata, as read from the repository
-     * @param currentFiles the files of the shard's latest commit, from {@link #luceneFiles}
+     * @param snapshots    the shard's backup metadata
+     * @param currentFiles the files of the build commit, from {@link #luceneFiles}
      */
     static ShardBaseline of(BlobStoreIndexShardSnapshots snapshots, Collection<LuceneFile> currentFiles) {
-        // The files a snapshot could find in the repository. It never looks for .si and segments_N files, because it keeps their
-        // contents in the metadata itself, and a file without a writer uuid is always counted.
-        final Map<String, LuceneFile> currentFilesByName = new HashMap<>();
-        for (LuceneFile file : currentFiles) {
-            if (isStoredInBackupMetadata(file) == false && file.writerUuid().length > 0) {
-                currentFilesByName.put(file.name(), file);
-            }
-        }
-        final Map<String, BytesRef> backedUpWriterUuids = new HashMap<>();
-        String latestStateId = null;
-        // Snapshots are listed in the order they were taken, so the last state id we see is the newest.
+        final Builder builder = new Builder(currentFiles);
         for (SnapshotFiles snapshot : snapshots) {
-            if (snapshot.shardStateIdentifier() != null) {
-                latestStateId = snapshot.shardStateIdentifier();
-            }
+            final List<String> blobNames = new ArrayList<>(snapshot.indexFiles().size());
             for (BlobStoreIndexShardSnapshot.FileInfo backedUpFile : snapshot.indexFiles()) {
-                final LuceneFile currentFile = currentFilesByName.get(backedUpFile.physicalName());
-                if (currentFile != null && currentFile.writerUuid().equals(backedUpFile.metadata().writerUuid())) {
-                    // A copy, so that the baseline owns exactly the bytes it accounts for.
-                    backedUpWriterUuids.put(currentFile.name(), BytesRef.deepCopyOf(currentFile.writerUuid()));
+                builder.addFile(backedUpFile);
+                blobNames.add(backedUpFile.name());
+            }
+            builder.addSnapshot(blobNames, snapshot.shardStateIdentifier());
+        }
+        return builder.build();
+    }
+
+    /**
+     * Builds a baseline while the shard's backup metadata is read one entry at a time, so that only what the baseline keeps is held,
+     * however many snapshots the metadata has. The metadata lists each backed-up file once ({@link #addFile}), and then each snapshot
+     * in the order they were taken, with the files it refers to ({@link #addSnapshot}). A backed-up file is kept only once a snapshot
+     * refers to it, so a file the metadata lists but no snapshot holds can't make a file look backed up. The same rules apply as for
+     * {@link #of}.
+     */
+    static final class Builder {
+        // The files a snapshot could find in the repository, by name.
+        private final Map<String, LuceneFile> currentFilesByName = new HashMap<>();
+        // Backed-up files with the name and writer uuid of a current file, by blob name, until a snapshot refers to them.
+        private final Map<String, LuceneFile> matchingBlobs = new HashMap<>();
+        private final Map<String, LuceneFile> backedUpFiles = new HashMap<>();
+        @Nullable
+        private String latestStateId;
+
+        Builder(Collection<LuceneFile> currentFiles) {
+            for (LuceneFile file : currentFiles) {
+                // A snapshot never looks for .si and segments_N files, because it keeps their contents in the metadata itself, and a
+                // file without a writer uuid is always counted.
+                if (isStoredInBackupMetadata(file) == false && file.writerUuid().length > 0) {
+                    currentFilesByName.put(file.name(), file);
                 }
             }
         }
-        return new ShardBaseline(Map.copyOf(backedUpWriterUuids), latestStateId);
+
+        /**
+         * A backed-up file, as the metadata lists it.
+         */
+        void addFile(BlobStoreIndexShardSnapshot.FileInfo backedUpFile) {
+            final LuceneFile currentFile = currentFilesByName.get(backedUpFile.physicalName());
+            if (currentFile != null && currentFile.writerUuid().equals(backedUpFile.metadata().writerUuid())) {
+                matchingBlobs.put(backedUpFile.name(), currentFile);
+            }
+        }
+
+        /**
+         * A snapshot, in the order the metadata lists them, which is the order they were taken.
+         *
+         * @param blobNames the names of the blobs of the files the snapshot holds ({@link BlobStoreIndexShardSnapshot.FileInfo#name})
+         * @param stateId   the snapshot's state id, or {@code null} if it has none
+         */
+        void addSnapshot(Collection<String> blobNames, @Nullable String stateId) {
+            if (stateId != null) {
+                latestStateId = stateId;
+            }
+            for (String blobName : blobNames) {
+                final LuceneFile currentFile = matchingBlobs.get(blobName);
+                if (currentFile != null) {
+                    backedUpFiles.put(currentFile.name(), currentFile);
+                }
+            }
+        }
+
+        ShardBaseline build() {
+            final Map<String, BytesRef> backedUpWriterUuids = new HashMap<>();
+            for (LuceneFile file : backedUpFiles.values()) {
+                // A copy, so that the baseline owns exactly the bytes it accounts for.
+                backedUpWriterUuids.put(file.name(), BytesRef.deepCopyOf(file.writerUuid()));
+            }
+            return new ShardBaseline(Map.copyOf(backedUpWriterUuids), latestStateId);
+        }
     }
 
     /**
@@ -253,6 +304,18 @@ final class ShardBaseline implements Accountable {
     @Override
     public long ramBytesUsed() {
         return ramBytesUsed;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        return o instanceof ShardBaseline other
+            && backedUpWriterUuids.equals(other.backedUpWriterUuids)
+            && Objects.equals(latestStateId, other.latestStateId);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(backedUpWriterUuids, latestStateId);
     }
 
     private static long ramBytesUsed(Map<String, BytesRef> backedUpWriterUuids, @Nullable String latestStateId) {

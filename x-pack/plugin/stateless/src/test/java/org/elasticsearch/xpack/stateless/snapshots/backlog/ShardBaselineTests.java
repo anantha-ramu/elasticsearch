@@ -121,6 +121,18 @@ public class ShardBaselineTests extends ESTestCase {
         assertBacklog(repository, commit(null, inlinedFile("_0.si"), inlinedFile("_1.si"), inlinedFile("segments_3"), cfs), 1000);
     }
 
+    public void testAFileNoSnapshotRefersToIsCounted() {
+        final var cfs = file("_0.cfs", 1000, 11, randomWriterUuid());
+        final var commit = commit(null, cfs);
+        // The metadata lists every backed-up file once, then each snapshot with the files it holds. Elasticsearch only lists files
+        // that a snapshot holds, but the baseline doesn't rely on that: a file that no snapshot refers to doesn't count as backed up.
+        final var builder = new ShardBaseline.Builder(luceneFiles(commit));
+        builder.addFile(new FileInfo("__" + randomUUID(), cfs, null));
+        builder.addSnapshot(List.of("__" + randomUUID()), null);
+
+        assertThat(builder.build().bytesToUpload(null, luceneFiles(commit)), equalTo(1000L));
+    }
+
     public void testAFileOfAnyRetainedSnapshotMatches() {
         final var older = file("_0.cfs", 1000, 11, randomWriterUuid());
         final var newer = file("_0.cfs", 1000, 12, randomWriterUuid());
