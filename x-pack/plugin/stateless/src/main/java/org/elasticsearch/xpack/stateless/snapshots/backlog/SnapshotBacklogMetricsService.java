@@ -10,6 +10,7 @@ package org.elasticsearch.xpack.stateless.snapshots.backlog;
 import org.elasticsearch.cluster.ClusterChangedEvent;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.ClusterStateListener;
+import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.routing.IndexRoutingTable;
 import org.elasticsearch.cluster.routing.RoutingTable;
@@ -48,7 +49,15 @@ import java.util.function.Supplier;
  * that is, the same allocation id. So a figure from before a relocation, a restart or any other reassignment is never used, even if
  * the shard has since come back to the same node.
  * <p>
- * Each primary gets one {@link Status}, checked in this order, the first that applies:
+ * Each primary gets one {@link Status}, checked in this order, the first that applies. First, while a snapshot of the repository runs
+ * ({@link SnapshotBacklogHolds} explains why and how):
+ * <ul>
+ *     <li>{@link Status#HELD}: the shard's snapshot is running, and the figure from when it started is held;</li>
+ *     <li>{@link Status#HOLD_PENDING}: the shard's snapshot is running, and no figure from its start is known yet;</li>
+ *     <li>{@link Status#HOLD_LOST}: the shard's snapshot was already running when this node started holding figures;</li>
+ *     <li>{@link Status#BACKED_UP}: the shard has finished in every running snapshot that includes it, so it counts 0.</li>
+ * </ul>
+ * Otherwise, the live figure, from the reports:
  * <ul>
  *     <li>{@link Status#UNASSIGNED}: the primary is not on any node;</li>
  *     <li>{@link Status#NOT_REPORTED}: its node has sent no report that is still kept;</li>
@@ -60,9 +69,10 @@ import java.util.function.Supplier;
  *     <li>{@link Status#MEASURED}: the node measured the shard. Only a measured figure is exact. The figure keeps the generation of
  *     the shard's backup metadata that the node measured against.</li>
  * </ul>
- * Every status but {@link Status#MEASURED} counts 0 bytes and is {@link MetricQuality#MINIMUM}: 0 is the one value that is always low
- * enough, and "minimum" tells the autoscaler not to scale down on it. A figure kept from before a relocation, or from a node that
- * stopped reporting, could count too much, since a snapshot may have finished since.
+ * Only {@link Status#MEASURED} and {@link Status#HELD} count bytes. {@link Status#BACKED_UP} counts 0 and is exact. Every other status
+ * counts 0 bytes and is {@link MetricQuality#MINIMUM}: 0 is the one value that is always low enough, and "minimum" tells the
+ * autoscaler not to scale down on it. A figure kept from before a relocation, or from a node that stopped reporting, could count too
+ * much, since a snapshot may have finished since.
  * <p>
  * When the store is safe to use: the store holds nothing unless this node is the elected master, the cluster state is recovered (so
  * the routing table and the nodes are known), and {@link SnapshotBacklogTracker#ENABLED_SETTING} is on. The store forgets everything
@@ -93,10 +103,21 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
         NOT_MEASURED,
         NOT_REPORTED,
         STALE,
-        UNASSIGNED;
+        UNASSIGNED,
+        HELD,
+        HOLD_PENDING,
+        HOLD_LOST,
+        BACKED_UP;
 
         public MetricQuality quality() {
-            return this == MEASURED ? MetricQuality.EXACT : MetricQuality.MINIMUM;
+            return switch (this) {
+                case MEASURED, HELD, BACKED_UP -> MetricQuality.EXACT;
+                case NOT_MEASURED, NOT_REPORTED, STALE, UNASSIGNED, HOLD_PENDING, HOLD_LOST -> MetricQuality.MINIMUM;
+            };
+        }
+
+        boolean hasFigure() {
+            return this == MEASURED || this == HELD;
         }
 
         String label() {
@@ -108,7 +129,8 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
      * The figure of one primary shard in one repository.
      *
      * @param generation the generation of the shard's backup metadata the figure was measured against; {@code null} unless measured
-     * @param bytes      the bytes the next snapshot of the shard would upload; 0 unless measured
+     *                   or held
+     * @param bytes      the bytes the next snapshot of the shard would upload; 0 unless measured or held
      */
     public record ShardFigure(Status status, @Nullable ShardGeneration generation, long bytes) {
 
@@ -120,12 +142,18 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
             Status.STALE,
             new ShardFigure(Status.STALE, null, 0),
             Status.UNASSIGNED,
-            new ShardFigure(Status.UNASSIGNED, null, 0)
+            new ShardFigure(Status.UNASSIGNED, null, 0),
+            Status.HOLD_PENDING,
+            new ShardFigure(Status.HOLD_PENDING, null, 0),
+            Status.HOLD_LOST,
+            new ShardFigure(Status.HOLD_LOST, null, 0),
+            Status.BACKED_UP,
+            new ShardFigure(Status.BACKED_UP, null, 0)
         );
 
         public ShardFigure {
-            assert (status == Status.MEASURED) == (generation != null) : status + " with generation " + generation;
-            assert status == Status.MEASURED || bytes == 0 : status + " with " + bytes + " bytes";
+            assert status.hasFigure() == (generation != null) : status + " with generation " + generation;
+            assert status.hasFigure() || bytes == 0 : status + " with " + bytes + " bytes";
         }
 
         static ShardFigure without(Status status) {
@@ -143,7 +171,11 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
     private final Supplier<ClusterState> clusterState;
     private final LongSupplier relativeTimeNanos;
     private final Map<String, NodeReport> reports = new ConcurrentHashMap<>();
+    private final SnapshotBacklogHolds holds = new SnapshotBacklogHolds();
     private volatile boolean enabled;
+    // Whether the holds follow the running snapshots since an earlier cluster state. False until the first state after this node
+    // became master or the setting was turned on, in which shards already active can't be held. Only changed on the applier thread.
+    private volatile boolean holding;
 
     @SuppressWarnings("this-escape")
     public SnapshotBacklogMetricsService(ClusterService clusterService, LongSupplier relativeTimeNanos, MeterRegistry meterRegistry) {
@@ -165,8 +197,10 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
     void setEnabled(boolean enabled) {
         // set the flag first, so a report stored after the clear sees it when it checks again (see update)
         this.enabled = enabled;
+        holding = false;
         if (enabled == false) {
             reports.clear();
+            holds.clear();
         }
     }
 
@@ -207,6 +241,10 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
             logger.debug("dropping snapshot backlog report {}, the node left or this node stopped keeping reports", request);
             return false;
         }
+        // the report is stored before looking for pending holds, see SnapshotBacklogHolds
+        final ClusterState state = clusterState.get();
+        final long now = relativeTimeNanos.getAsLong();
+        holds.onReport((projectRepo, shardId) -> getLiveFigure(state, projectRepo, shardId, now));
         return true;
     }
 
@@ -229,6 +267,8 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
     public void clusterChanged(ClusterChangedEvent event) {
         if (event.localNodeMaster() == false || event.state().blocks().hasGlobalBlock(GatewayService.STATE_NOT_RECOVERED_BLOCK)) {
             reports.clear();
+            holds.clear();
+            holding = false;
             return;
         }
         if (event.nodesChanged()) {
@@ -237,6 +277,17 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
                 final DiscoveryNode node = event.state().nodes().get(nodeAndReport.getKey());
                 return node == null || node.getEphemeralId().equals(nodeAndReport.getValue().ephemeralId()) == false;
             });
+        }
+        if (enabled
+            && (holding == false
+                || event.previousState().custom(SnapshotsInProgress.TYPE) != event.state().custom(SnapshotsInProgress.TYPE))) {
+            final long now = relativeTimeNanos.getAsLong();
+            holds.onClusterState(
+                event.state(),
+                holding == false,
+                (projectRepo, shardId) -> getLiveFigure(event.state(), projectRepo, shardId, now)
+            );
+            holding = true;
         }
     }
 
@@ -255,11 +306,14 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
             if (routingTable == null) {
                 continue;
             }
+            // shards that a running snapshot holds, or has finished, take that figure instead of the live one
+            final Map<ShardId, ShardFigure> backups = holds.getFigures(state, projectRepo);
             final Map<ShardId, ShardFigure> repositoryFigures = new HashMap<>();
             for (IndexRoutingTable indexRoutingTable : routingTable) {
                 for (int shard = 0; shard < indexRoutingTable.size(); shard++) {
                     final ShardRouting primary = indexRoutingTable.shard(shard).primaryShard();
-                    repositoryFigures.put(primary.shardId(), getFigure(projectRepo, primary, now));
+                    final ShardFigure backup = backups.get(primary.shardId());
+                    repositoryFigures.put(primary.shardId(), backup != null ? backup : getFigure(projectRepo, primary, now));
                 }
             }
             figures.put(projectRepo, Map.copyOf(repositoryFigures));
@@ -267,6 +321,17 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
         return Map.copyOf(figures);
     }
 
+    // The live figure of a shard by its id, for the holds.
+    private ShardFigure getLiveFigure(ClusterState state, ProjectRepo projectRepo, ShardId shardId, long now) {
+        final RoutingTable routingTable = state.globalRoutingTable().routingTables().get(projectRepo.projectId());
+        final IndexRoutingTable indexRoutingTable = routingTable == null ? null : routingTable.index(shardId.getIndex());
+        if (indexRoutingTable == null || shardId.id() >= indexRoutingTable.size()) {
+            return ShardFigure.without(Status.NOT_REPORTED);
+        }
+        return getFigure(projectRepo, indexRoutingTable.shard(shardId.id()).primaryShard(), now);
+    }
+
+    // The live figure of a primary: what its node last reported for it.
     private ShardFigure getFigure(ProjectRepo projectRepo, ShardRouting primary, long now) {
         if (primary.unassigned()) {
             return ShardFigure.without(Status.UNASSIGNED);
@@ -294,11 +359,11 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
     }
 
     /**
-     * The quality of a total over the given figures: exact only if every one of them was measured.
+     * The quality of a total over the given figures: exact only if every one of them is exact.
      */
     public static MetricQuality quality(Collection<ShardFigure> figures) {
         for (ShardFigure figure : figures) {
-            if (figure.status() != Status.MEASURED) {
+            if (figure.quality() == MetricQuality.MINIMUM) {
                 return MetricQuality.MINIMUM;
             }
         }

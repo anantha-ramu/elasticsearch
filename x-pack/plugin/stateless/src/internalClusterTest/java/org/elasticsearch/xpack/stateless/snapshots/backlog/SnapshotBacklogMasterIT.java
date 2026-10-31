@@ -11,11 +11,15 @@ import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.CheckedSupplier;
+import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.index.MergePolicyConfig;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.repositories.ProjectRepo;
+import org.elasticsearch.repositories.ShardGeneration;
+import org.elasticsearch.snapshots.SnapshotState;
 import org.elasticsearch.telemetry.Measurement;
 import org.elasticsearch.telemetry.TestTelemetryPlugin;
 import org.elasticsearch.test.InternalSettingsPlugin;
@@ -23,18 +27,28 @@ import org.elasticsearch.test.transport.MockTransportService;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
 import org.elasticsearch.xpack.stateless.MetricQuality;
+import org.elasticsearch.xpack.stateless.StatelessMockRepositoryPlugin;
+import org.elasticsearch.xpack.stateless.StatelessMockRepositoryStrategy;
 import org.elasticsearch.xpack.stateless.commits.HollowShardsService;
+import org.elasticsearch.xpack.stateless.objectstore.ObjectStoreService;
+import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.StatelessSnapshotEnabledStatus;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaselineCache.Measured;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.ShardBaselineCache.Result;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.SnapshotBacklogMetricsService.ShardFigure;
 import org.elasticsearch.xpack.stateless.snapshots.backlog.SnapshotBacklogMetricsService.Status;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.elasticsearch.snapshots.AbstractSnapshotIntegTestCase.createFullSnapshot;
+import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING;
+import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.hasItem;
@@ -63,6 +77,8 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
         plugins.add(TestTelemetryPlugin.class);
         // Registers index.merge.enabled.
         plugins.add(InternalSettingsPlugin.class);
+        // The mock object store, whose reads a test can block.
+        plugins.add(StatelessMockRepositoryPlugin.class);
         return plugins;
     }
 
@@ -199,6 +215,107 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
             final Measured measured = measuredOn(secondNode, shardId);
             assertThat(masterFigures().get(shardId), equalTo(new ShardFigure(Status.MEASURED, measured.generation(), measured.bytes())));
         });
+    }
+
+    public void testHeldFigureStaysThroughWritesAndARelocationDuringABackup() throws Exception {
+        // Snapshots read the shard's data from the object store, which the test can block, and keep running when the shard relocates.
+        final Settings settings = Settings.builder()
+            .put(backlogNodeSettings())
+            .put(ObjectStoreService.TYPE_SETTING.getKey(), ObjectStoreService.ObjectStoreType.MOCK)
+            .put(STATELESS_SNAPSHOT_ENABLED_SETTING.getKey(), StatelessSnapshotEnabledStatus.ENABLED)
+            .put(RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING.getKey(), true)
+            .build();
+        startMasterOnlyNode(settings);
+        final String firstNode = startIndexNode(settings);
+        createRepository(REPOSITORY, "fs");
+        SnapshotBacklogIT.putPolicies(REPOSITORY);
+        createIndex(INDEX, indexSettings(1, 0).put(MergePolicyConfig.INDEX_MERGE_ENABLED, false).build());
+        ensureGreen(INDEX);
+        write();
+        createFullSnapshot(logger, REPOSITORY, "snap-1");
+        write();
+        final ShardId shardId = new ShardId(resolveIndex(INDEX), 0);
+        final ShardGeneration startGeneration = SnapshotBacklogIT.expectedGeneration(REPOSITORY, shardId);
+        assertBusy(() -> {
+            evaluate(firstNode);
+            assertThat(masterFigures().get(shardId).status(), equalTo(Status.MEASURED));
+            assertThat(masterFigures().get(shardId).generation(), equalTo(startGeneration));
+        });
+        final ShardFigure beforeTheStart = masterFigures().get(shardId);
+        final String secondNode = startIndexNode(settings);
+
+        // The second snapshot blocks while reading the shard's data on the first node, so the shard stays active in it.
+        final CountDownLatch reading = new CountDownLatch(1);
+        final CountDownLatch unblock = new CountDownLatch(1);
+        setNodeRepositoryStrategy(firstNode, new StatelessMockRepositoryStrategy() {
+            @Override
+            public InputStream blobContainerReadBlob(
+                CheckedSupplier<InputStream, IOException> originalSupplier,
+                OperationPurpose purpose,
+                String blobName
+            ) throws IOException {
+                blockSnapshotRead(purpose);
+                return super.blobContainerReadBlob(originalSupplier, purpose, blobName);
+            }
+
+            @Override
+            public InputStream blobContainerReadBlob(
+                CheckedSupplier<InputStream, IOException> originalSupplier,
+                OperationPurpose purpose,
+                String blobName,
+                long position,
+                long length
+            ) throws IOException {
+                blockSnapshotRead(purpose);
+                return super.blobContainerReadBlob(originalSupplier, purpose, blobName, position, length);
+            }
+
+            private void blockSnapshotRead(OperationPurpose purpose) {
+                if (purpose == OperationPurpose.SNAPSHOT_DATA) {
+                    reading.countDown();
+                    safeAwait(unblock);
+                }
+            }
+        });
+        final var snapshot = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, "snap-2")
+            .setWaitForCompletion(true)
+            .execute();
+        safeAwait(reading);
+        assertBusy(() -> assertThat(masterFigures().get(shardId), equalTo(held(beforeTheStart))));
+
+        // New writes raise the node's own figure, but the master keeps the figure from the start.
+        write();
+        assertBusy(() -> {
+            evaluate(firstNode);
+            assertThat(measuredOn(firstNode, shardId).bytes(), greaterThan(beforeTheStart.bytes()));
+        });
+        assertThat(masterFigures().get(shardId), equalTo(held(beforeTheStart)));
+
+        // So does a relocation: the upload carries on from the first node.
+        updateIndexSettings(Settings.builder().put("index.routing.allocation.exclude._name", firstNode), INDEX);
+        internalCluster().awaitNodeVacated(INDEX, firstNode);
+        ensureGreen(INDEX);
+        assertBusy(() -> {
+            evaluate(secondNode);
+            measuredOn(secondNode, shardId);
+        });
+        assertThat(masterFigures().get(shardId), equalTo(held(beforeTheStart)));
+
+        // Once the snapshot ends, the figure is live again: measured by the second node against the new generation.
+        unblock.countDown();
+        assertThat(safeGet(snapshot).getSnapshotInfo().state(), equalTo(SnapshotState.SUCCESS));
+        final ShardGeneration nextGeneration = SnapshotBacklogIT.expectedGeneration(REPOSITORY, shardId);
+        assertThat(nextGeneration, not(equalTo(startGeneration)));
+        assertBusy(() -> {
+            evaluate(secondNode);
+            final Measured measured = measuredOn(secondNode, shardId);
+            assertThat(measured.generation(), equalTo(nextGeneration));
+            assertThat(masterFigures().get(shardId), equalTo(new ShardFigure(Status.MEASURED, nextGeneration, measured.bytes())));
+        });
+    }
+
+    private static ShardFigure held(ShardFigure measured) {
+        return new ShardFigure(Status.HELD, measured.generation(), measured.bytes());
     }
 
     private void write() {
