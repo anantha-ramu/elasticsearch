@@ -52,11 +52,14 @@ import java.util.function.LongSupplier;
  *     <li><b>A running snapshot has finished the shard.</b> Its new generation is used, from the cluster state.</li>
  *     <li><b>That snapshot then ends.</b> It leaves the cluster state in the same update that records its generations in the
  *     repository's top-level data, one repository generation up. The node may not have the master's answer for that repository
- *     generation yet, so it keeps using the shard's generation from the snapshot until it does. It only does that if the repository
- *     generation went up by exactly one in that update, so that the update is the snapshot being recorded, and only while the
- *     repository stays at that generation. Otherwise, for example if the snapshot failed to be recorded, or something else such as a
- *     deletion was written, the snapshot's generation may not be what the next snapshot starts from, and its metadata may list files
- *     as backed up that the next snapshot would still upload.</li>
+ *     generation yet, so it keeps using the shard's generation from the snapshot until it does, and only while the repository stays at
+ *     that generation. It does that only if the snapshot left in the very next cluster state after the one the node saw it in, and the
+ *     repository generation went up by exactly one in it. Every write of the repository's top-level data is published in a cluster
+ *     state of its own, and the only such write that removes a running snapshot is that snapshot being recorded. So these two checks
+ *     mean the update was the snapshot being recorded. Otherwise, for example if the snapshot failed to be recorded, or the node
+ *     missed a cluster state in which something else was written, the snapshot's generation may not be what the next snapshot starts
+ *     from, and its metadata may list files as backed up that the next snapshot would still upload. The shard then waits for the
+ *     master's answer.</li>
  *     <li><b>The master's answer is older than the repository</b>, because something was written since. The answer isn't used, as
  *     after a deletion its metadata could list files as backed up that are gone. A new answer is asked for.</li>
  *     <li><b>A shard isn't in the master's answer.</b> If the request asked about it, the repository has no backup metadata for it,
@@ -156,13 +159,17 @@ final class NextShardGenerations {
     }
 
     /**
-     * Takes in a new cluster state. It must be given every cluster state the node applies, in order, as the cluster state listener
-     * gets them: telling that a snapshot ended, and what was written to the repository in the same update, needs consecutive states.
+     * Takes in a new cluster state, in the order the node applies them. States in which no running snapshot, metadata or routing
+     * changed may be left out.
      *
-     * @param primaries for each repository to track, the shards on this node that are primaries of its project. The repository must
-     *                  be registered in the given state. Repositories not given are forgotten.
+     * @param previousVersion the version of the cluster state the node applied just before this one. If it is one less than this
+     *                        state's, the node missed no state in between, and can tell what a single update did.
+     * @param primaries       for each repository to track, the shards on this node that are primaries of its project. The repository
+     *                        must be registered in the given state. Repositories not given are forgotten.
      */
-    synchronized void onClusterState(ClusterState state, Map<ProjectRepo, ? extends Collection<ShardId>> primaries) {
+    synchronized void onClusterState(ClusterState state, long previousVersion, Map<ProjectRepo, ? extends Collection<ShardId>> primaries) {
+        // Each published cluster state's version is one more than the one before, so a bigger step means the node missed a state.
+        final boolean followsPrevious = state.version() == previousVersion + 1;
         repositories.keySet().retainAll(primaries.keySet());
         final SnapshotsInProgress snapshotsInProgress = SnapshotsInProgress.get(state);
         for (Map.Entry<ProjectRepo, ? extends Collection<ShardId>> repositoryAndShards : primaries.entrySet()) {
@@ -182,8 +189,10 @@ final class NextShardGenerations {
                 continue;
             }
             // A successful snapshot leaves the cluster state in the same update that writes it to the repository, one generation up.
-            final boolean oneWrite = repository.generation >= RepositoryData.EMPTY_REPO_GEN && generation == repository.generation + 1;
-            if (oneWrite) {
+            final boolean recorded = followsPrevious
+                && repository.generation >= RepositoryData.EMPTY_REPO_GEN
+                && generation == repository.generation + 1;
+            if (recorded) {
                 for (ShardId shardId : shardIds) {
                     final Choice before = inFlightGeneration(repository.inFlight, repository.inFlightIndexIds, shardId);
                     if (before != null && inFlightGeneration(inFlight, inFlightIndexIds, shardId) == null) {

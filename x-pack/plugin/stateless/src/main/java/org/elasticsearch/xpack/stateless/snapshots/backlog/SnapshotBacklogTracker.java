@@ -264,7 +264,7 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
             || event.metadataChanged()
             || event.routingTableChanged();
         if (relevant) {
-            current.generations.onClusterState(state, shardIdsByRepository(state, localPrimaries.get()));
+            current.generations.onClusterState(state, event.previousState().version(), shardIdsByRepository(state, localPrimaries.get()));
         }
         current.state = state;
         if (relevant && NextShardGenerations.isSupported(state)) {

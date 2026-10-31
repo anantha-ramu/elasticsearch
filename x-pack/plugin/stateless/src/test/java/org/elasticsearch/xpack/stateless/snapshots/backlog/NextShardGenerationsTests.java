@@ -69,7 +69,7 @@ public class NextShardGenerationsTests extends ESTestCase {
     );
 
     public void testAsksForAllPrimariesInOneRequestAndUsesTheAnswer() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0, SHARD_1)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0, SHARD_1)));
         assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
 
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0, SHARD_1), true);
@@ -84,7 +84,7 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testShardNeverBackedUpIsNotAskedAgain() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         // The shard isn't in the answer, because the repository has nothing of it.
         answer(0, 5, Map.of());
@@ -96,12 +96,12 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testANewPrimaryIsAskedAbout() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(0, 5, Map.of(SHARD_0, RECORDED));
 
         // Another primary arrived on the node. Until the master answers about it, it has no generation.
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0, SHARD_1)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0, SHARD_1)));
         assertThat(generations.choose(REPOSITORY, SHARD_1), nullValue());
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0, SHARD_1), false);
 
@@ -110,35 +110,35 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testInFlightGenerationBeatsMasterAnswer() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(0, 5, Map.of(SHARD_0, RECORDED));
 
         // A running snapshot has finished the shard. The next snapshot starts from what it wrote.
-        generations.onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         assertThat(generations.choose(REPOSITORY, SHARD_0), equalTo(new Choice(INDEX_ID, IN_FLIGHT)));
     }
 
     public void testAShardStillBeingSnapshottedKeepsTheGenerationItStartedFrom() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(0, 5, Map.of(SHARD_0, RECORDED));
 
-        generations.onClusterState(state(5, snapshot("snap", ShardState.INIT, RECORDED)), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5, snapshot("snap", ShardState.INIT, RECORDED)), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         assertThat(generations.choose(REPOSITORY, SHARD_0), equalTo(new Choice(INDEX_ID, RECORDED)));
     }
 
     public void testKeepsFinishedSnapshotGenerationUntilAnswerCatchesUp() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(0, 5, Map.of(SHARD_0, RECORDED));
-        generations.onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         // The snapshot is recorded in the repository (generation 6) and leaves the cluster state in the same update. The node still has
         // the master's answer at generation 5, which is out of date, but the snapshot's generation is what the next snapshot starts from.
-        generations.onClusterState(state(6), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(6), Map.of(REPOSITORY, List.of(SHARD_0)));
         assertThat(generations.choose(REPOSITORY, SHARD_0), equalTo(new Choice(INDEX_ID, IN_FLIGHT)));
 
         // An answer still at generation 5 changes nothing.
@@ -150,17 +150,17 @@ public class NextShardGenerationsTests extends ESTestCase {
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(2, 6, Map.of(SHARD_0, IN_FLIGHT));
         assertThat(generations.choose(REPOSITORY, SHARD_0), equalTo(new Choice(INDEX_ID, IN_FLIGHT)));
-        generations.onClusterState(state(7), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(7), Map.of(REPOSITORY, List.of(SHARD_0)));
         assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
     }
 
     public void testFailedFinalizationIsNotRemembered() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
-        generations.onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         // The snapshot failed to be recorded and left the cluster state without a write to the repository. Its generation lists files
         // the next snapshot would upload again, so it must not be used, even before the node has any answer from the master.
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
 
         // The master's answer at generation 5 is right.
@@ -170,36 +170,47 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testFinishedSnapshotIsNotRememberedIfMoreWasWritten() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
-        generations.onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         // The node didn't see a state in between: two writes, so the update that removed the snapshot isn't known to have recorded it.
-        generations.onClusterState(state(7), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(7), Map.of(REPOSITORY, List.of(SHARD_0)));
+
+        assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
+    }
+
+    public void testFinishedSnapshotIsNotRememberedAfterAMissedState() {
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
+
+        // One write and the snapshot gone, but the node missed a state in between (version 3): the snapshot may have failed to be
+        // recorded, and something else written, so its generation isn't known to be what the next snapshot starts from.
+        generations.onClusterState(ClusterState.builder(state(6)).version(4).build(), 2, Map.of(REPOSITORY, List.of(SHARD_0)));
 
         assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
     }
 
     public void testRememberedGenerationDroppedWhenRepositoryMovesOn() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(0, 5, Map.of(SHARD_0, RECORDED));
-        generations.onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
-        generations.onClusterState(state(6), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5, snapshot("snap", ShardState.SUCCESS, IN_FLIGHT)), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(6), Map.of(REPOSITORY, List.of(SHARD_0)));
         assertThat(generations.choose(REPOSITORY, SHARD_0), equalTo(new Choice(INDEX_ID, IN_FLIGHT)));
 
         // Something else is written, for example a deletion that rewrote the shard's metadata.
-        generations.onClusterState(state(7), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(7), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
     }
 
     public void testAnswerOlderThanRepositoryIsNotUsed() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(0, 5, Map.of(SHARD_0, RECORDED));
 
         // For example, a deletion was written, and the old metadata can list files that are gone.
-        generations.onClusterState(state(6), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(6), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), false);
@@ -209,7 +220,7 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testOneRequestAtATimeAndOneMoreIfNeeded() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), false);
@@ -221,7 +232,7 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testAnAnswerThatIsAlreadyOlderIsAskedForOnceMoreAtOnce() {
-        generations.onClusterState(state(6), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(6), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(0, 5, Map.of(SHARD_0, RECORDED));
         assertThat(requestsNeeded, equalTo(1));
@@ -237,7 +248,7 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testAfterAFailureOnlyTheNextEvaluationAsks() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         sent.get(0).listener().onFailure(new ElasticsearchException("simulated"));
         assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
@@ -249,7 +260,7 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testUnknownRepositoryGenerationAsksOnEveryEvaluation() {
-        generations.onClusterState(state(RepositoryData.UNKNOWN_REPO_GEN), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(RepositoryData.UNKNOWN_REPO_GEN), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(0, 5, Map.of(SHARD_0, RECORDED));
         assertThat(generations.choose(REPOSITORY, SHARD_0), equalTo(new Choice(INDEX_ID, RECORDED)));
@@ -261,11 +272,11 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testARepositoryRegisteredAgainStartsOver() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
         answer(0, 5, Map.of(SHARD_0, RECORDED));
 
-        generations.onClusterState(state(5, "another-uuid"), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5, "another-uuid"), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         assertThat(generations.choose(REPOSITORY, SHARD_0), nullValue());
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), false);
@@ -273,10 +284,10 @@ public class NextShardGenerationsTests extends ESTestCase {
     }
 
     public void testAnswerForARepositoryNoLongerTrackedIsIgnored() {
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
         generations.maybeRequest(REPOSITORY, List.of(SHARD_0), true);
-        generations.onClusterState(state(5), Map.of());
-        generations.onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
+        onClusterState(state(5), Map.of());
+        onClusterState(state(5), Map.of(REPOSITORY, List.of(SHARD_0)));
 
         answer(0, 5, Map.of(SHARD_0, RECORDED));
 
@@ -291,6 +302,14 @@ public class NextShardGenerationsTests extends ESTestCase {
             .build();
         assertFalse(NextShardGenerations.isSupported(mixed));
         assertThat(sent, empty());
+    }
+
+    private long version;
+
+    // Each cluster state directly follows the one before it.
+    private void onClusterState(ClusterState state, Map<ProjectRepo, List<ShardId>> primaries) {
+        version += 1;
+        generations.onClusterState(ClusterState.builder(state).version(version).build(), version - 1, primaries);
     }
 
     private void answer(int request, long repositoryGeneration, Map<ShardId, ShardGeneration> shardGenerations) {
