@@ -81,17 +81,6 @@ public class ShardBaselineCacheTests extends ESTestCase {
         assertThat(cache.ramBytesUsed(), greaterThan(0L));
     }
 
-    public void testTheCommitIsTakenAfterTheMetadataIsRead() {
-        final var cache = cache(Long.MAX_VALUE);
-        repository.metadata.put(GENERATION_1, backedUp());
-
-        measure(cache, shard(0), GENERATION_1, new FakeShard(null));
-        taskQueue.runAllRunnableTasks();
-
-        // A snapshot that finished between the two would otherwise leave newer files out of the baseline, see ShardBaseline#of.
-        assertThat(events, equalTo(List.of("read " + GENERATION_1, "commit")));
-    }
-
     public void testANewShardGenerationNeedsNoRead() {
         final var cache = cache(Long.MAX_VALUE);
         final var shard = shard(0);
@@ -302,6 +291,8 @@ public class ShardBaselineCacheTests extends ESTestCase {
             new MockLog.UnseenEventExpectation("no warning", ShardBaselineCache.class.getCanonicalName(), Level.WARN, "*")
         );
         assertThat(measure(cache, shard, GENERATION_1, closing), equalTo(new NotMeasured(Reason.READ_FAILED)));
+        // The commit is taken first, so the repository isn't read for nothing.
+        assertThat(repository.reads, equalTo(List.of()));
     }
 
     public void testTheBudgetRefusesNewShardsButNeverARebuild() {
@@ -472,8 +463,10 @@ public class ShardBaselineCacheTests extends ESTestCase {
     }
 
     /**
-     * A repository with backup metadata by generation. A read fails if {@link #failure} is set, or if there is no metadata for the
-     * generation, as when a newer generation replaced it. {@link #duringRead} runs in the middle of each read.
+     * A repository with backup metadata by generation. A read builds the baseline from the whole metadata, which gives the same
+     * baseline as reading it one entry at a time ({@link ShardBaselineFormatTests}). A read fails if {@link #failure} is set, or if
+     * there is no metadata for the generation, as when a newer generation replaced it. {@link #duringRead} runs in the middle of each
+     * read.
      */
     private class FakeRepository implements ShardBaselineCache.MetadataReader {
         final Map<ShardGeneration, BlobStoreIndexShardSnapshots> metadata = new HashMap<>();
@@ -482,8 +475,13 @@ public class ShardBaselineCacheTests extends ESTestCase {
         Consumer<ShardGeneration> duringRead = generation -> {};
 
         @Override
-        public BlobStoreIndexShardSnapshots read(ProjectRepo repository, IndexId indexId, int shardId, ShardGeneration generation)
-            throws IOException {
+        public ShardBaseline read(
+            ProjectRepo repository,
+            IndexId indexId,
+            int shardId,
+            ShardGeneration generation,
+            List<LuceneFile> currentFiles
+        ) throws IOException {
             assertThat(repository, equalTo(REPOSITORY));
             assertThat(indexId, equalTo(INDEX_ID));
             events.add("read " + generation);
@@ -496,7 +494,7 @@ public class ShardBaselineCacheTests extends ESTestCase {
             if (shardSnapshots == null) {
                 throw new NoSuchFileException("index-" + generation);
             }
-            return shardSnapshots;
+            return ShardBaseline.of(shardSnapshots, currentFiles);
         }
     }
 

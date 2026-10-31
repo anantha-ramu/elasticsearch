@@ -59,17 +59,14 @@ import java.util.function.LongSupplier;
  *     dropped, and a load still queued or running for it changes nothing when it finishes.</li>
  *     <li><b>Measuring is turned off</b> ({@link #close}). Everything is dropped, and loads still queued or running change nothing.</li>
  * </ul>
- * The parsed backup metadata is only held while a baseline is built, at most {@link #MAX_CONCURRENT_LOADS} at a time. It has no size
- * limit, as in the snapshot itself, which parses the same metadata for every shard it snapshots, up to ten at a time.
+ * A load reads the backup metadata one entry at a time, keeping only what the baseline needs ({@link ShardBaselineFormat}), so it
+ * takes about as much memory as the baseline it builds, however many snapshots the repository keeps.
  */
 final class ShardBaselineCache implements Accountable, Releasable {
 
     private static final Logger logger = LogManager.getLogger(ShardBaselineCache.class);
 
-    // Loads run while a backup is still going (a shard's generation changes when that shard finishes), next to the snapshot's own
-    // parses of the same metadata, up to ten at a time. Two keeps what loads add small: at 7-day retention a typical shard's
-    // metadata takes about 4.4 MB once parsed, and a shard with 2,000 files per snapshot about 44 MB.
-    static final int MAX_CONCURRENT_LOADS = 2;
+    static final int MAX_CONCURRENT_LOADS = 4;
     static final TimeValue FIRST_RETRY_DELAY = TimeValue.timeValueSeconds(30);
     static final TimeValue MAX_RETRY_DELAY = TimeValue.timeValueMinutes(10);
     static final TimeValue WARNING_INTERVAL = TimeValue.timeValueMinutes(10);
@@ -104,13 +101,15 @@ final class ShardBaselineCache implements Accountable, Releasable {
     }
 
     /**
-     * Reads a shard's backup metadata from a repository.
+     * Reads a shard's backup metadata from a repository straight into a baseline, see {@link ShardBaselineFormat}.
      */
     interface MetadataReader {
         /**
          * Reads the blob of exactly this generation, and fails if it doesn't exist.
+         *
+         * @param currentFiles the files of the shard's build commit, see {@link ShardBaseline#of}
          */
-        BlobStoreIndexShardSnapshots read(ProjectRepo repository, IndexId indexId, int shardId, ShardGeneration generation)
+        ShardBaseline read(ProjectRepo repository, IndexId indexId, int shardId, ShardGeneration generation, List<LuceneFile> currentFiles)
             throws IOException;
     }
 
@@ -305,23 +304,24 @@ final class ShardBaselineCache implements Accountable, Releasable {
             indexId = entry.indexId;
             commits = entry.commits;
         }
-        BlobStoreIndexShardSnapshots snapshots = null;
-        Exception readFailure = null;
+        // The commit is taken now, after the caller learned the generation, so every snapshot in that generation's metadata is of an
+        // earlier commit, as ShardBaseline#of requires.
+        LatestCommit commit = null;
+        Exception commitFailure = null;
         try {
-            snapshots = ShardGenerations.NEW_SHARD_GEN.equals(generation)
-                ? BlobStoreIndexShardSnapshots.EMPTY
-                : reader.read(key.repository(), indexId, key.shardId().id(), generation);
+            commit = commits.get();
         } catch (Exception e) {
-            readFailure = e;
+            commitFailure = e;
         }
         ShardBaseline baseline = null;
-        Exception commitFailure = null;
-        if (snapshots != null) {
+        Exception readFailure = null;
+        if (commit != null) {
             try {
-                // The commit must be taken after the metadata is read, see ShardBaseline#of.
-                baseline = ShardBaseline.of(snapshots, commits.get().files());
+                baseline = ShardGenerations.NEW_SHARD_GEN.equals(generation)
+                    ? ShardBaseline.of(BlobStoreIndexShardSnapshots.EMPTY, commit.files())
+                    : reader.read(key.repository(), indexId, key.shardId().id(), generation, commit.files());
             } catch (Exception e) {
-                commitFailure = e;
+                readFailure = e;
             }
         }
         synchronized (this) {
