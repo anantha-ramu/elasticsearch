@@ -309,8 +309,8 @@ public class ShardBaselineCacheTests extends ESTestCase {
         final var commit = new FakeShard(null, cfs0);
         repository.metadata.put(GENERATION_1, backedUp(cfs0));
         final long oneBaseline = ShardBaseline.of(backedUp(cfs0), commit.files).ramBytesUsed();
-        // Room for one baseline, and not for two.
-        final long budget = oneBaseline + randomLongBetween(0, oneBaseline - 1);
+        // Room for one baseline, and not for two. The budget isn't full after the first, so the second is read and then refused.
+        final long budget = oneBaseline + 1;
         final var cache = cache(budget);
         measure(cache, shard(0), GENERATION_1, commit);
         taskQueue.runAllRunnableTasks();
@@ -339,6 +339,20 @@ public class ShardBaselineCacheTests extends ESTestCase {
         measure(cache, shard(1), GENERATION_1, commit);
         taskQueue.runAllRunnableTasks();
         assertThat(measure(cache, shard(1), GENERATION_1, commit), equalTo(new Measured(GENERATION_1, 0)));
+    }
+
+    public void testOnceTheBudgetIsFullANewShardIsRefusedWithoutARead() {
+        final var commit = new FakeShard(null, file("_0.cfs", 1000));
+        repository.metadata.put(GENERATION_1, backedUp(file("_0.cfs", 1000)));
+        // Exactly one baseline fills the budget.
+        final var cache = cache(ShardBaseline.of(backedUp(file("_0.cfs", 1000)), commit.files).ramBytesUsed());
+        measure(cache, shard(0), GENERATION_1, commit);
+        taskQueue.runAllRunnableTasks();
+
+        // A second shard couldn't fit whatever its metadata holds, so the repository isn't read for it.
+        assertThat(measure(cache, shard(1), GENERATION_1, commit), equalTo(new NotMeasured(Reason.OVER_BUDGET)));
+        assertFalse(taskQueue.hasRunnableTasks());
+        assertThat(repository.reads, equalTo(List.of(GENERATION_1)));
     }
 
     public void testAShardThatLeavesIsForgotten() {
