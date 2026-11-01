@@ -54,6 +54,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 import static org.hamcrest.Matchers.anEmptyMap;
 import static org.hamcrest.Matchers.equalTo;
@@ -332,6 +333,14 @@ public class SnapshotBacklogMetricsServiceTests extends ESTestCase {
         assertThat(figures().get(SHARD), equalTo(ShardFigure.without(Status.NOT_REPORTED)));
     }
 
+    /**
+     * The status attribute follows modules/apm/NAMING.md, the pattern the APM module checks every attribute against when assertions are
+     * on (MetricValidator.Attributes.ATTRIBUTE_PATTERN). The repository attribute is checked in {@link SnapshotBacklogTrackerTests}.
+     */
+    public void testStatusAttributeFollowsTheNamingGuide() {
+        assertTrue(Pattern.compile("es(_[a-z][a-z0-9]{0,29}){2,8}").matcher(SnapshotBacklogMetricsService.STATUS_ATTRIBUTE).matches());
+    }
+
     private Map<ShardId, ShardFigure> figures() {
         return service.getFigures(applied).get(REPOSITORY);
     }
@@ -382,7 +391,7 @@ public class SnapshotBacklogMetricsServiceTests extends ESTestCase {
     private Map<String, Long> sizeGauge() {
         final Map<String, Long> byRepository = new HashMap<>();
         for (Measurement measurement : measurements(SnapshotBacklogMetricsService.SIZE_METRIC)) {
-            byRepository.put((String) measurement.attributes().get("repo_name"), measurement.getLong());
+            byRepository.put((String) measurement.attributes().get(SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE), measurement.getLong());
         }
         return byRepository;
     }
@@ -390,8 +399,8 @@ public class SnapshotBacklogMetricsServiceTests extends ESTestCase {
     private Map<String, Long> shardsGauge() {
         final Map<String, Long> byStatus = new HashMap<>();
         for (Measurement measurement : measurements(SnapshotBacklogMetricsService.SHARDS_METRIC)) {
-            assertThat(measurement.attributes().get("repo_name"), equalTo("repo"));
-            byStatus.put((String) measurement.attributes().get("status"), measurement.getLong());
+            assertThat(measurement.attributes().get(SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE), equalTo("repo"));
+            byStatus.put((String) measurement.attributes().get(SnapshotBacklogMetricsService.STATUS_ATTRIBUTE), measurement.getLong());
         }
         return byStatus;
     }
