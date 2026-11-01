@@ -118,7 +118,7 @@ public class SnapshotBacklogMasterIT extends AbstractStatelessPluginIntegTestCas
             final List<Measurement> size = telemetry.getLongAsyncGaugeMeasurement(SnapshotBacklogMetricsService.SIZE_METRIC);
             assertThat(size.size(), equalTo(1));
             assertThat(size.get(0).getLong(), equalTo(total));
-            assertThat(size.get(0).attributes(), equalTo(Map.of("repo_name", REPOSITORY)));
+            assertThat(size.get(0).attributes(), equalTo(Map.of(SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE, REPOSITORY)));
         });
     }
 

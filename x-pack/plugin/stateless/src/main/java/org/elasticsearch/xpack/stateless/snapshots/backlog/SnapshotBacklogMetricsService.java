@@ -84,6 +84,8 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
 
     static final String SIZE_METRIC = "es.stateless.snapshot_backlog.master.size";
     static final String SHARDS_METRIC = "es.stateless.snapshot_backlog.master.shards.current";
+    // The attribute for the status of the shards counted, named as modules/apm/NAMING.md asks
+    static final String STATUS_ATTRIBUTE = "es_snapshot_backlog_status";
 
     /**
      * Where the figure of one primary shard in one repository comes from. See the class Javadoc for when each one applies.
@@ -316,7 +318,7 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
                     for (ShardFigure figure : repositoryAndFigures.getValue().values()) {
                         bytes += figure.bytes();
                     }
-                    measurement.record(bytes, Map.of("repo_name", repositoryAndFigures.getKey().name()));
+                    measurement.record(bytes, Map.of(SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE, repositoryAndFigures.getKey().name()));
                 }
             }
         );
@@ -334,7 +336,12 @@ public class SnapshotBacklogMetricsService implements ClusterStateListener {
                     for (Status status : Status.values()) {
                         measurement.record(
                             byStatus.getOrDefault(status, 0L),
-                            Map.of("repo_name", repositoryAndFigures.getKey().name(), "status", status.label())
+                            Map.of(
+                                SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE,
+                                repositoryAndFigures.getKey().name(),
+                                STATUS_ATTRIBUTE,
+                                status.label()
+                            )
                         );
                     }
                 }
