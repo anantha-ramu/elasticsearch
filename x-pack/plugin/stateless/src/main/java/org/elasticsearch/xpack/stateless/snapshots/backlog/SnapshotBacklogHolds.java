@@ -54,7 +54,10 @@ import java.util.function.BiFunction;
  *     <li>Otherwise none yet ({@link Status#HOLD_PENDING}: 0, minimum). The first live figure measured against the start generation is
  *     held when a report brings one. Waiting happens when two snapshots of the repository overlap. The cluster state update that
  *     finishes the shard in the earlier snapshot also starts the shard in the later snapshot, from the generation the earlier
- *     snapshot just wrote. No report measured against that generation exists yet.</li>
+ *     snapshot just wrote. No report measured against that generation exists yet. A figure held this way was measured after the
+ *     snapshot started, so it can also count data written since the start, up to one evaluation interval of writes. That small
+ *     overcount is accepted: waiting for a figure from before the start would leave the shard at 0 and minimum for the whole
+ *     snapshot.</li>
  *     <li>A figure measured against any other generation is never held.</li>
  *     <li>The first snapshot of a new index starts from {@link ShardGenerations#NEW_SHARD_GEN}, and the node measures a shard the
  *     repository doesn't know against {@code NEW_SHARD_GEN} too. A new shard in an index the repository already knows, such as after
