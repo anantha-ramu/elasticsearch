@@ -62,7 +62,7 @@ final class BlobStoreMetadataReader implements ShardBaselineCache.MetadataReader
         ShardGeneration generation,
         List<LuceneFile> currentFiles
     ) throws IOException {
-        final Map<String, Object> attributes = Map.of("repo_name", projectRepo.name());
+        final Map<String, Object> attributes = Map.of(SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE, projectRepo.name());
         reads.incrementBy(1, attributes);
         try {
             final Repository repository = repositoriesService.repository(projectRepo.projectId(), projectRepo.name());
