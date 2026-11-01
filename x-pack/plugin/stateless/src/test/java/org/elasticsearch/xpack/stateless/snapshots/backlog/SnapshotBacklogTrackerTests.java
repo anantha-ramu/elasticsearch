@@ -58,6 +58,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
 import static org.hamcrest.Matchers.anEmptyMap;
 import static org.hamcrest.Matchers.empty;
@@ -128,7 +129,17 @@ public class SnapshotBacklogTrackerTests extends ESTestCase {
         assertThat(tracker.getResults(), equalTo(Map.of(REPOSITORY, Map.of(SHARD, new NotMeasured(Reason.CLUSTER_TOO_OLD)))));
         assertThat(
             notMeasuredGauge(),
-            equalTo(Map.of(Map.<String, Object>of("repo_name", "repo", "reason", Reason.CLUSTER_TOO_OLD.name()), 1L))
+            equalTo(
+                Map.of(
+                    Map.<String, Object>of(
+                        SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE,
+                        "repo",
+                        SnapshotBacklogTracker.REASON_ATTRIBUTE,
+                        Reason.CLUSTER_TOO_OLD.name()
+                    ),
+                    1L
+                )
+            )
         );
 
         // Once every node is upgraded, the master is asked.
@@ -314,9 +325,19 @@ public class SnapshotBacklogTrackerTests extends ESTestCase {
             notMeasuredGauge(),
             equalTo(
                 Map.of(
-                    Map.<String, Object>of("repo_name", "repo", "reason", Reason.LOADING.name()),
+                    Map.<String, Object>of(
+                        SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE,
+                        "repo",
+                        SnapshotBacklogTracker.REASON_ATTRIBUTE,
+                        Reason.LOADING.name()
+                    ),
                     2L,
-                    Map.<String, Object>of("repo_name", "repo", "reason", Reason.NO_GENERATION.name()),
+                    Map.<String, Object>of(
+                        SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE,
+                        "repo",
+                        SnapshotBacklogTracker.REASON_ATTRIBUTE,
+                        Reason.NO_GENERATION.name()
+                    ),
                     1L
                 )
             )
@@ -332,6 +353,17 @@ public class SnapshotBacklogTrackerTests extends ESTestCase {
         assertThat(gauge(SnapshotBacklogTracker.BACKLOG_METRIC), equalTo(List.of(2 * FILE_LENGTH)));
         // It needed no read.
         assertThat(reads, equalTo(List.of(RECORDED)));
+    }
+
+    /**
+     * The attribute names follow modules/apm/NAMING.md. With assertions on, the APM module checks every attribute against the same
+     * pattern (MetricValidator.Attributes.ATTRIBUTE_PATTERN), so a name that breaks it fails any test that records through real APM.
+     */
+    public void testMetricAttributesFollowTheNamingGuide() {
+        final Pattern pattern = Pattern.compile("es(_[a-z][a-z0-9]{0,29}){2,8}");
+        for (String attribute : List.of(SnapshotBacklogTracker.REPOSITORY_ATTRIBUTE, SnapshotBacklogTracker.REASON_ATTRIBUTE)) {
+            assertTrue(attribute, pattern.matcher(attribute).matches());
+        }
     }
 
     private LocalPrimary primary(ShardId shardId, boolean hollow) {

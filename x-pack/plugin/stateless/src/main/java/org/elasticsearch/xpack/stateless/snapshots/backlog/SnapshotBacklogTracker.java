@@ -103,6 +103,10 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
     static final String NOT_MEASURED_SHARDS_METRIC = "es.stateless.snapshot_backlog.shards.not_measured.current";
     static final String BASELINES_METRIC = "es.stateless.snapshot_backlog.baselines.size";
 
+    // Metric attribute names, as modules/apm/NAMING.md asks: the root "es", then the area, then the name.
+    static final String REPOSITORY_ATTRIBUTE = "es_repository_name";
+    static final String REASON_ATTRIBUTE = "es_snapshot_backlog_reason";
+
     /**
      * A primary shard on this node.
      *
@@ -438,7 +442,7 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
                             bytes += measured.bytes();
                         }
                     }
-                    measurement.record(bytes, Map.of("repo_name", repositoryAndResults.getKey().name()));
+                    measurement.record(bytes, Map.of(REPOSITORY_ATTRIBUTE, repositoryAndResults.getKey().name()));
                 }
             }
         );
@@ -453,7 +457,7 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
                         .stream()
                         .filter(result -> result instanceof Measured)
                         .count();
-                    measurement.record(measured, Map.of("repo_name", repositoryAndResults.getKey().name()));
+                    measurement.record(measured, Map.of(REPOSITORY_ATTRIBUTE, repositoryAndResults.getKey().name()));
                 }
             }
         );
@@ -472,7 +476,12 @@ public final class SnapshotBacklogTracker implements ClusterStateListener, Index
                     for (Map.Entry<Reason, Long> reasonAndCount : byReason.entrySet()) {
                         measurement.record(
                             reasonAndCount.getValue(),
-                            Map.of("repo_name", repositoryAndResults.getKey().name(), "reason", reasonAndCount.getKey().name())
+                            Map.of(
+                                REPOSITORY_ATTRIBUTE,
+                                repositoryAndResults.getKey().name(),
+                                REASON_ATTRIBUTE,
+                                reasonAndCount.getKey().name()
+                            )
                         );
                     }
                 }
