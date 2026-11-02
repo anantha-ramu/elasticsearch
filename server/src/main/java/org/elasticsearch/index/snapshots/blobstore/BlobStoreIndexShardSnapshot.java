@@ -38,7 +38,18 @@ import static org.elasticsearch.index.store.StoreFileMetadata.UNAVAILABLE_WRITER
 public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
 
     /**
-     * Information about snapshotted file
+     * Information about snapshotted file.
+     * <p>
+     * A file is stored in one of two ways:
+     * <ul>
+     *     <li>In blobs of its own: {@link #partName} gives the name of each part, and the parts hold exactly the file's bytes. This is
+     *     how snapshots upload files, and it is the only layout older versions understand.</li>
+     *     <li>As a byte range inside a copied blob: the repository holds a server-side copy of a whole stateless commit blob, named
+     *     {@link #blob()}, and the file's bytes start at {@link #offset()} in it and run for {@link #length()} bytes. Many files share one
+     *     copied blob, and the copied blob also holds bytes that belong to no file. No blob is written under {@link #name()}, which only
+     *     keeps the file unique in the shard's snapshot metadata. {@link #source()} records which commit blob was copied, so that a later
+     *     snapshot can find the copy and reuse it.</li>
+     * </ul>
      */
     public static final class FileInfo implements Writeable {
         public static final String SERIALIZE_WRITER_UUID = "serialize_writer_uuid";
@@ -49,6 +60,11 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
         private final long partBytes;
         private final int numberOfParts;
         private final StoreFileMetadata metadata;
+        @Nullable // unless the file is stored inside a copied blob
+        private final String blob;
+        private final long offset;
+        @Nullable // unless the file is stored inside a copied blob
+        private final String source;
 
         /**
          * Constructs a new instance of file info
@@ -58,8 +74,37 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
          * @param partSize     size of the single chunk
          */
         public FileInfo(String name, StoreFileMetadata metadata, @Nullable ByteSizeValue partSize) {
+            this(name, metadata, partSize, null, 0L, null);
+        }
+
+        /**
+         * Constructs the file info of a file that is stored as a byte range inside a copied blob.
+         *
+         * @param name     unique name of the file in the shard's snapshot metadata; no blob is written under this name
+         * @param metadata the file's metadata, whose length is the length of the range
+         * @param blob     name of the copied blob in the shard's folder of the repository
+         * @param offset   position in {@code blob} where the file starts
+         * @param source   path of the commit blob that was copied, used to find the copy again
+         */
+        public FileInfo(String name, StoreFileMetadata metadata, String blob, long offset, String source) {
+            this(name, metadata, null, Objects.requireNonNull(blob), offset, Objects.requireNonNull(source));
+        }
+
+        private FileInfo(
+            String name,
+            StoreFileMetadata metadata,
+            @Nullable ByteSizeValue partSize,
+            @Nullable String blob,
+            long offset,
+            @Nullable String source
+        ) {
             this.name = Objects.requireNonNull(name);
             this.metadata = metadata;
+            assert blob == null || (partSize == null && offset >= 0) : "copied file [" + name + "] must be one range at offset >= 0";
+            assert (blob == null) == (source == null) : "blob [" + blob + "] and source [" + source + "] must be set together";
+            this.blob = blob;
+            this.offset = offset;
+            this.source = source;
 
             long partBytes = Long.MAX_VALUE;
             if (partSize != null && partSize.getBytes() > 0) {
@@ -87,6 +132,11 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
+            // Only snapshot-based peer recovery sends a FileInfo to another node, and it never uses a snapshot that holds copied files.
+            // Refusing here means the wire format needs no field for them.
+            if (blob != null) {
+                throw new IllegalStateException("cannot send file [" + name + "] stored inside copied blob [" + blob + "] to another node");
+            }
             out.writeString(name);
             metadata.writeTo(out);
             out.writeOptionalWriteable(partSize);
@@ -108,6 +158,7 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
          * @return part name
          */
         public String partName(int part) {
+            assert blob == null : "file [" + name + "] has no part blobs, it is stored inside copied blob [" + blob + "]";
             if (numberOfParts > 1) {
                 return name + ".part" + part;
             } else {
@@ -201,6 +252,36 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
         }
 
         /**
+         * Whether this file is stored as a byte range inside a copied blob rather than in blobs of its own. See the class Javadoc.
+         */
+        public boolean isCopied() {
+            return blob != null;
+        }
+
+        /**
+         * The name of the copied blob that holds this file, or {@code null} if the file is stored in blobs of its own.
+         */
+        @Nullable
+        public String blob() {
+            return blob;
+        }
+
+        /**
+         * The position in {@link #blob()} where this file starts, or {@code 0} if the file is stored in blobs of its own.
+         */
+        public long offset() {
+            return offset;
+        }
+
+        /**
+         * The path of the commit blob that {@link #blob()} is a copy of, or {@code null} if the file is stored in blobs of its own.
+         */
+        @Nullable
+        public String source() {
+            return source;
+        }
+
+        /**
          * Checks if a file in a store is the same file
          *
          * @param md file in a store
@@ -235,6 +316,12 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
                     return false;
                 }
             }
+            // Where the bytes are stored matters too, so that a shard generation and a shard snapshot that disagree about it are caught.
+            if (Objects.equals(blob, fileInfo.blob) == false
+                || offset != fileInfo.offset
+                || Objects.equals(source, fileInfo.source) == false) {
+                return false;
+            }
             return metadata.isSame(fileInfo.metadata);
         }
 
@@ -246,6 +333,9 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
         static final String WRITTEN_BY = "written_by";
         static final String META_HASH = "meta_hash";
         static final String WRITER_UUID = "writer_uuid";
+        static final String BLOB = "blob";
+        static final String OFFSET = "offset";
+        static final String SOURCE = "source";
 
         /**
          * Serializes file info into JSON
@@ -280,6 +370,12 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
                 builder.field(WRITER_UUID, writerUuid.bytes, writerUuid.offset, writerUuid.length);
             }
 
+            if (file.blob != null) {
+                builder.field(BLOB, file.blob);
+                builder.field(OFFSET, file.offset);
+                builder.field(SOURCE, file.source);
+            }
+
             builder.endObject();
         }
 
@@ -299,6 +395,9 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
             String writtenBy = null;
             BytesRef metaHash = new BytesRef();
             BytesRef writerUuid = UNAVAILABLE_WRITER_UUID;
+            String blob = null;
+            Long offset = null;
+            String source = null;
             XContentParserUtils.ensureExpectedToken(token, XContentParser.Token.START_OBJECT, parser);
             String currentFieldName;
             while ((currentFieldName = parser.nextFieldName()) != null) {
@@ -326,6 +425,9 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
                             throw new ElasticsearchParseException("invalid (empty) writer uuid");
                         }
                     }
+                    case BLOB -> blob = parser.text();
+                    case OFFSET -> offset = parser.longValue();
+                    case SOURCE -> source = parser.text();
                     default -> XContentParserUtils.throwUnknownField(currentFieldName, parser);
                 }
             }
@@ -348,7 +450,21 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
             } catch (Exception e) {
                 throw new ElasticsearchParseException("invalid written_by [" + writtenBy + "]");
             }
-            return new FileInfo(name, new StoreFileMetadata(physicalName, length, checksum, writtenBy, metaHash, writerUuid), partSize);
+            // A file stored inside a copied blob has all of blob, offset and source, and is one range, so it has no part size. Other files
+            // have none of them. The source is a path in another bucket and contains '/', so it is not checked as a file name.
+            if (blob != null || offset != null || source != null) {
+                if (blob == null || Strings.validFileName(blob) == false) {
+                    throw new ElasticsearchParseException("missing or invalid copied blob name [" + blob + "] for file [" + name + "]");
+                } else if (offset == null || offset < 0) {
+                    throw new ElasticsearchParseException("missing or invalid offset [" + offset + "] for file [" + name + "]");
+                } else if (Strings.hasLength(source) == false) {
+                    throw new ElasticsearchParseException("missing source of copied blob [" + blob + "] for file [" + name + "]");
+                } else if (partSize != null) {
+                    throw new ElasticsearchParseException("file [" + name + "] inside copied blob [" + blob + "] cannot have a part size");
+                }
+            }
+            final var metadata = new StoreFileMetadata(physicalName, length, checksum, writtenBy, metaHash, writerUuid);
+            return blob == null ? new FileInfo(name, metadata, partSize) : new FileInfo(name, metadata, blob, offset, source);
         }
 
         @Override
@@ -363,6 +479,7 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
                 + partBytes
                 + ", metadata: "
                 + metadata
+                + (blob == null ? "" : ", blob: " + blob + ", offset: " + offset + ", source: " + source)
                 + "]";
         }
     }

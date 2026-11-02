@@ -12,6 +12,7 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.Version;
 import org.elasticsearch.ElasticsearchParseException;
 import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.index.IndexVersions;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
@@ -31,6 +32,7 @@ import static org.elasticsearch.index.store.StoreFileMetadata.UNAVAILABLE_WRITER
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.nullValue;
 
 public class FileInfoTests extends ESTestCase {
     private static final Version MIN_SUPPORTED_LUCENE_VERSION = IndexVersions.MINIMUM_COMPATIBLE.luceneVersion();
@@ -159,6 +161,154 @@ public class FileInfoTests extends ESTestCase {
                 }
             }
         }
+    }
+
+    public void testCopiedFileToFromXContent() throws IOException {
+        final FileInfo info = randomCopiedFileInfo();
+        final XContentBuilder builder = XContentFactory.contentBuilder(XContentType.JSON);
+        FileInfo.toXContent(info, builder, ToXContent.EMPTY_PARAMS);
+        final byte[] xContent = BytesReference.toBytes(BytesReference.bytes(shuffleXContent(builder)));
+
+        final FileInfo parsedInfo;
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, xContent)) {
+            parser.nextToken();
+            parsedInfo = FileInfo.fromXContent(parser);
+        }
+        assertTrue(parsedInfo.isCopied());
+        assertThat(parsedInfo.name(), equalTo(info.name()));
+        assertThat(parsedInfo.blob(), equalTo(info.blob()));
+        assertThat(parsedInfo.offset(), equalTo(info.offset()));
+        assertThat(parsedInfo.source(), equalTo(info.source()));
+        assertThat(parsedInfo.partSize(), nullValue());
+        assertThat(parsedInfo.numberOfParts(), equalTo(1));
+        assertThat(parsedInfo.partBytes(0), equalTo(info.length()));
+        assertTrue(parsedInfo.isSame(info));
+    }
+
+    public void testInvalidCopiedFieldsInFromXContent() throws IOException {
+        // every way of breaking the copied fields, then the valid case last
+        for (int corruption = 0; corruption <= 6; corruption++) {
+            String blob = "c__" + randomAlphaOfLength(10);
+            Long offset = randomNonNegativeLong();
+            String source = "indices/" + randomAlphaOfLength(10) + "/0/" + between(1, 5) + "/stateless_commit_" + between(1, 1000);
+            Long partSize = null;
+            final String failure;
+            switch (corruption) {
+                case 0 -> {
+                    blob = null;
+                    failure = "missing or invalid copied blob name";
+                }
+                case 1 -> {
+                    blob = "c__foo" + randomFrom(",", "/", "*", " ") + "bar";
+                    failure = "missing or invalid copied blob name";
+                }
+                case 2 -> {
+                    offset = null;
+                    failure = "missing or invalid offset";
+                }
+                case 3 -> {
+                    offset = -randomLongBetween(1, Long.MAX_VALUE);
+                    failure = "missing or invalid offset";
+                }
+                case 4 -> {
+                    source = randomBoolean() ? null : "";
+                    failure = "missing source of copied blob";
+                }
+                case 5 -> {
+                    partSize = randomLongBetween(1, Long.MAX_VALUE);
+                    failure = "cannot have a part size";
+                }
+                case 6 -> failure = null;
+                default -> throw new AssertionError("unexpected corruption " + corruption);
+            }
+
+            final XContentBuilder builder = XContentFactory.contentBuilder(XContentType.JSON);
+            builder.startObject();
+            builder.field(FileInfo.NAME, "__foobar");
+            builder.field(FileInfo.PHYSICAL_NAME, "_0.cfs");
+            builder.field(FileInfo.LENGTH, between(16, 1000));
+            builder.field(FileInfo.WRITTEN_BY, Version.LATEST.toString());
+            builder.field(FileInfo.CHECKSUM, "666");
+            if (blob != null) {
+                builder.field(FileInfo.BLOB, blob);
+            }
+            if (offset != null) {
+                builder.field(FileInfo.OFFSET, offset);
+            }
+            if (source != null) {
+                builder.field(FileInfo.SOURCE, source);
+            }
+            if (partSize != null) {
+                builder.field(FileInfo.PART_SIZE, partSize);
+            }
+            builder.endObject();
+            final byte[] xContent = BytesReference.toBytes(BytesReference.bytes(builder));
+
+            try (XContentParser parser = createParser(JsonXContent.jsonXContent, xContent)) {
+                parser.nextToken();
+                if (failure == null) {
+                    // the source is a path with '/' in it, which is fine even though it would not be a valid file name
+                    final FileInfo parsedInfo = FileInfo.fromXContent(parser);
+                    assertTrue(parsedInfo.isCopied());
+                    assertThat(parsedInfo.source(), equalTo(source));
+                } else {
+                    final ElasticsearchParseException e = expectThrows(
+                        ElasticsearchParseException.class,
+                        () -> FileInfo.fromXContent(parser)
+                    );
+                    assertThat(e.getMessage(), containsString(failure));
+                }
+            }
+        }
+    }
+
+    public void testIsSameComparesWhereBytesAreStored() {
+        final FileInfo copied = randomCopiedFileInfo();
+        final String name = copied.name();
+        final StoreFileMetadata metadata = copied.metadata();
+        assertTrue(copied.isSame(new FileInfo(name, metadata, copied.blob(), copied.offset(), copied.source())));
+        assertFalse(copied.isSame(new FileInfo(name, metadata, copied.blob() + "x", copied.offset(), copied.source())));
+        assertFalse(copied.isSame(new FileInfo(name, metadata, copied.blob(), copied.offset() + 1, copied.source())));
+        assertFalse(copied.isSame(new FileInfo(name, metadata, copied.blob(), copied.offset(), copied.source() + "x")));
+        final FileInfo uploaded = new FileInfo(name, metadata, null);
+        assertFalse(copied.isSame(uploaded));
+        assertFalse(uploaded.isSame(copied));
+    }
+
+    public void testCopiedFileIsNotSentToAnotherNode() throws IOException {
+        final FileInfo copied = randomCopiedFileInfo();
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            final IllegalStateException e = expectThrows(IllegalStateException.class, () -> copied.writeTo(out));
+            assertThat(e.getMessage(), containsString(copied.blob()));
+        }
+        // a copied file has no part blobs, and asking for one is a bug
+        expectThrows(AssertionError.class, () -> copied.partName(0));
+
+        // a file stored in blobs of its own still goes over the wire as before
+        final FileInfo uploaded = new FileInfo(
+            copied.name(),
+            copied.metadata(),
+            randomBoolean() ? null : ByteSizeValue.ofBytes(between(1, 1000))
+        );
+        assertTrue(copyWriteable(uploaded, writableRegistry(), FileInfo::new).isSame(uploaded));
+    }
+
+    private static FileInfo randomCopiedFileInfo() {
+        final StoreFileMetadata metadata = new StoreFileMetadata(
+            "_" + randomAlphaOfLength(5) + ".cfs",
+            randomLongBetween(16, Integer.MAX_VALUE),
+            randomAlphaOfLengthBetween(1, 10),
+            Version.LATEST.toString(),
+            new BytesRef(),
+            randomBytesRef(20)
+        );
+        return new FileInfo(
+            "__" + randomAlphaOfLength(10),
+            metadata,
+            "c__" + randomAlphaOfLength(10),
+            randomLongBetween(0, Long.MAX_VALUE - 1),
+            "indices/" + randomAlphaOfLength(10) + "/0/" + between(1, 5) + "/stateless_commit_" + between(1, 1000)
+        );
     }
 
     public void testGetPartSize() {

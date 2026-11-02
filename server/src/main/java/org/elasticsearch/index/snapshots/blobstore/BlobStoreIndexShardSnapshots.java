@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -174,6 +175,57 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
      */
     public FileInfo findNameFile(String name) {
         return files.get(name);
+    }
+
+    // names of the copied blobs that the file infos refer to, and the same blobs keyed by the commit blob each one is a copy of
+    // lazy computed for the same reason as physicalFiles: only snapshot create and delete need them
+    private Set<String> copiedBlobNames;
+    private Map<String, String> copiedBlobsBySource;
+
+    /**
+     * Returns the names of all copied blobs that file infos of this shard refer to. Snapshot delete keeps these copied blobs and deletes
+     * every other copied blob in the shard's folder, including copies that a failed snapshot left behind.
+     *
+     * @return the names of the referenced copied blobs, see {@link FileInfo#blob()}
+     */
+    public Set<String> copiedBlobNames() {
+        var names = this.copiedBlobNames;
+        if (names == null) {
+            final Set<String> found = new HashSet<>();
+            for (FileInfo fileInfo : files.values()) {
+                if (fileInfo.isCopied()) {
+                    found.add(fileInfo.blob());
+                }
+            }
+            names = Collections.unmodifiableSet(found);
+            copiedBlobNames = names;
+        }
+        return names;
+    }
+
+    /**
+     * Finds the copied blob that holds a copy of the given commit blob. A new snapshot that needs a file from that commit blob points its
+     * file info at the existing copy instead of copying the commit blob again.
+     *
+     * @param source path of a commit blob, see {@link FileInfo#source()}
+     * @return the name of the copied blob, or null if no file info refers to a copy of {@code source}
+     */
+    public String findCopiedBlob(String source) {
+        var bySource = this.copiedBlobsBySource;
+        if (bySource == null) {
+            bySource = new HashMap<>();
+            for (FileInfo fileInfo : files.values()) {
+                if (fileInfo.isCopied()) {
+                    final String otherBlob = bySource.putIfAbsent(fileInfo.source(), fileInfo.blob());
+                    // A snapshot reuses the copy that its starting generation refers to, so one generation never holds two copies of the
+                    // same commit blob.
+                    assert otherBlob == null || otherBlob.equals(fileInfo.blob())
+                        : "commit blob [" + fileInfo.source() + "] copied twice, to [" + otherBlob + "] and [" + fileInfo.blob() + "]";
+                }
+            }
+            copiedBlobsBySource = bySource;
+        }
+        return bySource.get(source);
     }
 
     @Override
