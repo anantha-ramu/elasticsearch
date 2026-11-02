@@ -31,6 +31,7 @@ import java.io.IOException;
 import java.util.function.BiFunction;
 
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING;
+import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING;
 
 /**
@@ -44,6 +45,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
 
     private volatile StatelessSnapshotEnabledStatus statelessSnapshotEnabledStatus;
     private volatile boolean relocationDuringSnapshotEnabled;
+    private volatile boolean serverSideCopyEnabled;
     private final BiFunction<ShardId, Long, BlobContainer> shardBlobContainerFunc;
     private final SnapshotsCommitService snapshotsCommitService;
     private final LocalPrimarySnapshotShardContextFactory localPrimaryFactory;
@@ -60,6 +62,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
         final ClusterSettings clusterSettings = stateless.getClusterService().getClusterSettings();
         clusterSettings.initializeAndWatch(STATELESS_SNAPSHOT_ENABLED_SETTING, this::setStatelessSnapshotEnabledStatus);
         clusterSettings.initializeAndWatch(RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING, this::setRelocationDuringSnapshotEnabled);
+        clusterSettings.initializeAndWatch(SERVER_SIDE_COPY_ENABLED_SETTING, value -> serverSideCopyEnabled = value);
         this.localPrimaryFactory = new LocalPrimarySnapshotShardContextFactory(
             stateless.getClusterService(),
             stateless.getIndicesService()
@@ -109,6 +112,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
                         snapshotCommitInfo.blobLocations(),
                         shardBlobContainerFunc,
                         snapshotCommitInfo.isShardRelocated(),
+                        serverSideCopyEnabled,
                         snapshotCommitInfo.snapshotIndexCommit().closingBefore(listener)
                     )
                 );
@@ -181,6 +185,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
                             response.blobLocations(),
                             shardBlobContainerFunc,
                             null,
+                            serverSideCopyEnabled,
                             listener
                         )
                     );

@@ -1526,6 +1526,7 @@ public class StatelessPlugin extends Plugin
             SearchShardInformationIndexListener.QUERY_SEARCH_SHARD_INFORMATION_SETTING,
             StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING,
             StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING,
+            StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING,
             StatelessSnapshotSettings.STATELESS_SNAPSHOT_WAIT_FOR_ACTIVE_PRIMARY_TIMEOUT_SETTING,
             StatelessShardRelocationOrder.PRIORITIZE_WRITE_SHARD_RELOCATIONS_SETTING,
             StatelessMemoryMetricsService.FIXED_SHARD_MEMORY_OVERHEAD_SETTING,

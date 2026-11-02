@@ -272,7 +272,8 @@ public class StatelessSnapshotShardContextFactoryTests extends ESTestCase {
                 Sets.addToCopy(
                     ClusterSettings.BUILT_IN_CLUSTER_SETTINGS,
                     STATELESS_SNAPSHOT_ENABLED_SETTING,
-                    RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING
+                    RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING,
+                    StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING
                 )
             )
         );

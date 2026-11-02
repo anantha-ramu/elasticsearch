@@ -99,6 +99,20 @@ public class StatelessSnapshotSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Whether a shard snapshot puts its new files into the repository with server-side copies of the commit blobs that hold them, instead
+     * of reading each file and uploading it. Each such file is then stored as a byte range of a copy, a layout that older versions cannot
+     * read, so enable the setting only when every node that reads the repository understands that layout. A change applies to shard
+     * snapshots that start after it. Copies happen only when {@link #STATELESS_SNAPSHOT_ENABLED_SETTING} makes shard snapshots read from
+     * the object store.
+     */
+    public static final Setting<Boolean> SERVER_SIDE_COPY_ENABLED_SETTING = Setting.boolSetting(
+        "stateless.snapshot.server_side_copy.enabled",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
     public static final Setting<TimeValue> STATELESS_SNAPSHOT_WAIT_FOR_ACTIVE_PRIMARY_TIMEOUT_SETTING = Setting.positiveTimeSetting(
         "stateless.snapshot.wait_for_active_primary_timeout",
         TimeValue.timeValueMinutes(5),
