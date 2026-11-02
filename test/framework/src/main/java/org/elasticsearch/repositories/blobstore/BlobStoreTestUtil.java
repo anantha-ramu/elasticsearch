@@ -34,13 +34,16 @@ import org.elasticsearch.common.blobstore.BlobPath;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.blobstore.RetryingInputStream;
 import org.elasticsearch.common.blobstore.support.BlobMetadata;
+import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.ThreadContext;
 import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
+import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.repositories.ShardGeneration;
@@ -67,7 +70,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.apache.lucene.tests.util.LuceneTestCase.random;
 import static org.elasticsearch.repositories.blobstore.BlobStoreRepository.MAX_HEAP_SIZE_FOR_SNAPSHOT_DELETION_SETTING;
@@ -493,5 +498,108 @@ public final class BlobStoreTestUtil {
 
     public static OperationPurpose randomNonDataPurpose() {
         return randomValueOtherThan(OperationPurpose.SNAPSHOT_DATA, BlobStoreTestUtil::randomPurpose);
+    }
+
+    /**
+     * Rewrites one shard snapshot so that some of its data files are stored as byte ranges of a single copied blob, the layout that
+     * server-side copy of stateless commit blobs produces, without running a copy. This lets tests exercise the readers of that layout,
+     * such as restore and snapshot delete.
+     * <p>
+     * The copied blob holds the chosen files in random order. With {@code withFiller} set, random bytes also sit before, between and after
+     * the files, like the headers and padding of a real commit blob. Without it, the first file starts at offset 0 and the last one ends at
+     * the end of the blob. The files' own blobs are deleted, so that only the copied blob can serve them. The shard generation must hold
+     * only this snapshot, so that no other snapshot refers to the rewritten files.
+     *
+     * @return the file infos of the moved files, all pointing at the same copied blob; empty if no file was chosen
+     */
+    public static List<BlobStoreIndexShardSnapshot.FileInfo> moveFilesIntoCopiedBlob(
+        BlobStoreRepository repository,
+        IndexId indexId,
+        int shardId,
+        ShardGeneration shardGeneration,
+        SnapshotId snapshotId,
+        Predicate<BlobStoreIndexShardSnapshot.FileInfo> filesToMove,
+        boolean withFiller
+    ) throws IOException {
+        final BlobContainer shardContainer = repository.shardContainer(indexId, shardId);
+        final BlobStoreIndexShardSnapshots generation = repository.getBlobStoreIndexShardSnapshots(indexId, shardId, shardGeneration);
+        if (generation.snapshots().size() != 1 || generation.snapshots().get(0).snapshot().equals(snapshotId.getName()) == false) {
+            throw new IllegalArgumentException("shard generation [" + shardGeneration + "] must hold only snapshot [" + snapshotId + "]");
+        }
+        final SnapshotFiles snapshotFiles = generation.snapshots().get(0);
+        final BlobStoreIndexShardSnapshot shardSnapshot = repository.loadShardSnapshot(shardContainer, snapshotId);
+
+        final List<BlobStoreIndexShardSnapshot.FileInfo> toMove = new ArrayList<>();
+        for (BlobStoreIndexShardSnapshot.FileInfo fileInfo : shardSnapshot.indexFiles()) {
+            // files kept inline in the metadata, .si and segments_N, have no blobs and are never copied
+            if (fileInfo.metadata().hashEqualsContents() == false && fileInfo.isCopied() == false && filesToMove.test(fileInfo)) {
+                toMove.add(fileInfo);
+            }
+        }
+        if (toMove.isEmpty()) {
+            return List.of();
+        }
+        Collections.shuffle(toMove, random());
+
+        final String copiedBlob = BlobStoreRepository.COPIED_DATA_BLOB_PREFIX + UUIDs.randomBase64UUID(random());
+        // stands in for the path of the commit blob in the stateless object store
+        final String source = "indices/" + indexId.getId() + "/" + shardId + "/1/stateless_commit_" + randomIntBetween(1, 1000);
+        final Map<String, BlobStoreIndexShardSnapshot.FileInfo> moved = new HashMap<>();
+        try (BytesStreamOutput copiedBytes = new BytesStreamOutput()) {
+            for (BlobStoreIndexShardSnapshot.FileInfo fileInfo : toMove) {
+                maybeWriteFiller(copiedBytes, withFiller);
+                final long offset = copiedBytes.position();
+                for (int part = 0; part < fileInfo.numberOfParts(); part++) {
+                    try (InputStream partStream = shardContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, fileInfo.partName(part))) {
+                        partStream.transferTo(copiedBytes);
+                    }
+                }
+                moved.put(
+                    fileInfo.name(),
+                    new BlobStoreIndexShardSnapshot.FileInfo(fileInfo.name(), fileInfo.metadata(), copiedBlob, offset, source)
+                );
+            }
+            maybeWriteFiller(copiedBytes, withFiller);
+            shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, copiedBlob, copiedBytes.bytes(), true);
+        }
+
+        BlobStoreRepository.INDEX_SHARD_SNAPSHOT_FORMAT.write(
+            new BlobStoreIndexShardSnapshot(
+                shardSnapshot.snapshot(),
+                shardSnapshot.indexFiles().stream().map(f -> moved.getOrDefault(f.name(), f)).toList(),
+                shardSnapshot.startTime(),
+                shardSnapshot.time(),
+                shardSnapshot.incrementalFileCount(),
+                shardSnapshot.incrementalSize()
+            ),
+            shardContainer,
+            snapshotId.getUUID(),
+            random().nextBoolean()
+        );
+        BlobStoreRepository.INDEX_SHARD_SNAPSHOTS_FORMAT.write(
+            BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(
+                new SnapshotFiles(
+                    snapshotFiles.snapshot(),
+                    snapshotFiles.indexFiles().stream().map(f -> moved.getOrDefault(f.name(), f)).toList(),
+                    snapshotFiles.shardStateIdentifier()
+                )
+            ),
+            shardContainer,
+            shardGeneration.getGenerationUUID(),
+            random().nextBoolean()
+        );
+        shardContainer.deleteBlobsIgnoringIfNotExists(
+            OperationPurpose.SNAPSHOT_DATA,
+            toMove.stream().flatMap(f -> IntStream.range(0, f.numberOfParts()).mapToObj(f::partName)).iterator()
+        );
+        return List.copyOf(moved.values());
+    }
+
+    private static void maybeWriteFiller(BytesStreamOutput out, boolean withFiller) throws IOException {
+        if (withFiller) {
+            final byte[] filler = new byte[randomIntBetween(1, 4096)];
+            random().nextBytes(filler);
+            out.writeBytes(filler);
+        }
     }
 }

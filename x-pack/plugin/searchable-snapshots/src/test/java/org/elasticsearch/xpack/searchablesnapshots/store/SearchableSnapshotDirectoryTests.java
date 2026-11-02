@@ -137,6 +137,7 @@ import static org.elasticsearch.xpack.searchablesnapshots.SearchableSnapshots.SN
 import static org.elasticsearch.xpack.searchablesnapshots.cache.full.CacheService.resolveSnapshotCache;
 import static org.elasticsearch.xpack.searchablesnapshots.store.SearchableSnapshotDirectory.getNonNullFileExt;
 import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.hasSize;
@@ -808,6 +809,75 @@ public class SearchableSnapshotDirectoryTests extends AbstractSearchableSnapshot
                         assertBusy(() -> assertListOfFiles(cacheDir, equalTo(0), equalTo(0L)));
                     }
                 }
+            } finally {
+                sharedBlobCacheService.close();
+                assertThreadPoolNotBusy(threadPool);
+            }
+        }
+    }
+
+    public void testRejectsSnapshotWithFilesInsideCopiedBlobs() throws Exception {
+        try (CacheService cacheService = defaultCacheService()) {
+            cacheService.start();
+
+            final String luceneVersion = IndexVersion.current().luceneVersion().toString();
+            final BlobStoreIndexShardSnapshot.FileInfo uploaded = new BlobStoreIndexShardSnapshot.FileInfo(
+                "__" + randomAlphaOfLength(10),
+                new StoreFileMetadata("_0.cfs", between(16, 1000), "abc", luceneVersion),
+                null
+            );
+            final BlobStoreIndexShardSnapshot.FileInfo copied = new BlobStoreIndexShardSnapshot.FileInfo(
+                "__" + randomAlphaOfLength(10),
+                new StoreFileMetadata("_1.cfs", between(16, 1000), "def", luceneVersion),
+                "c__" + randomAlphaOfLength(10),
+                between(0, 4096),
+                "indices/aBcDeFgH/0/1/stateless_commit_5"
+            );
+            final BlobStoreIndexShardSnapshot snapshot = new BlobStoreIndexShardSnapshot(
+                "_snapshot",
+                randomBoolean() ? List.of(uploaded, copied) : List.of(copied, uploaded),
+                0L,
+                0L,
+                0,
+                0L
+            );
+            final Path shardSnapshotDir = createTempDir();
+            final BlobContainer blobContainer = new FsBlobContainer(
+                new FsBlobStore(randomIntBetween(1, 8) * 1024, shardSnapshotDir, true),
+                BlobPath.EMPTY,
+                shardSnapshotDir
+            );
+
+            final SnapshotId snapshotId = new SnapshotId("_name", "_uuid");
+            final IndexId indexId = new IndexId("_id", "_uuid");
+            final ShardId shardId = new ShardId(new Index("_name", "_id"), 0);
+            final Path shardDir = randomShardPath(shardId);
+            final ShardPath shardPath = new ShardPath(false, shardDir, shardDir, shardId);
+            final Path cacheDir = Files.createDirectories(resolveSnapshotCache(shardDir).resolve(snapshotId.getUUID()));
+            final SharedBlobCacheService<CacheKey> sharedBlobCacheService = defaultFrozenCacheService();
+            try (
+                SearchableSnapshotDirectory directory = new SearchableSnapshotDirectory(
+                    () -> blobContainer,
+                    () -> snapshot,
+                    new TestUtils.NoopBlobStoreCacheService(),
+                    "_repo",
+                    snapshotId,
+                    indexId,
+                    shardId,
+                    Settings.builder().put(SNAPSHOT_CACHE_ENABLED_SETTING.getKey(), randomBoolean()).build(),
+                    () -> 0L,
+                    cacheService,
+                    cacheDir,
+                    shardPath,
+                    threadPool,
+                    sharedBlobCacheService
+                )
+            ) {
+                final IllegalArgumentException e = expectThrows(
+                    IllegalArgumentException.class,
+                    () -> directory.loadSnapshot(createRecoveryState(randomBoolean()), () -> false, new PlainActionFuture<>())
+                );
+                assertThat(e.getMessage(), containsString("is stored inside copied blob [" + copied.blob() + "]"));
             } finally {
                 sharedBlobCacheService.close();
                 assertThreadPoolNotBusy(threadPool);

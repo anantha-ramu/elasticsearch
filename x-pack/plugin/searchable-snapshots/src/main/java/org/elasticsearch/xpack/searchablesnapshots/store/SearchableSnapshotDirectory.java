@@ -207,7 +207,25 @@ public class SearchableSnapshotDirectory extends BaseDirectory {
             synchronized (this) {
                 alreadyLoaded = this.loaded;
                 if (alreadyLoaded == false) {
-                    this.snapshot = snapshotSupplier.get();
+                    final BlobStoreIndexShardSnapshot shardSnapshot = snapshotSupplier.get();
+                    // Searchable snapshots read each file from its own part blobs. A file stored as a byte range inside a copied blob has
+                    // none, so refuse to mount such a snapshot rather than read the wrong bytes.
+                    for (BlobStoreIndexShardSnapshot.FileInfo fileInfo : shardSnapshot.indexFiles()) {
+                        if (fileInfo.isCopied()) {
+                            throw new IllegalArgumentException(
+                                "cannot mount snapshot ["
+                                    + snapshotId
+                                    + "] of shard "
+                                    + shardId
+                                    + " because file ["
+                                    + fileInfo.physicalName()
+                                    + "] is stored inside copied blob ["
+                                    + fileInfo.blob()
+                                    + "], which searchable snapshots do not support"
+                            );
+                        }
+                    }
+                    this.snapshot = shardSnapshot;
                     this.loaded = true;
                     cleanExistingRegularShardFiles();
                     waitForPendingEvictions();

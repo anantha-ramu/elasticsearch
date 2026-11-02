@@ -177,8 +177,8 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
         return files.get(name);
     }
 
-    // names of the copied blobs that the file infos refer to, and the same blobs keyed by the commit blob each one is a copy of
-    // lazy computed for the same reason as physicalFiles: only snapshot create and delete need them
+    // Built on first use, like physicalFiles, because only snapshot create and delete need them: the names of the copied blobs that
+    // file infos refer to, and each copy keyed by the commit blob it was copied from.
     private Set<String> copiedBlobNames;
     private Map<String, String> copiedBlobsBySource;
 
@@ -204,8 +204,8 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
     }
 
     /**
-     * Finds the copied blob that holds a copy of the given commit blob. A new snapshot that needs a file from that commit blob points its
-     * file info at the existing copy instead of copying the commit blob again.
+     * Finds the copied blob that is a copy of the given commit blob, so that a new snapshot that needs a file from that commit blob can
+     * point its file info at the existing copy instead of copying the commit blob again.
      *
      * @param source path of a commit blob, see {@link FileInfo#source()}
      * @return the name of the copied blob, or null if no file info refers to a copy of {@code source}
@@ -217,8 +217,8 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
             for (FileInfo fileInfo : files.values()) {
                 if (fileInfo.isCopied()) {
                     final String otherBlob = bySource.putIfAbsent(fileInfo.source(), fileInfo.blob());
-                    // A snapshot reuses the copy that its starting generation refers to, so one generation never holds two copies of the
-                    // same commit blob.
+                    // A snapshot is meant to reuse an existing copy of a commit blob instead of copying it again, so two copies of one
+                    // commit blob in a shard generation point to a bug.
                     assert otherBlob == null || otherBlob.equals(fileInfo.blob())
                         : "commit blob [" + fileInfo.source() + "] copied twice, to [" + otherBlob + "] and [" + fileInfo.blob() + "]";
                 }
