@@ -56,6 +56,7 @@ import org.elasticsearch.common.blobstore.DeleteResult;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.blobstore.fs.FsBlobContainer;
 import org.elasticsearch.common.blobstore.support.BlobMetadata;
+import org.elasticsearch.common.blobstore.support.FilterBlobContainer;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.collect.Iterators;
@@ -155,8 +156,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -167,6 +170,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -3602,6 +3606,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             final BlockingQueue<BlobStoreIndexShardSnapshot.FileInfo> filesToSnapshot = new LinkedBlockingQueue<>();
             int filesInShardMetadataCount = 0;
             long filesInShardMetadataSize = 0;
+            final CopyPlan copyPlan = new CopyPlan(snapshots);
 
             if (context.isSearchableSnapshot()) {
                 indexCommitPointFiles = Collections.emptyList();
@@ -3630,6 +3635,12 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                     if (existingFileInfo == null) {
                         indexIncrementalFileCount++;
                         indexIncrementalSize += md.length();
+                        final SnapshotShardContext.CopySource copySource = needsWrite ? context.copySource(fileName) : null;
+                        if (copySource != null) {
+                            // the file becomes a byte range of a copy of the commit blob that holds it, see CopyPlan
+                            indexCommitPointFiles.add(copyPlan.addFile(md, copySource));
+                            continue;
+                        }
                         // create a new FileInfo
                         BlobStoreIndexShardSnapshot.FileInfo snapshotFileInfo = new BlobStoreIndexShardSnapshot.FileInfo(
                             (needsWrite ? UPLOADED_DATA_BLOB_PREFIX : VIRTUAL_DATA_BLOB_PREFIX) + UUIDs.randomBase64UUID(),
@@ -3666,6 +3677,9 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 indexIncrementalSize,
                 indexTotalFileSize
             );
+            // A new file that points at a copy the repository already holds needs no upload or copy, so it counts as processed now, like a
+            // file kept inline in the metadata.
+            snapshotStatus.addProcessedFiles(copyPlan.reusedFileCount(), copyPlan.reusedFileSize());
 
             final ShardGeneration indexGeneration;
             final boolean writeShardGens = SnapshotsServiceUtils.useShardGenerations(context.getRepositoryMetaVersion());
@@ -3759,6 +3773,9 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
 
             // filesToSnapshot will be emptied while snapshotting the file. We make a copy here for cleanup purpose in case of failure.
             final AtomicReference<List<FileInfo>> fileToCleanUp = new AtomicReference<>(List.copyOf(filesToSnapshot));
+            // On failure, delete exactly the copies this shard snapshot creates. A new file info may point at a copy that an earlier
+            // snapshot made and still needs, so no name is derived from the file infos here.
+            final AtomicReference<List<String>> copiesToCleanUp = new AtomicReference<>(copyPlan.newCopyBlobNames());
             final ActionListener<Collection<Void>> allFilesUploadedListener = ActionListener.assertOnce(ActionListener.wrap(ignore -> {
                 snapshotStatus.updateStatusDescription("all files uploaded: finalizing");
                 final IndexShardSnapshotStatus.Copy lastSnapshotStatus = snapshotStatus.moveToFinalize();
@@ -3776,6 +3793,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 // Once we start writing the shard level snapshot file, no cleanup will be performed because it is possible that
                 // written files are referenced by another concurrent process.
                 fileToCleanUp.set(List.of());
+                copiesToCleanUp.set(List.of());
                 try {
                     final String snapshotUUID = snapshotId.getUUID();
                     final Map<String, String> serializationParams = Collections.singletonMap(
@@ -3807,7 +3825,10 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                     snapshotStatus.updateStatusDescription("all files uploaded: cleaning up data files, exception while finalizing: " + e);
                     shardContainer.deleteBlobsIgnoringIfNotExists(
                         OperationPurpose.SNAPSHOT_DATA,
-                        Iterators.flatMap(fileToCleanUp.get().iterator(), f -> Iterators.forRange(0, f.numberOfParts(), f::partName))
+                        Iterators.concat(
+                            Iterators.flatMap(fileToCleanUp.get().iterator(), f -> Iterators.forRange(0, f.numberOfParts(), f::partName)),
+                            copiesToCleanUp.get().iterator()
+                        )
                     );
                 } catch (Exception innerException) {
                     e.addSuppressed(innerException);
@@ -3815,11 +3836,15 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 context.onFailure(e);
             }));
 
-            if (indexIncrementalFileCount == 0 || filesToSnapshot.isEmpty()) {
+            if (filesToSnapshot.isEmpty() && copyPlan.newCopies().isEmpty()) {
                 allFilesUploadedListener.onResponse(Collections.emptyList());
                 return;
             }
-            snapshotFiles(context, filesToSnapshot, allFilesUploadedListener);
+            if (copyPlan.newCopies().isEmpty()) {
+                snapshotFiles(context, filesToSnapshot, allFilesUploadedListener);
+            } else {
+                snapshotFilesAndCopyBlobs(context, shardContainer, filesToSnapshot, copyPlan.newCopies(), allFilesUploadedListener);
+            }
         } catch (Exception e) {
             context.onFailure(e);
         }
@@ -3872,6 +3897,247 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             shardSnapshotTaskRunner.enqueueFileSnapshot(context, filesToSnapshot::poll, filesListener);
         }
     }
+
+    /**
+     * Uploads the given files and makes the given server-side copies of commit blobs, all as tasks on the {@link ShardSnapshotTaskRunner},
+     * then checks the copies before completing the listener. See {@link CopyPlan} for what is copied.
+     */
+    private void snapshotFilesAndCopyBlobs(
+        SnapshotShardContext context,
+        BlobContainer shardContainer,
+        BlockingQueue<FileInfo> filesToSnapshot,
+        List<NewCopy> newCopies,
+        ActionListener<Collection<Void>> allFilesUploadedListener
+    ) throws IOException {
+        // Check that every commit blob exists and holds its files' ranges before copying anything. The listing also gives each commit
+        // blob's length, which copyBlob needs.
+        final Map<String, Long> sourceLengths = sourceBlobLengths(context, newCopies);
+        final ActionListener<Collection<Void>> checkCopiesListener = allFilesUploadedListener.delegateFailureAndWrap((l, results) -> {
+            checkCopies(context, shardContainer, newCopies, sourceLengths);
+            l.onResponse(results);
+        });
+        final int noOfFilesToSnapshot = filesToSnapshot.size();
+        final AtomicBoolean failed = new AtomicBoolean();
+        final ActionListener<Void> tasksListener = new GroupedActionListener<Void>(
+            noOfFilesToSnapshot + newCopies.size(),
+            checkCopiesListener
+        ).delegateResponse((l, e) -> {
+            // stop the remaining uploads and copies if any of them fails
+            failed.set(true);
+            filesToSnapshot.clear();
+            l.onFailure(e);
+        });
+        context.status()
+            .updateStatusDescription("enqueued file snapshot and blob copy tasks: threads running concurrent uploads and copies");
+        for (NewCopy newCopy : newCopies) {
+            shardSnapshotTaskRunner.enqueueBlobCopy(context, () -> {
+                if (failed.get() == false) {
+                    copyBlob(context, shardContainer, newCopy, sourceLengths.get(newCopy.copySource().source()));
+                }
+            }, tasksListener);
+        }
+        for (int i = 0; i < noOfFilesToSnapshot; i++) {
+            shardSnapshotTaskRunner.enqueueFileSnapshot(context, filesToSnapshot::poll, tasksListener);
+        }
+    }
+
+    /**
+     * Lists the folders that hold the commit blobs to copy, once each, and returns each commit blob's length keyed by its source path.
+     * Fails if a commit blob is missing, or too short to hold the range of one of its files.
+     */
+    private static Map<String, Long> sourceBlobLengths(SnapshotShardContext context, List<NewCopy> newCopies) throws IOException {
+        context.status().updateStatusDescription("listing commit blobs to copy");
+        final Map<String, Map<String, BlobMetadata>> blobsByFolder = new HashMap<>();
+        final Map<String, Long> lengths = new HashMap<>();
+        for (NewCopy newCopy : newCopies) {
+            context.status().ensureNotAborted();
+            final SnapshotShardContext.CopySource source = newCopy.copySource();
+            final String folder = source.container().path().buildAsString();
+            Map<String, BlobMetadata> blobs = blobsByFolder.get(folder);
+            if (blobs == null) {
+                blobs = source.container().listBlobs(OperationPurpose.SNAPSHOT_METADATA);
+                blobsByFolder.put(folder, blobs);
+            }
+            final BlobMetadata blob = blobs.get(source.blobName());
+            if (blob == null) {
+                throw new IndexShardSnapshotFailedException(context.shardId(), "commit blob [" + source.source() + "] to copy is missing");
+            }
+            for (FileInfo fileInfo : newCopy.files()) {
+                if (blob.length() - fileInfo.length() < fileInfo.offset()) {
+                    throw new IndexShardSnapshotFailedException(
+                        context.shardId(),
+                        "file ["
+                            + fileInfo.physicalName()
+                            + "] at ["
+                            + fileInfo.offset()
+                            + "+"
+                            + fileInfo.length()
+                            + "] does not fit in commit blob ["
+                            + source.source()
+                            + "] of length ["
+                            + blob.length()
+                            + "]"
+                    );
+                }
+            }
+            lengths.put(source.source(), blob.length());
+        }
+        return lengths;
+    }
+
+    /**
+     * Copies one commit blob, whole and server-side, into the shard's folder under the name the {@link CopyPlan} chose for it.
+     */
+    private void copyBlob(SnapshotShardContext context, BlobContainer shardContainer, NewCopy newCopy, long blobLength) throws IOException {
+        final IndexShardSnapshotStatus snapshotStatus = context.status();
+        final FileInfo firstFile = newCopy.files().getFirst();
+        ensureNotAborted(context.shardId(), context.snapshotId(), snapshotStatus, firstFile.physicalName());
+        final SnapshotShardContext.CopySource source = newCopy.copySource();
+        // An open file reader holds the shard's commit, which keeps the commit blob in the object store while the copy runs. Once the
+        // primary has moved to another node, which then keeps the blobs, this node should let go so that its store can close. An upload
+        // checks for that on every read. A copy has no reads, so check before and after the copy call.
+        try (var commitRef = context.fileReader(firstFile.physicalName(), firstFile.metadata())) {
+            commitRef.maybeReleaseCommitRef();
+            final long startMillis = threadPool.rawRelativeTimeInMillis();
+            // The source container comes from the object store, whose containers may be wrapped differently from this repository's.
+            // copyBlob accepts only its own repository type's container as the source, so pass the innermost one. No executor, so a
+            // multipart copy copies one part at a time, as an upload writes one part at a time.
+            shardContainer.copyBlob(
+                OperationPurpose.SNAPSHOT_DATA,
+                FilterBlobContainer.unwrap(source.container()),
+                source.blobName(),
+                newCopy.blobName(),
+                blobLength,
+                null
+            );
+            commitRef.maybeReleaseCommitRef();
+            logger.trace(
+                "[{}] copied [{}] of size [{}b] to [{}][{}] in [{}ms]",
+                metadata.name(),
+                source.source(),
+                blobLength,
+                shardContainer.path(),
+                newCopy.blobName(),
+                threadPool.rawRelativeTimeInMillis() - startMillis
+            );
+        }
+        snapshotStatus.addProcessedFiles(newCopy.files().size(), newCopy.files().stream().mapToLong(FileInfo::length).sum());
+    }
+
+    /**
+     * Checks with one listing of the shard's folder that every copy this shard snapshot made exists and is as long as the commit blob it
+     * was copied from. A copy call that reports success without leaving a complete blob behind would otherwise go unnoticed until a
+     * restore.
+     */
+    private static void checkCopies(
+        SnapshotShardContext context,
+        BlobContainer shardContainer,
+        List<NewCopy> newCopies,
+        Map<String, Long> sourceLengths
+    ) throws IOException {
+        context.status().updateStatusDescription("all blobs copied: checking the copies");
+        final Map<String, BlobMetadata> copies = shardContainer.listBlobsByPrefix(
+            OperationPurpose.SNAPSHOT_METADATA,
+            COPIED_DATA_BLOB_PREFIX
+        );
+        for (NewCopy newCopy : newCopies) {
+            final BlobMetadata copy = copies.get(newCopy.blobName());
+            final long expectedLength = sourceLengths.get(newCopy.copySource().source());
+            if (copy == null || copy.length() != expectedLength) {
+                throw new IndexShardSnapshotFailedException(
+                    context.shardId(),
+                    "copied blob ["
+                        + newCopy.blobName()
+                        + "] of commit blob ["
+                        + newCopy.copySource().source()
+                        + "] has length ["
+                        + (copy == null ? "none, it is missing" : copy.length())
+                        + "] but expected ["
+                        + expectedLength
+                        + "]"
+                );
+            }
+        }
+    }
+
+    /**
+     * Decides, for one shard snapshot, how files that live in commit blobs of an object store get into the repository (see
+     * {@link SnapshotShardContext#copySource}). Each such file becomes a byte range of a copy of its commit blob. The snapshot starts from
+     * the shard's current generation, the {@code index-<uuid>} blob that lists the files of the shard's earlier snapshots:
+     * <ul>
+     *     <li>If that generation already refers to a copy of the file's commit blob, the file points at that copy, and nothing is copied.
+     *     The copy holds the whole commit blob, so it holds this file too.</li>
+     *     <li>Otherwise the commit blob is copied once, whole, under a new random name, however many of its files the snapshot needs.</li>
+     * </ul>
+     * New copies never get a name derived from the commit blob. A snapshot delete removes the unreferenced copies it found in a listing of
+     * the shard's folder, and it can still be removing them while a new snapshot starts. A new copy with the same name as an old one in
+     * that listing could be removed right after it is made. A random name is never in such a listing.
+     */
+    private static final class CopyPlan {
+        private final BlobStoreIndexShardSnapshots startingGeneration;
+        private final Map<String, NewCopy> newCopiesBySource = new LinkedHashMap<>();
+        private int reusedFileCount;
+        private long reusedFileSize;
+
+        CopyPlan(BlobStoreIndexShardSnapshots startingGeneration) {
+            this.startingGeneration = startingGeneration;
+        }
+
+        /**
+         * Returns the file info of a new file stored as a byte range of a copy of the commit blob that {@code copySource} describes.
+         */
+        FileInfo addFile(StoreFileMetadata metadata, SnapshotShardContext.CopySource copySource) {
+            final String source = copySource.source();
+            NewCopy newCopy = newCopiesBySource.get(source);
+            final String copiedBlob;
+            if (newCopy != null) {
+                copiedBlob = newCopy.blobName();
+            } else {
+                final String existingCopy = startingGeneration.findCopiedBlob(source);
+                if (existingCopy != null) {
+                    copiedBlob = existingCopy;
+                    reusedFileCount += 1;
+                    reusedFileSize += metadata.length();
+                } else {
+                    copiedBlob = COPIED_DATA_BLOB_PREFIX + UUIDs.randomBase64UUID();
+                    newCopy = new NewCopy(copiedBlob, copySource, new ArrayList<>());
+                    newCopiesBySource.put(source, newCopy);
+                }
+            }
+            final FileInfo fileInfo = new FileInfo(
+                UPLOADED_DATA_BLOB_PREFIX + UUIDs.randomBase64UUID(),
+                metadata,
+                copiedBlob,
+                copySource.offset(),
+                source
+            );
+            if (newCopy != null) {
+                newCopy.files().add(fileInfo);
+            }
+            return fileInfo;
+        }
+
+        List<NewCopy> newCopies() {
+            return List.copyOf(newCopiesBySource.values());
+        }
+
+        List<String> newCopyBlobNames() {
+            return newCopiesBySource.values().stream().map(NewCopy::blobName).toList();
+        }
+
+        int reusedFileCount() {
+            return reusedFileCount;
+        }
+
+        long reusedFileSize() {
+            return reusedFileSize;
+        }
+    }
+
+    /**
+     * A commit blob that a shard snapshot copies, the name of its copy, and the new files stored as byte ranges of that copy.
+     */
+    private record NewCopy(String blobName, SnapshotShardContext.CopySource copySource, List<FileInfo> files) {}
 
     @Override
     public void restoreShard(

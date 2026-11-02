@@ -67,6 +67,31 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     private final BiFunction<ShardId, Long, BlobContainer> blobContainerFunc;
     @Nullable // when snapshot runs on a different node from the primary
     private final BooleanSupplier isShardRelocated;
+    private final boolean serverSideCopyEnabled;
+
+    public StatelessSnapshotShardContext(
+        ShardId shardId,
+        SnapshotId snapshotId,
+        IndexId indexId,
+        @Nullable String shardStateIdentifier,
+        IndexShardSnapshotStatus snapshotStatus,
+        IndexVersion repositoryMetaVersion,
+        long snapshotStartTime,
+        @Nullable SnapshotIndexCommit snapshotIndexCommit,
+        Map<String, BlobLocation> fileToBlobLocations,
+        BiFunction<ShardId, Long, BlobContainer> blobContainerFunc,
+        @Nullable BooleanSupplier isShardRelocated,
+        boolean serverSideCopyEnabled,
+        ActionListener<ShardSnapshotResult> listener
+    ) {
+        super(snapshotId, indexId, shardStateIdentifier, snapshotStatus, repositoryMetaVersion, snapshotStartTime, listener);
+        this.shardId = shardId;
+        this.snapshotIndexCommit = snapshotIndexCommit;
+        this.fileToBlobLocations = fileToBlobLocations;
+        this.blobContainerFunc = blobContainerFunc;
+        this.isShardRelocated = isShardRelocated;
+        this.serverSideCopyEnabled = serverSideCopyEnabled;
+    }
 
     public StatelessSnapshotShardContext(
         ShardId shardId,
@@ -82,12 +107,21 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         @Nullable BooleanSupplier isShardRelocated,
         ActionListener<ShardSnapshotResult> listener
     ) {
-        super(snapshotId, indexId, shardStateIdentifier, snapshotStatus, repositoryMetaVersion, snapshotStartTime, listener);
-        this.shardId = shardId;
-        this.snapshotIndexCommit = snapshotIndexCommit;
-        this.fileToBlobLocations = fileToBlobLocations;
-        this.blobContainerFunc = blobContainerFunc;
-        this.isShardRelocated = isShardRelocated;
+        this(
+            shardId,
+            snapshotId,
+            indexId,
+            shardStateIdentifier,
+            snapshotStatus,
+            repositoryMetaVersion,
+            snapshotStartTime,
+            snapshotIndexCommit,
+            fileToBlobLocations,
+            blobContainerFunc,
+            isShardRelocated,
+            false,
+            listener
+        );
     }
 
     @Override
@@ -156,6 +190,32 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         assert blobLocation != null : "Blob location for file [" + file + "] not found in " + fileToBlobLocations;
         final BlobContainer blobContainer = blobContainerFunc.apply(shardId, blobLocation.primaryTerm());
         return new BlobStoreFileReader(file, blobContainer, blobLocation, commitRefReleasable, isShardRelocated);
+    }
+
+    @Override
+    public CopySource copySource(String file) {
+        if (serverSideCopyEnabled == false) {
+            return null;
+        }
+        final BlobLocation blobLocation = fileToBlobLocations.get(file);
+        assert blobLocation != null : "Blob location for file [" + file + "] not found in " + fileToBlobLocations;
+        // The commit blob's path under the object store's base path, used to find an existing copy. The snapshot repository keeps one
+        // folder per index name, so an index that is deleted and created again with the same name shares that folder, and the index UUID
+        // keeps the two indices' paths apart.
+        final String source = "indices/"
+            + shardId.getIndex().getUUID()
+            + "/"
+            + shardId.id()
+            + "/"
+            + blobLocation.primaryTerm()
+            + "/"
+            + blobLocation.blobName();
+        return new CopySource(
+            source,
+            blobContainerFunc.apply(shardId, blobLocation.primaryTerm()),
+            blobLocation.blobName(),
+            blobLocation.offset()
+        );
     }
 
     private Releasable maybeWithSnapshotIndexCommitRef() {

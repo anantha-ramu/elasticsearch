@@ -48,6 +48,19 @@ public abstract class FilterBlobContainer implements BlobContainer {
      */
     protected abstract BlobContainer wrapChild(BlobContainer child);
 
+    /**
+     * Returns the innermost container, such as an S3 or FS container, or the given container if it is not wrapped. Use the result only as
+     * the source of {@link BlobContainer#copyBlob}, which accepts only its own repository type's container as the source, while the source
+     * of a server-side copy can come from another store whose containers are wrapped differently. Anything else must not use the result,
+     * because it skips whatever the wrappers add.
+     */
+    public static BlobContainer unwrap(BlobContainer blobContainer) {
+        while (blobContainer instanceof FilterBlobContainer filterBlobContainer) {
+            blobContainer = filterBlobContainer.delegate;
+        }
+        return blobContainer;
+    }
+
     @Override
     public BlobPath path() {
         return delegate.path();
@@ -133,9 +146,9 @@ public abstract class FilterBlobContainer implements BlobContainer {
         long blobSize,
         @Nullable Executor executor
     ) throws IOException {
-        // FsBlobContainer accesses internals of the sourceBlobContainer in copyBlob so it needs the delegate
-        assert sourceBlobContainer instanceof FilterBlobContainer;
-        delegate.copyBlob(purpose, ((FilterBlobContainer) sourceBlobContainer).delegate, sourceBlobName, blobName, blobSize, executor);
+        // The innermost container's copyBlob accepts only its own repository type's container as the source, so pass the innermost
+        // container of the source too. The source may be wrapped differently from this container, or not at all.
+        delegate.copyBlob(purpose, unwrap(sourceBlobContainer), sourceBlobName, blobName, blobSize, executor);
     }
 
     @Override

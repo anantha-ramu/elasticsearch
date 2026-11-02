@@ -13,6 +13,7 @@ import org.apache.lucene.store.IndexInput;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.DelegatingActionListener;
 import org.elasticsearch.action.support.SubscribableListener;
+import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.lucene.store.InputStreamIndexInput;
 import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.core.Nullable;
@@ -108,6 +109,29 @@ public abstract class SnapshotShardContext extends DelegatingActionListener<Shar
     public abstract void failStoreIfCorrupted(Exception e);
 
     public abstract FileReader fileReader(String file, StoreFileMetadata metadata) throws IOException;
+
+    /**
+     * Returns the commit blob that holds the file, so that the snapshot can copy that whole blob inside the object store instead of
+     * reading the file and uploading it, or {@code null} if the file must be uploaded. A commit blob is a blob in a stateless object store
+     * that holds the files of one or more Lucene commits, see {@link BlobStoreIndexShardSnapshot.FileInfo}. Only a stateless shard can
+     * return a commit blob, and only when server-side copy is enabled. While a copy runs, the caller holds the shard's commit with
+     * {@link #fileReader} of a file in that blob, as an upload of that file would, so that the commit blob stays in the object store.
+     */
+    @Nullable
+    public CopySource copySource(String file) {
+        return null;
+    }
+
+    /**
+     * A commit blob in an object store that holds a file, and where the file starts in it.
+     *
+     * @param source    path of the commit blob, unique across indices and shards. A snapshot reuses an existing copy made from the same
+     *                  path, see {@link BlobStoreIndexShardSnapshot.FileInfo#source()}.
+     * @param container the container that holds the commit blob
+     * @param blobName  the name of the commit blob in {@code container}
+     * @param offset    the position in that blob where the file starts
+     */
+    public record CopySource(String source, BlobContainer container, String blobName, long offset) {}
 
     public interface FileReader extends Closeable {
 

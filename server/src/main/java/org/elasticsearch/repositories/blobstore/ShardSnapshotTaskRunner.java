@@ -16,6 +16,7 @@ import org.elasticsearch.action.ActionRunnable;
 import org.elasticsearch.common.CheckedBiConsumer;
 import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.common.util.concurrent.PrioritizedThrottledTaskRunner;
+import org.elasticsearch.core.CheckedRunnable;
 import org.elasticsearch.core.Strings;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.repositories.SnapshotShardContext;
@@ -30,8 +31,8 @@ import static org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSna
 
 /**
  * {@link ShardSnapshotTaskRunner} performs snapshotting tasks, prioritizing {@link ShardSnapshotTask}
- * over {@link FileSnapshotTask}. Each enqueued shard to snapshot results in one {@link ShardSnapshotTask}
- * and zero or more {@link FileSnapshotTask}s.
+ * over {@link FileSnapshotTask} and {@link BlobCopyTask}. Each enqueued shard to snapshot results in one {@link ShardSnapshotTask},
+ * zero or more {@link FileSnapshotTask}s, and one {@link BlobCopyTask} for each commit blob it copies server-side.
  */
 public class ShardSnapshotTaskRunner {
     private static final Logger logger = LogManager.getLogger(ShardSnapshotTaskRunner.class);
@@ -139,6 +140,36 @@ public class ShardSnapshotTaskRunner {
         }
     }
 
+    /**
+     * A server-side copy of one blob for a shard snapshot. A copy takes the place of the uploads of the files in that blob, so it runs with
+     * the same priority as a file upload.
+     */
+    class BlobCopyTask extends SnapshotTask {
+        private final CheckedRunnable<Exception> copy;
+        private final ActionListener<Void> copyListener;
+
+        BlobCopyTask(SnapshotShardContext context, CheckedRunnable<Exception> copy, ActionListener<Void> copyListener) {
+            super(context);
+            this.copy = copy;
+            this.copyListener = copyListener;
+        }
+
+        @Override
+        public void doRun() {
+            ActionRunnable.run(copyListener, copy).run();
+        }
+
+        @Override
+        public int priority() {
+            return 2;
+        }
+
+        @Override
+        public String toString() {
+            return getClass().getSimpleName() + "{snapshotID=[" + context.snapshotId() + "], indexID=[" + context.indexId() + "]}";
+        }
+    }
+
     public ShardSnapshotTaskRunner(
         final int maxRunningTasks,
         final Executor executor,
@@ -162,6 +193,14 @@ public class ShardSnapshotTaskRunner {
     ) {
         final FileSnapshotTask task = new FileSnapshotTask(context, fileInfos, listener);
         taskRunner.enqueueTask(task);
+    }
+
+    public void enqueueBlobCopy(
+        final SnapshotShardContext context,
+        final CheckedRunnable<Exception> copy,
+        final ActionListener<Void> listener
+    ) {
+        taskRunner.enqueueTask(new BlobCopyTask(context, copy, listener));
     }
 
     // visible for testing
