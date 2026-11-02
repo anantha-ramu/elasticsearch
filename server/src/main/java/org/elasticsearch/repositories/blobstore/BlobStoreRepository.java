@@ -3776,6 +3776,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             // On failure, delete exactly the copies this shard snapshot creates. A new file info may point at a copy that an earlier
             // snapshot made and still needs, so no name is derived from the file infos here.
             final AtomicReference<List<String>> copiesToCleanUp = new AtomicReference<>(copyPlan.newCopyBlobNames());
+            final CopyStats copyStats = new CopyStats(copyPlan, filesToSnapshot);
             final ActionListener<Collection<Void>> allFilesUploadedListener = ActionListener.assertOnce(ActionListener.wrap(ignore -> {
                 snapshotStatus.updateStatusDescription("all files uploaded: finalizing");
                 final IndexShardSnapshotStatus.Copy lastSnapshotStatus = snapshotStatus.moveToFinalize();
@@ -3812,6 +3813,9 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                     throw new IndexShardSnapshotFailedException(shardId, "Failed to write commit point", e);
                 }
                 afterWriteSnapBlob.run();
+                if (copyStats.usedCopies()) {
+                    copyStats.log(metadata.name(), snapshotId, shardId);
+                }
                 final ShardSnapshotResult shardSnapshotResult = new ShardSnapshotResult(
                     indexGeneration,
                     ByteSizeValue.ofBytes(blobStoreIndexShardSnapshot.totalSize()),
@@ -3843,7 +3847,14 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             if (copyPlan.newCopies().isEmpty()) {
                 snapshotFiles(context, filesToSnapshot, allFilesUploadedListener);
             } else {
-                snapshotFilesAndCopyBlobs(context, shardContainer, filesToSnapshot, copyPlan.newCopies(), allFilesUploadedListener);
+                snapshotFilesAndCopyBlobs(
+                    context,
+                    shardContainer,
+                    filesToSnapshot,
+                    copyPlan.newCopies(),
+                    copyStats,
+                    allFilesUploadedListener
+                );
             }
         } catch (Exception e) {
             context.onFailure(e);
@@ -3900,18 +3911,21 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
 
     /**
      * Uploads the given files and makes the given server-side copies of commit blobs, all as tasks on the {@link ShardSnapshotTaskRunner},
-     * then checks the copies before completing the listener. See {@link CopyPlan} for what is copied.
+     * then checks the copies before completing the listener. See {@link CopyPlan} for what is copied. The length of each commit blob and
+     * the time each copy took go into {@code copyStats}.
      */
     private void snapshotFilesAndCopyBlobs(
         SnapshotShardContext context,
         BlobContainer shardContainer,
         BlockingQueue<FileInfo> filesToSnapshot,
         List<NewCopy> newCopies,
+        CopyStats copyStats,
         ActionListener<Collection<Void>> allFilesUploadedListener
     ) throws IOException {
         // Check that every commit blob exists and holds its files' ranges before copying anything. The listing also gives each commit
         // blob's length, which copyBlob needs.
         final Map<String, Long> sourceLengths = sourceBlobLengths(context, newCopies);
+        copyStats.onSourceLengths(sourceLengths);
         final ActionListener<Collection<Void>> checkCopiesListener = allFilesUploadedListener.delegateFailureAndWrap((l, results) -> {
             checkCopies(context, shardContainer, newCopies, sourceLengths);
             l.onResponse(results);
@@ -3932,7 +3946,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
         for (NewCopy newCopy : newCopies) {
             shardSnapshotTaskRunner.enqueueBlobCopy(context, () -> {
                 if (failed.get() == false) {
-                    copyBlob(context, shardContainer, newCopy, sourceLengths.get(newCopy.copySource().source()));
+                    copyStats.onCopy(copyBlob(context, shardContainer, newCopy, sourceLengths.get(newCopy.copySource().source())));
                 }
             }, tasksListener);
         }
@@ -3986,13 +4000,15 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     }
 
     /**
-     * Copies one commit blob, whole and server-side, into the shard's folder under the name the {@link CopyPlan} chose for it.
+     * Copies one commit blob, whole and server-side, into the shard's folder under the name the {@link CopyPlan} chose for it. Returns how
+     * many milliseconds the copy call took.
      */
-    private void copyBlob(SnapshotShardContext context, BlobContainer shardContainer, NewCopy newCopy, long blobLength) throws IOException {
+    private long copyBlob(SnapshotShardContext context, BlobContainer shardContainer, NewCopy newCopy, long blobLength) throws IOException {
         final IndexShardSnapshotStatus snapshotStatus = context.status();
         final FileInfo firstFile = newCopy.files().getFirst();
         ensureNotAborted(context.shardId(), context.snapshotId(), snapshotStatus, firstFile.physicalName());
         final SnapshotShardContext.CopySource source = newCopy.copySource();
+        final long copyMillis;
         // An open file reader holds the shard's commit, which keeps the commit blob in the object store while the copy runs. Once the
         // primary has moved to another node, which then keeps the blobs, this node should let go so that its store can close. An upload
         // checks for that on every read. A copy has no reads, so check before and after the copy call.
@@ -4010,6 +4026,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 blobLength,
                 null
             );
+            copyMillis = threadPool.rawRelativeTimeInMillis() - startMillis;
             commitRef.maybeReleaseCommitRef();
             logger.trace(
                 "[{}] copied [{}] of size [{}b] to [{}][{}] in [{}ms]",
@@ -4018,10 +4035,11 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 blobLength,
                 shardContainer.path(),
                 newCopy.blobName(),
-                threadPool.rawRelativeTimeInMillis() - startMillis
+                copyMillis
             );
         }
         snapshotStatus.addProcessedFiles(newCopy.files().size(), newCopy.files().stream().mapToLong(FileInfo::length).sum());
+        return copyMillis;
     }
 
     /**
@@ -4076,6 +4094,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     private static final class CopyPlan {
         private final BlobStoreIndexShardSnapshots startingGeneration;
         private final Map<String, NewCopy> newCopiesBySource = new LinkedHashMap<>();
+        private final Set<String> reusedCopies = new HashSet<>();
         private int reusedFileCount;
         private long reusedFileSize;
 
@@ -4096,6 +4115,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 final String existingCopy = startingGeneration.findCopiedBlob(source);
                 if (existingCopy != null) {
                     copiedBlob = existingCopy;
+                    reusedCopies.add(existingCopy);
                     reusedFileCount += 1;
                     reusedFileSize += metadata.length();
                 } else {
@@ -4125,6 +4145,10 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             return newCopiesBySource.values().stream().map(NewCopy::blobName).toList();
         }
 
+        int reusedCopyCount() {
+            return reusedCopies.size();
+        }
+
         int reusedFileCount() {
             return reusedFileCount;
         }
@@ -4138,6 +4162,97 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
      * A commit blob that a shard snapshot copies, the name of its copy, and the new files stored as byte ranges of that copy.
      */
     private record NewCopy(String blobName, SnapshotShardContext.CopySource copySource, List<FileInfo> files) {}
+
+    /**
+     * Measurements of one shard snapshot that stores files as byte ranges of copied commit blobs (see {@link CopyPlan}). They are logged
+     * once, after the shard snapshot has written all its blobs, so that a test or benchmark run can read them for each shard snapshot. A
+     * shard snapshot that fails, or that stores no new file as a byte range, logs nothing.
+     * <ul>
+     *     <li>Why a log line: the line can list the dead bytes of every new copy, which a counter in node stats or metrics cannot, and it
+     *     needs no new field in the snapshot status API, which would change the wire format between nodes. That API already has the time
+     *     and the size of the new files for each shard, so the line leaves them out. Node stats have the uploaded bytes only for each
+     *     repository, so the line gives the files and bytes that this shard snapshot uploaded.</li>
+     *     <li>A new file is a file that no earlier snapshot of the shard holds. Files in new copies and files in reused copies count only
+     *     new files. Reused copies counts each earlier copy once.</li>
+     *     <li>Copied bytes is the whole length of the new copies, so it includes their dead bytes. Dead bytes are the bytes of a new copy
+     *     that no file of this shard snapshot uses: the headers and padding between the files (see {@link FileInfo}), and files of
+     *     earlier commits in the same commit blob that a merge has since deleted. Dead bytes are not always wasted: a later snapshot that
+     *     needs a file in that part of the commit blob points at the existing copy, and nothing is copied again. Reused copies add no
+     *     dead bytes here.</li>
+     *     <li>Dead bytes per new copy has one number for each new copy, largest first, without the copy names.</li>
+     *     <li>Total copy time is the sum over all copy calls, which run in parallel, so it can be longer than the shard snapshot took.
+     *     Slowest copy is the longest single copy call.</li>
+     *     <li>Threads: {@link #onSourceLengths} runs once, before any copy starts. {@link #onCopy} runs on several snapshot threads at the
+     *     same time, so its totals are atomic. {@link #log} runs after the last copy and upload has finished.</li>
+     * </ul>
+     */
+    private static final class CopyStats {
+        private final List<NewCopy> newCopies;
+        private final int reusedCopies;
+        private final int filesInReusedCopies;
+        private final int uploadedFiles;
+        private final long uploadedBytes;
+        private final AtomicLong copyMillis = new AtomicLong();
+        private final AtomicLong slowestCopyMillis = new AtomicLong();
+        private volatile Map<String, Long> sourceLengths = Map.of();
+
+        CopyStats(CopyPlan copyPlan, Collection<FileInfo> filesToUpload) {
+            this.newCopies = copyPlan.newCopies();
+            this.reusedCopies = copyPlan.reusedCopyCount();
+            this.filesInReusedCopies = copyPlan.reusedFileCount();
+            this.uploadedFiles = filesToUpload.size();
+            this.uploadedBytes = filesToUpload.stream().mapToLong(FileInfo::length).sum();
+        }
+
+        /**
+         * Whether this shard snapshot stored any new file as a byte range of a copied commit blob, in a new copy or in a reused copy.
+         */
+        boolean usedCopies() {
+            return newCopies.isEmpty() == false || filesInReusedCopies > 0;
+        }
+
+        void onSourceLengths(Map<String, Long> lengths) {
+            sourceLengths = lengths;
+        }
+
+        void onCopy(long millis) {
+            copyMillis.addAndGet(millis);
+            slowestCopyMillis.accumulateAndGet(millis, Math::max);
+        }
+
+        void log(String repository, SnapshotId snapshotId, ShardId shardId) {
+            long copiedBytes = 0;
+            int filesInNewCopies = 0;
+            final List<Long> deadBytesPerNewCopy = new ArrayList<>(newCopies.size());
+            for (NewCopy newCopy : newCopies) {
+                final long blobLength = sourceLengths.get(newCopy.copySource().source());
+                copiedBytes += blobLength;
+                filesInNewCopies += newCopy.files().size();
+                deadBytesPerNewCopy.add(blobLength - newCopy.files().stream().mapToLong(FileInfo::length).sum());
+            }
+            final long deadBytes = deadBytesPerNewCopy.stream().mapToLong(Long::longValue).sum();
+            deadBytesPerNewCopy.sort(Collections.reverseOrder());
+            logger.info(
+                "[{}][{}]{} shard snapshot copy stats: new copies [{}], copied bytes [{}], total copy time [{}ms], slowest copy [{}ms], "
+                    + "files in new copies [{}], reused copies [{}], files in reused copies [{}], uploaded files [{}], "
+                    + "uploaded bytes [{}], dead bytes [{}], dead bytes per new copy {}",
+                repository,
+                snapshotId,
+                shardId,
+                newCopies.size(),
+                copiedBytes,
+                copyMillis.get(),
+                slowestCopyMillis.get(),
+                filesInNewCopies,
+                reusedCopies,
+                filesInReusedCopies,
+                uploadedFiles,
+                uploadedBytes,
+                deadBytes,
+                deadBytesPerNewCopy
+            );
+        }
+    }
 
     @Override
     public void restoreShard(

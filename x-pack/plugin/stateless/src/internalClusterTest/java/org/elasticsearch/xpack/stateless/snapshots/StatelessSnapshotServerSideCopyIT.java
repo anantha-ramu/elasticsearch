@@ -7,6 +7,7 @@
 
 package org.elasticsearch.xpack.stateless.snapshots;
 
+import org.apache.logging.log4j.Level;
 import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotResponse;
 import org.elasticsearch.action.admin.cluster.snapshots.restore.RestoreSnapshotResponse;
 import org.elasticsearch.cluster.routing.ShardRouting;
@@ -30,6 +31,7 @@ import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.snapshots.SnapshotInfo;
 import org.elasticsearch.snapshots.SnapshotState;
 import org.elasticsearch.test.InternalSettingsPlugin;
+import org.elasticsearch.test.MockLog;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.threadpool.ThreadPoolStats;
 import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
@@ -110,7 +112,23 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
 
         final String repoName = randomIdentifier();
         createRepository(repoName, "fs");
-        createSnapshot(repoName, "snap", List.of(indexName), List.of());
+        // at least one shard snapshot of the index logs a copy stats line that shows no uploaded file
+        MockLog.assertThatLogger(
+            () -> createSnapshot(repoName, "snap", List.of(indexName), List.of()),
+            BlobStoreRepository.class,
+            new MockLog.SeenEventExpectation(
+                "copy stats",
+                BlobStoreRepository.class.getCanonicalName(),
+                Level.INFO,
+                "["
+                    + repoName
+                    + "][snap/*]["
+                    + indexName
+                    + "][*] shard snapshot copy stats: new copies [*], copied bytes [*], total copy time [*ms], slowest copy [*ms],"
+                    + " files in new copies [*], reused copies [0], files in reused copies [0], uploaded files [0], uploaded bytes [0],"
+                    + " dead bytes [*], dead bytes per new copy [*]"
+            )
+        );
         assertAllDataFilesCopied(repoName, indexName, "snap");
 
         assertAcked(indicesAdmin().prepareDelete(indexName));
