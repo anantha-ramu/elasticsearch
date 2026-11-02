@@ -24,7 +24,9 @@ import org.elasticsearch.common.blobstore.fs.FsBlobContainer;
 import org.elasticsearch.common.blobstore.fs.FsBlobStore;
 import org.elasticsearch.common.blobstore.support.BlobMetadata;
 import org.elasticsearch.common.blobstore.support.FilterBlobContainer;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.collect.Iterators;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.core.FixForMultiProject;
 import org.elasticsearch.core.IOUtils;
@@ -63,10 +65,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Executor;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 
@@ -235,6 +240,69 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         }
     }
 
+    public void testCommitBlobTooShortFailsBeforeAnyCopy() throws IOException {
+        final var shardAndRepository = new ShardAndRepository();
+        try {
+            shardAndRepository.indexSegments(between(1, 3));
+            // Each commit blob loses its last bytes, so the range of the last file written into it runs past its end.
+            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
+                between(1, 3),
+                name -> true,
+                between(1, 16)
+            );
+            final Snapshot snapshot = shardAndRepository.newSnapshot();
+            final Exception e = expectThrows(Exception.class, () -> shardAndRepository.snapshot(snapshot, sources::get));
+            assertThat(e.getMessage(), containsString("does not fit in commit blob"));
+            shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    public void testMissingCommitBlobFailsBeforeAnyCopy() throws IOException {
+        final var shardAndRepository = new ShardAndRepository();
+        try {
+            shardAndRepository.indexSegments(between(1, 3));
+            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
+                between(1, 3),
+                name -> true,
+                0
+            );
+            // One of the commit blobs is gone from the object store, so the listing taken before any copy does not show it.
+            final String missingBlob = randomFrom(sources.values()).blobName();
+            shardAndRepository.objectStore.deleteBlobsIgnoringIfNotExists(OperationPurpose.SNAPSHOT_DATA, Iterators.single(missingBlob));
+            final Snapshot snapshot = shardAndRepository.newSnapshot();
+            final Exception e = expectThrows(Exception.class, () -> shardAndRepository.snapshot(snapshot, sources::get));
+            assertThat(e.getMessage(), containsString("to copy is missing"));
+            shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    public void testBrokenCopyFailsBeforeShardSnapshotIsWritten() throws IOException {
+        // The repository's copy call returns as if it worked, but the copy is then missing, or one byte short.
+        final boolean dropCopy = randomBoolean();
+        final var shardAndRepository = new ShardAndRepository(container -> new BrokenCopies(container, dropCopy));
+        try {
+            shardAndRepository.indexSegments(between(1, 3));
+            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
+                between(1, 3),
+                name -> true,
+                0
+            );
+            final Snapshot snapshot = shardAndRepository.newSnapshot();
+            final Exception e = expectThrows(Exception.class, () -> shardAndRepository.snapshot(snapshot, sources::get));
+            assertThat(e.getMessage(), containsString("but expected"));
+            assertThat(e.getMessage(), e.getMessage().contains("none, it is missing"), equalTo(dropCopy));
+            // the check of the copies failed before snap-<uuid>.dat was written, and the failure cleanup deleted any copy still in the
+            // shard's folder
+            shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
     private static Set<String> copiedBlobs(BlobContainer shardContainer) throws IOException {
         return copiedBlobs(shardContainer.listBlobs(OperationPurpose.SNAPSHOT_METADATA).keySet());
     }
@@ -256,23 +324,33 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         private final IndexId indexId = new IndexId(randomAlphaOfLength(10), UUIDs.randomBase64UUID());
         private final ShardId shardId = new ShardId(indexId.getName(), indexId.getId(), 0);
         @FixForMultiProject(description = "randomize when snapshot and restore support multiple projects, see also ES-10225, ES-10228")
-        private final BlobStoreRepository repository = (BlobStoreRepository) TestUtils.createRepository(
-            ProjectId.DEFAULT,
-            createTempDir(),
-            xContentRegistry()
-        );
+        private final BlobStoreRepository repository;
         private final BlobContainer objectStore;
         private IndexShard shard;
         private int commitBlobCount;
 
         ShardAndRepository() throws IOException {
+            this(null);
+        }
+
+        /**
+         * @param shardContainers if not null, wraps the repository's shard containers, see {@link TestUtils#createRepository}
+         */
+        ShardAndRepository(@Nullable UnaryOperator<BlobContainer> shardContainers) throws IOException {
+            repository = (BlobStoreRepository) TestUtils.createRepository(
+                ProjectId.DEFAULT,
+                createTempDir(),
+                xContentRegistry(),
+                shardContainers
+            );
             final Path objectStorePath = createTempDir();
             BlobContainer container = new FsBlobContainer(
                 new FsBlobStore(randomIntBetween(1, 8) * 1024, objectStorePath, false),
                 BlobPath.EMPTY,
                 objectStorePath
             );
-            // the object store's containers may be wrapped, unlike this repository's, so the copy must unwrap its source
+            // the object store's containers may be wrapped, and not the way the repository's shard containers are, so the copy must
+            // unwrap its source
             for (int i = between(0, 2); i > 0; i--) {
                 container = new WrappedContainer(container);
             }
@@ -346,6 +424,29 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 }
             }
             return sources;
+        }
+
+        /**
+         * Takes a first shard snapshot of all the shard's files through a context that offers the given copy sources.
+         */
+        ShardGeneration snapshot(Snapshot snapshot, Function<String, SnapshotShardContext.CopySource> copySources) throws IOException {
+            return snapshot(
+                snapshot,
+                IndexShardSnapshotStatus.newInitializing(null, randomLongBetween(1, Long.MAX_VALUE)),
+                copySources,
+                name -> true
+            );
+        }
+
+        /**
+         * Checks that a shard snapshot that failed left no copy, no uploaded file and no {@code snap-<uuid>.dat} blob in the shard's
+         * folder. The {@code index-<uuid>} blob that a shard snapshot writes first can stay, because no generation refers to it.
+         */
+        void assertFailedSnapshotLeftNoData(Snapshot snapshot) throws IOException {
+            final Set<String> blobs = shardContainer().listBlobs(OperationPurpose.SNAPSHOT_METADATA).keySet();
+            assertThat(copiedBlobs(blobs), empty());
+            assertThat(blobs.stream().filter(name -> name.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX)).toList(), empty());
+            assertFalse(blobs.contains(BlobStoreRepository.INDEX_SHARD_SNAPSHOT_FORMAT.blobName(snapshot.getSnapshotId().getUUID())));
         }
 
         /**
@@ -517,6 +618,42 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         @Override
         protected BlobContainer wrapChild(BlobContainer child) {
             return new ListingWithMissingBlob(child, missingBlob);
+        }
+    }
+
+    /**
+     * A shard container whose copies report success without leaving a complete blob behind: right after each copy, the copy is deleted or
+     * cut one byte short. The shard snapshot's check of its copies must catch that before it writes {@code snap-<uuid>.dat}.
+     */
+    private static final class BrokenCopies extends FilterBlobContainer {
+        private final boolean dropCopy;
+
+        BrokenCopies(BlobContainer delegate, boolean dropCopy) {
+            super(delegate);
+            this.dropCopy = dropCopy;
+        }
+
+        @Override
+        public void copyBlob(
+            OperationPurpose purpose,
+            BlobContainer sourceBlobContainer,
+            String sourceBlobName,
+            String blobName,
+            long blobSize,
+            @Nullable Executor executor
+        ) throws IOException {
+            super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
+            if (dropCopy) {
+                deleteBlobsIgnoringIfNotExists(purpose, Iterators.single(blobName));
+            } else {
+                final byte[] copy = readAll(this, blobName);
+                writeBlob(purpose, blobName, new BytesArray(copy, 0, copy.length - 1), false);
+            }
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new BrokenCopies(child, dropCopy);
         }
     }
 
