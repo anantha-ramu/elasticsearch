@@ -44,11 +44,12 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
      * <ul>
      *     <li>In blobs of its own: {@link #partName} gives the name of each part, and the parts hold exactly the file's bytes. This is
      *     how snapshots upload files, and it is the only layout older versions understand.</li>
-     *     <li>As a byte range inside a copied blob: the repository holds a server-side copy of a whole stateless commit blob, named
-     *     {@link #blob()}, and the file's bytes start at {@link #offset()} in it and run for {@link #length()} bytes. Many files share one
-     *     copied blob, and the copied blob also holds bytes that belong to no file. No blob is written under {@link #name()}, which only
-     *     keeps the file unique in the shard's snapshot metadata. {@link #source()} records which commit blob was copied, so that a later
-     *     snapshot can find the copy and reuse it.</li>
+     *     <li>As a byte range inside a copied blob. In stateless Elasticsearch, a commit blob ({@code stateless_commit_N}) holds the files
+     *     of one or more Lucene commits back to back, with headers and padding between them. A copied blob is a copy of a whole commit
+     *     blob, made by the object store itself. Its name is {@link #blob()}, and the file's bytes start at {@link #offset()} in the copied
+     *     blob and run for {@link #length()} bytes. Many files share one copied blob, which also holds bytes that belong to no file. No
+     *     blob is written under {@link #name()}, which only keeps the file unique in the shard's snapshot metadata. {@link #source()}
+     *     records which commit blob was copied, so that a later snapshot can find the copy and reuse it.</li>
      * </ul>
      */
     public static final class FileInfo implements Writeable {
@@ -132,8 +133,8 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            // Only snapshot-based peer recovery sends a FileInfo to another node, and it never uses a snapshot that holds copied files.
-            // Refusing here means the wire format needs no field for them.
+            // Only snapshot-based peer recovery sends a FileInfo to another node, and ShardSnapshotsService never picks a snapshot that
+            // holds copied files for it. Refusing here means the wire format needs no fields for copied files.
             if (blob != null) {
                 throw new IllegalStateException("cannot send file [" + name + "] stored inside copied blob [" + blob + "] to another node");
             }
@@ -295,7 +296,7 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
          * Checks if a file in a store is the same file
          *
          * @param fileInfo file in a store
-         * @return true if file in a store this this file have the same checksum and length
+         * @return true if both file infos describe the same file, with the same checksum and length, stored in the same place
          */
         public boolean isSame(FileInfo fileInfo) {
             if (numberOfParts != fileInfo.numberOfParts) {
@@ -316,7 +317,8 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
                     return false;
                 }
             }
-            // Where the bytes are stored matters too, so that a shard generation and a shard snapshot that disagree about it are caught.
+            // Two file infos with the same name must also agree on where the bytes are stored. The consistency assertions and the
+            // repository integrity check rely on this to catch a shard generation and a shard snapshot that disagree.
             if (Objects.equals(blob, fileInfo.blob) == false
                 || offset != fileInfo.offset
                 || Objects.equals(source, fileInfo.source) == false) {
@@ -450,8 +452,9 @@ public class BlobStoreIndexShardSnapshot implements ToXContentFragment {
             } catch (Exception e) {
                 throw new ElasticsearchParseException("invalid written_by [" + writtenBy + "]");
             }
-            // A file stored inside a copied blob has all of blob, offset and source, and is one range, so it has no part size. Other files
-            // have none of them. The source is a path in another bucket and contains '/', so it is not checked as a file name.
+            // A file in a copied blob has blob, offset and source, and no part size, because it is one range. Other files have none of
+            // blob, offset and source. The source is a path in the stateless object store, so it contains '/' and is not checked as a
+            // file name.
             if (blob != null || offset != null || source != null) {
                 if (blob == null || Strings.validFileName(blob) == false) {
                     throw new ElasticsearchParseException("missing or invalid copied blob name [" + blob + "] for file [" + name + "]");

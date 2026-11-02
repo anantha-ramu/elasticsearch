@@ -9,14 +9,19 @@
 
 package org.elasticsearch.repositories.blobstore;
 
+import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.TestUtil;
+import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.routing.RecoverySource;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.routing.ShardRoutingHelper;
 import org.elasticsearch.common.UUIDs;
+import org.elasticsearch.common.blobstore.BlobContainer;
+import org.elasticsearch.common.blobstore.OperationPurpose;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.core.FixForMultiProject;
 import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.index.IndexVersion;
@@ -28,6 +33,7 @@ import org.elasticsearch.index.shard.IndexShardState;
 import org.elasticsearch.index.shard.IndexShardTestCase;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.snapshots.IndexShardSnapshotFailedException;
+import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.index.store.Store;
 import org.elasticsearch.index.store.StoreFileMetadata;
 import org.elasticsearch.repositories.FinalizeSnapshotContext;
@@ -42,10 +48,13 @@ import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.snapshots.SnapshotInfo;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Predicate;
 
 import static org.hamcrest.Matchers.containsString;
 
@@ -128,6 +137,129 @@ public class BlobStoreRepositoryRestoreTests extends IndexShardTestCase {
                 String fileName = storeFile.name();
                 assertTrue("File [" + fileName + "] does not exist in store directory", directoryFiles.contains(fileName));
                 assertEquals(storeFile.length(), shard.store().directory().fileLength(fileName));
+            }
+        } finally {
+            if (shard != null && shard.state() != IndexShardState.CLOSED) {
+                try {
+                    closeShardNoCheck(shard);
+                } finally {
+                    IOUtils.close(shard.store());
+                }
+            }
+        }
+    }
+
+    public void testRestoreFilesInsideCopiedBlob() throws IOException {
+        // Every data file moves into one copied blob, back to back, so the blob holds files at offset 0, in the middle and at the end.
+        restoreAfterMovingFilesIntoCopiedBlob(fileInfo -> true, false, false);
+    }
+
+    public void testRestoreMixOfCopiedFilesAndFilesInTheirOwnBlobs() throws IOException {
+        // Some files move into a copied blob with filler bytes around each one, the rest stay in blobs of their own.
+        restoreAfterMovingFilesIntoCopiedBlob(fileInfo -> randomBoolean(), true, false);
+    }
+
+    public void testRestoreFailsCleanlyFromCorruptedCopiedBlob() throws IOException {
+        restoreAfterMovingFilesIntoCopiedBlob(fileInfo -> true, randomBoolean(), true);
+    }
+
+    /**
+     * Snapshots a shard, rewrites the shard snapshot so that the chosen files are byte ranges of one copied blob, then restores it into an
+     * empty store. Restore must then read each moved file from its range, or fail with a corruption error if {@code corrupt} is set, in
+     * which case one bit of one moved file is flipped first.
+     */
+    private void restoreAfterMovingFilesIntoCopiedBlob(
+        Predicate<BlobStoreIndexShardSnapshot.FileInfo> filesToMove,
+        boolean withFiller,
+        boolean corrupt
+    ) throws IOException {
+        final IndexId indexId = new IndexId(randomAlphaOfLength(10), UUIDs.randomBase64UUID());
+        final ShardId shardId = new ShardId(indexId.getName(), indexId.getId(), 0);
+
+        IndexShard shard = newShard(shardId, true);
+        try {
+            recoverShardFromStore(shard);
+            // several segments, so that there are several data files to move
+            final int segments = between(2, 4);
+            for (int segment = 0; segment < segments; segment++) {
+                for (int i = between(1, 50); i > 0; i--) {
+                    indexDoc(shard, "_doc", UUIDs.randomBase64UUID(random()));
+                }
+                flushShard(shard, true);
+            }
+
+            @FixForMultiProject(description = "randomize when snapshot and restore support multiple projects, see also ES-10225, ES-10228")
+            final BlobStoreRepository repository = (BlobStoreRepository) TestUtils.createRepository(
+                ProjectId.DEFAULT,
+                createTempDir(),
+                xContentRegistry()
+            );
+            final Snapshot snapshot = new Snapshot(repository.getMetadata().name(), new SnapshotId(randomAlphaOfLength(10), "_uuid"));
+            final ShardGeneration shardGen = snapshotShard(shard, snapshot, repository);
+            final Store.MetadataSnapshot storeFiles = shard.snapshotStoreMetadata();
+
+            final List<BlobStoreIndexShardSnapshot.FileInfo> moved = BlobStoreTestUtil.moveFilesIntoCopiedBlob(
+                repository,
+                indexId,
+                shardId.id(),
+                shardGen,
+                snapshot.getSnapshotId(),
+                filesToMove,
+                withFiller
+            );
+            if (corrupt) {
+                assertFalse("no file was moved", moved.isEmpty());
+                final BlobStoreIndexShardSnapshot.FileInfo victim = randomFrom(moved);
+                final BlobContainer shardContainer = repository.shardContainer(indexId, shardId.id());
+                final byte[] copiedBytes;
+                try (InputStream in = shardContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, victim.blob())) {
+                    copiedBytes = in.readAllBytes();
+                }
+                final int position = Math.toIntExact(victim.offset() + randomLongBetween(0, victim.length() - 1));
+                copiedBytes[position] = (byte) (copiedBytes[position] ^ (1 << between(0, 7)));
+                shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, victim.blob(), new BytesArray(copiedBytes), false);
+            }
+
+            // restore into an empty store, so that every file comes from the repository
+            closeShards(shard);
+            try (var files = Files.list(shard.shardPath().resolveIndex())) {
+                for (Path file : files.toList()) {
+                    if (file.getFileName().toString().equals("write.lock") == false) {
+                        Files.delete(file);
+                    }
+                }
+            }
+            final ShardRouting shardRouting = ShardRoutingHelper.initWithSameId(
+                shard.routingEntry(),
+                new RecoverySource.SnapshotRecoverySource(UUIDs.randomBase64UUID(), snapshot, IndexVersion.current(), indexId)
+            );
+            shard = newShard(
+                shardRouting,
+                null,
+                shard.shardPath(),
+                shard.indexSettings().getIndexMetadata(),
+                null,
+                null,
+                new InternalEngineFactory(),
+                NOOP_GCP_SYNCER,
+                RetentionLeaseSyncer.EMPTY,
+                IndexEventListener.NOOP
+            );
+
+            if (corrupt) {
+                final IndexShard restoringShard = shard;
+                final Exception e = expectThrows(Exception.class, () -> recoverShardFromSnapshot(restoringShard, snapshot, repository));
+                assertNotNull("expected a corruption error but got " + e, ExceptionsHelper.unwrap(e, CorruptIndexException.class));
+                assertTrue(shard.store().isMarkedCorrupted());
+            } else {
+                recoverShardFromSnapshot(shard, snapshot, repository);
+                TestUtil.checkIndex(shard.store().directory());
+                final Store.MetadataSnapshot restoredFiles = shard.store().getMetadata(null);
+                for (StoreFileMetadata storeFile : storeFiles) {
+                    final StoreFileMetadata restoredFile = restoredFiles.get(storeFile.name());
+                    assertNotNull("file [" + storeFile.name() + "] was not restored", restoredFile);
+                    assertTrue("file [" + storeFile.name() + "] differs after restore", restoredFile.isSame(storeFile));
+                }
             }
         } finally {
             if (shard != null && shard.state() != IndexShardState.CLOSED) {

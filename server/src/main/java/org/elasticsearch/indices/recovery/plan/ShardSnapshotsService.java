@@ -138,6 +138,19 @@ public class ShardSnapshotsService {
                 snapshot.getSnapshotId()
             );
 
+            // Recovery from a snapshot reads each file from blobs of its own and sends its file info to the recovering node. A file
+            // stored inside a copied blob has no blobs of its own, and its file info cannot be sent, so fall back to a normal peer
+            // recovery for such a snapshot.
+            if (blobStoreIndexShardSnapshot.indexFiles().stream().anyMatch(BlobStoreIndexShardSnapshot.FileInfo::isCopied)) {
+                logger.debug(
+                    "{} not recovering from [{}][{}] because it has files stored inside copied blobs",
+                    shardId,
+                    snapshot.getRepository(),
+                    snapshot.getSnapshotId()
+                );
+                return Optional.empty();
+            }
+
             Map<String, StoreFileMetadata> snapshotFiles = blobStoreIndexShardSnapshot.indexFiles()
                 .stream()
                 .map(BlobStoreIndexShardSnapshot.FileInfo::metadata)

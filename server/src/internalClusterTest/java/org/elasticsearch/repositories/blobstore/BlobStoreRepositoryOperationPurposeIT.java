@@ -244,7 +244,8 @@ public class BlobStoreRepositoryOperationPurposeIT extends AbstractSnapshotInteg
     }
 
     private static void assertPurposeConsistency(OperationPurpose purpose, String blobName) {
-        if (blobName.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX)) {
+        if (blobName.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX)
+            || blobName.startsWith(BlobStoreRepository.COPIED_DATA_BLOB_PREFIX)) {
             assertEquals(blobName, OperationPurpose.SNAPSHOT_DATA, purpose);
         } else {
             assertThat(

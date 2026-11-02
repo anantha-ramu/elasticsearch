@@ -27,7 +27,8 @@ public enum RepositoryFileType {
     INDEX_METADATA("indices/UUID/meta-SHORTUUID.dat"),
     SHARD_GENERATION("indices/UUID/NUM/index-UUID"),
     SHARD_SNAPSHOT_INFO("indices/UUID/NUM/snap-UUID.dat"),
-    SHARD_DATA("indices/UUID/NUM/__UUID"),
+    // a blob of its own for one file (__), or a copied blob that holds byte ranges of many files (c__)
+    SHARD_DATA("indices/UUID/NUM/c?__UUID"),
     // NB no support for legacy names (yet)
     ;
 

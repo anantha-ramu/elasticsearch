@@ -10,6 +10,7 @@ package org.elasticsearch.repositories.blobstore.testkit.integrity;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RateLimiter;
 import org.elasticsearch.action.ActionListener;
@@ -20,6 +21,7 @@ import org.elasticsearch.cluster.metadata.Metadata;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.blobstore.support.BlobMetadata;
 import org.elasticsearch.common.collect.Iterators;
+import org.elasticsearch.common.io.Streams;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.CancellableThreads;
 import org.elasticsearch.common.util.Maps;
@@ -35,6 +37,7 @@ import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
 import org.elasticsearch.index.snapshots.blobstore.RateLimitingInputStream;
 import org.elasticsearch.index.snapshots.blobstore.SlicedInputStream;
+import org.elasticsearch.index.store.Store;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.repositories.RepositoryVerificationException;
@@ -546,33 +549,51 @@ class RepositoryIntegrityVerifier {
                         return;
                     }
 
-                    for (int partIndex = 0; partIndex < fileInfo.numberOfParts(); partIndex++) {
-                        final var blobName = fileInfo.partName(partIndex);
-                        final var blobInfo = shardContainerContents.blobsByName().get(blobName);
-                        if (blobInfo == null) {
+                    if (fileInfo.isCopied()) {
+                        // The file is a byte range of a copied blob that other files share. The copied blob also holds bytes that
+                        // belong to no file, so its exact length is not known here: it only has to be long enough to hold the range.
+                        final var blobInfo = shardContainerContents.blobsByName().get(fileInfo.blob());
+                        if (blobInfo == null || blobInfo.length() - fileInfo.length() < fileInfo.offset()) {
                             isRestorable = false;
-                            String physicalFileName = fileInfo.physicalName();
-                            anomaly("missing blob").snapshotId(snapshotId)
+                            final var anomaly = anomaly(blobInfo == null ? "missing blob" : "mismatched blob length").snapshotId(snapshotId)
                                 .shardDescription(indexDescription, shardContainerContents.shardId())
-                                .blobName(blobName, physicalFileName)
-                                .part(partIndex, fileInfo.numberOfParts())
-                                .fileLength(ByteSizeValue.ofBytes(fileInfo.length()))
-                                .partLength(ByteSizeValue.ofBytes(fileInfo.partBytes(partIndex)))
-                                .write(listener);
+                                .blobName(fileInfo.blob(), fileInfo.physicalName())
+                                .fileLength(ByteSizeValue.ofBytes(fileInfo.length()));
+                            if (blobInfo != null) {
+                                anomaly.blobLength(ByteSizeValue.ofBytes(blobInfo.length()));
+                            }
+                            anomaly.write(listener);
                             return;
-                        } else if (blobInfo.length() != fileInfo.partBytes(partIndex)) {
-                            isRestorable = false;
-                            String physicalFileName = fileInfo.physicalName();
-                            ByteSizeValue blobLength = ByteSizeValue.ofBytes(blobInfo.length());
-                            anomaly("mismatched blob length").snapshotId(snapshotId)
-                                .shardDescription(indexDescription, shardContainerContents.shardId())
-                                .blobName(blobName, physicalFileName)
-                                .part(partIndex, fileInfo.numberOfParts())
-                                .fileLength(ByteSizeValue.ofBytes(fileInfo.length()))
-                                .partLength(ByteSizeValue.ofBytes(fileInfo.partBytes(partIndex)))
-                                .blobLength(blobLength)
-                                .write(listener);
-                            return;
+                        }
+                    } else {
+                        for (int partIndex = 0; partIndex < fileInfo.numberOfParts(); partIndex++) {
+                            final var blobName = fileInfo.partName(partIndex);
+                            final var blobInfo = shardContainerContents.blobsByName().get(blobName);
+                            if (blobInfo == null) {
+                                isRestorable = false;
+                                String physicalFileName = fileInfo.physicalName();
+                                anomaly("missing blob").snapshotId(snapshotId)
+                                    .shardDescription(indexDescription, shardContainerContents.shardId())
+                                    .blobName(blobName, physicalFileName)
+                                    .part(partIndex, fileInfo.numberOfParts())
+                                    .fileLength(ByteSizeValue.ofBytes(fileInfo.length()))
+                                    .partLength(ByteSizeValue.ofBytes(fileInfo.partBytes(partIndex)))
+                                    .write(listener);
+                                return;
+                            } else if (blobInfo.length() != fileInfo.partBytes(partIndex)) {
+                                isRestorable = false;
+                                String physicalFileName = fileInfo.physicalName();
+                                ByteSizeValue blobLength = ByteSizeValue.ofBytes(blobInfo.length());
+                                anomaly("mismatched blob length").snapshotId(snapshotId)
+                                    .shardDescription(indexDescription, shardContainerContents.shardId())
+                                    .blobName(blobName, physicalFileName)
+                                    .part(partIndex, fileInfo.numberOfParts())
+                                    .fileLength(ByteSizeValue.ofBytes(fileInfo.length()))
+                                    .partLength(ByteSizeValue.ofBytes(fileInfo.partBytes(partIndex)))
+                                    .blobLength(blobLength)
+                                    .write(listener);
+                                return;
+                            }
                         }
                     }
 
@@ -783,17 +804,49 @@ class RepositoryIntegrityVerifier {
             return shardContainerContents.blobContentsListeners().computeIfAbsent(fileInfo.name(), ignored -> {
                 if (requestParams.verifyBlobContents()) {
                     return SubscribableListener.newForked(listener -> snapshotTaskRunner.run(ActionRunnable.run(listener, () -> {
-                        try (var slicedStream = new SlicedInputStream(fileInfo.numberOfParts()) {
-                            @Override
-                            protected InputStream openSlice(int slice) throws IOException {
-                                return blobStoreRepository.shardContainer(indexDescription.indexId(), shardContainerContents.shardId())
-                                    .readBlob(OperationPurpose.REPOSITORY_ANALYSIS, fileInfo.partName(slice));
-                            }
-                        };
-                            var rateLimitedStream = new RateLimitingInputStream(slicedStream, () -> rateLimiter, throttledNanos::addAndGet);
+                        final var shardContainer = blobStoreRepository.shardContainer(
+                            indexDescription.indexId(),
+                            shardContainerContents.shardId()
+                        );
+                        try (
+                            var fileStream = fileInfo.isCopied()
+                                ? Streams.limitStream(
+                                    shardContainer.readBlob(
+                                        OperationPurpose.REPOSITORY_ANALYSIS,
+                                        fileInfo.blob(),
+                                        fileInfo.offset(),
+                                        fileInfo.length()
+                                    ),
+                                    fileInfo.length()
+                                )
+                                : new SlicedInputStream(fileInfo.numberOfParts()) {
+                                    @Override
+                                    protected InputStream openSlice(int slice) throws IOException {
+                                        return shardContainer.readBlob(OperationPurpose.REPOSITORY_ANALYSIS, fileInfo.partName(slice));
+                                    }
+                                };
+                            var rateLimitedStream = new RateLimitingInputStream(fileStream, () -> rateLimiter, throttledNanos::addAndGet);
                             var indexInput = new IndexInputWrapper(rateLimitedStream, fileInfo.length())
                         ) {
-                            CodecUtil.checksumEntireFile(indexInput);
+                            final long checksum = CodecUtil.checksumEntireFile(indexInput);
+                            // If the offset is wrong but the range happens to cover another whole Lucene file, that file's footer still
+                            // checks out. So also compare the checksum with the one recorded for the expected file.
+                            if (fileInfo.isCopied() && Store.digestToString(checksum).equals(fileInfo.checksum()) == false) {
+                                throw new CorruptIndexException(
+                                    "range ["
+                                        + fileInfo.offset()
+                                        + "+"
+                                        + fileInfo.length()
+                                        + "] holds a file with checksum ["
+                                        + Store.digestToString(checksum)
+                                        + "] but file ["
+                                        + fileInfo.physicalName()
+                                        + "] has checksum ["
+                                        + fileInfo.checksum()
+                                        + "]",
+                                    fileInfo.blob()
+                                );
+                            }
                         }
                     })));
                 } else {

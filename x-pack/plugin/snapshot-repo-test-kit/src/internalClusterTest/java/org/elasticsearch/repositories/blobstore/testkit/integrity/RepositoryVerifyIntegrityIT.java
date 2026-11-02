@@ -16,6 +16,9 @@ import org.elasticsearch.client.Request;
 import org.elasticsearch.client.Response;
 import org.elasticsearch.client.ResponseException;
 import org.elasticsearch.cluster.metadata.ProjectId;
+import org.elasticsearch.common.blobstore.BlobContainer;
+import org.elasticsearch.common.blobstore.OperationPurpose;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
@@ -29,12 +32,14 @@ import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshotsI
 import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.index.store.StoreFileMetadata;
 import org.elasticsearch.plugins.Plugin;
+import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.ProjectRepo;
 import org.elasticsearch.repositories.RepositoriesService;
 import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.repositories.ShardGenerations;
 import org.elasticsearch.repositories.blobstore.BlobStoreCorruptionUtils;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
+import org.elasticsearch.repositories.blobstore.BlobStoreTestUtil;
 import org.elasticsearch.repositories.blobstore.RepositoryFileType;
 import org.elasticsearch.repositories.blobstore.testkit.SnapshotRepositoryTestKit;
 import org.elasticsearch.repositories.fs.FsRepository;
@@ -56,6 +61,7 @@ import org.elasticsearch.transport.TransportResponse;
 import org.elasticsearch.xcontent.XContentFactory;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -775,6 +781,74 @@ public class RepositoryVerifyIntegrityIT extends AbstractSnapshotIntegTestCase {
         }
         assertEquals(200, response.getStatusLine().getStatusCode());
         assertThat(getAnomalies(ObjectPath.createFromResponse(response)), equalTo(Set.of(expectedAnomaly)));
+    }
+
+    public void testFilesInsideCopiedBlob() throws IOException {
+        final var repositoryName = randomIdentifier();
+        createRepository(repositoryName, FsRepository.TYPE, randomRepoPath());
+        final var indexName = randomIdentifier();
+        createIndex(indexName, indexSettingsNoReplicas(1).build());
+        for (int i = between(1, 100); i > 0; i--) {
+            prepareIndex(indexName).setSource("field", randomAlphaOfLength(10)).get();
+        }
+        flushAndRefresh(indexName);
+        createSnapshot(repositoryName, randomIdentifier(), List.of(indexName));
+
+        // store the snapshot's data files as byte ranges of one copied blob, as server-side copy would
+        final BlobStoreRepository repository = getRepositoryOnMaster(repositoryName);
+        final RepositoryData repositoryData = getRepositoryData(repositoryName);
+        final IndexId indexId = repositoryData.resolveIndexId(indexName);
+        final List<BlobStoreIndexShardSnapshot.FileInfo> moved = BlobStoreTestUtil.moveFilesIntoCopiedBlob(
+            repository,
+            indexId,
+            0,
+            repositoryData.shardGenerations().getShardGen(indexId, 0),
+            repositoryData.getSnapshotIds().iterator().next(),
+            fileInfo -> true,
+            randomBoolean()
+        );
+        assertFalse("no file was moved", moved.isEmpty());
+        assertThat(getAnomalies(verifyIntegrityWithBlobContents(repositoryName)), empty());
+
+        // break the copied blob in one way and expect the matching anomaly
+        final BlobContainer shardContainer = repository.shardContainer(indexId, 0);
+        final String copiedBlob = moved.get(0).blob();
+        final byte[] copiedBytes;
+        try (InputStream in = shardContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, copiedBlob)) {
+            copiedBytes = in.readAllBytes();
+        }
+        final String expectedAnomaly;
+        switch (between(0, 2)) {
+            case 0 -> {
+                shardContainer.deleteBlobsIgnoringIfNotExists(OperationPurpose.SNAPSHOT_DATA, List.of(copiedBlob).iterator());
+                expectedAnomaly = "missing blob";
+            }
+            case 1 -> {
+                // cut the blob short, so that the last file's range no longer fits in it
+                final long rangesEnd = moved.stream().mapToLong(fileInfo -> fileInfo.offset() + fileInfo.length()).max().orElseThrow();
+                final int newLength = Math.toIntExact(rangesEnd - between(1, Math.toIntExact(Math.min(rangesEnd, 16))));
+                shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, copiedBlob, new BytesArray(copiedBytes, 0, newLength), false);
+                expectedAnomaly = "mismatched blob length";
+            }
+            case 2 -> {
+                // flip a bit inside one file's range
+                final BlobStoreIndexShardSnapshot.FileInfo victim = randomFrom(moved);
+                final int position = Math.toIntExact(victim.offset() + randomLongBetween(0, victim.length() - 1));
+                copiedBytes[position] = (byte) (copiedBytes[position] ^ (1 << between(0, 7)));
+                shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, copiedBlob, new BytesArray(copiedBytes), false);
+                expectedAnomaly = "corrupt data blob";
+            }
+            default -> throw new AssertionError("unexpected case");
+        }
+        assertThat(getAnomalies(verifyIntegrityWithBlobContents(repositoryName)), equalTo(Set.of(expectedAnomaly)));
+    }
+
+    private ObjectPath verifyIntegrityWithBlobContents(String repositoryName) throws IOException {
+        final var request = new Request("POST", "/_snapshot/" + repositoryName + "/_verify_integrity");
+        request.addParameter("verify_blob_contents", null);
+        final var response = getRestClient().performRequest(request);
+        assertEquals(200, response.getStatusLine().getStatusCode());
+        return ObjectPath.createFromResponse(response);
     }
 
     private Set<String> getAnomalies(ObjectPath responseObjectPath) throws IOException {

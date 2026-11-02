@@ -284,6 +284,14 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     public static final String UPLOADED_DATA_BLOB_PREFIX = "__";
 
     /**
+     * Name prefix for copied blobs. A copied blob is a copy, made by the object store itself, of a whole stateless commit blob, so it holds
+     * the data of many files. Each of those files is a byte range of the copied blob, see
+     * {@link BlobStoreIndexShardSnapshot.FileInfo#isCopied()}. Snapshot delete keeps a copied blob while a surviving file refers to it, and
+     * deletes any other copied blob in the shard's folder.
+     */
+    public static final String COPIED_DATA_BLOB_PREFIX = "c__";
+
+    /**
      * Prefix that signals that index metadata with this identifier was adjusted for resharding.
      * See metadata write logic in {@link BlobStoreRepository#finalizeSnapshot(FinalizeSnapshotContext)}.
      * This prefix is added for debugging purposes, it is not actually used in any logic.
@@ -1550,7 +1558,8 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 }
 
                 // Unused blobs are all previous index-, data- and meta-blobs and that are not referenced by the new index- as well as all
-                // temporary blobs
+                // temporary blobs. A copied blob is shared by many files, so it is unused only if no surviving file refers to it. The same
+                // check also removes copies that a failed snapshot left behind, which no file refers to.
                 private static List<String> unusedBlobs(
                     Set<String> originalShardBlobs,
                     Set<String> survivingSnapshotUUIDs,
@@ -1566,6 +1575,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                                     ) == false)
                                 || (blob.startsWith(UPLOADED_DATA_BLOB_PREFIX)
                                     && updatedSnapshots.findNameFile(canonicalName(blob)) == null)
+                                || (blob.startsWith(COPIED_DATA_BLOB_PREFIX) && updatedSnapshots.copiedBlobNames().contains(blob) == false)
                                 || FsBlobContainer.isTempBlobName(blob)
                         )
                         .toList();
@@ -3957,18 +3967,35 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                             indexOutput.writeBytes(hash.bytes, hash.offset, hash.length);
                             recoveryState.getIndex().addRecoveredBytesToFile(fileInfo.physicalName(), hash.length);
                         } else {
-                            try (InputStream stream = maybeRateLimitRestores(new SlicedInputStream(fileInfo.numberOfParts()) {
-                                @Override
-                                protected InputStream openSlice(int slice) throws IOException {
-                                    ensureNotClosing(store);
-                                    return container.readBlob(OperationPurpose.SNAPSHOT_DATA, fileInfo.partName(slice));
-                                }
+                            final InputStream fileStream;
+                            if (fileInfo.isCopied()) {
+                                // One ranged read of the copied blob that holds the file. Limiting it to the file's length guards against a
+                                // blob store that returns more than was asked for; the verifying output then checks length and checksum.
+                                ensureNotClosing(store);
+                                fileStream = Streams.limitStream(
+                                    container.readBlob(
+                                        OperationPurpose.SNAPSHOT_DATA,
+                                        fileInfo.blob(),
+                                        fileInfo.offset(),
+                                        fileInfo.length()
+                                    ),
+                                    fileInfo.length()
+                                );
+                            } else {
+                                fileStream = new SlicedInputStream(fileInfo.numberOfParts()) {
+                                    @Override
+                                    protected InputStream openSlice(int slice) throws IOException {
+                                        ensureNotClosing(store);
+                                        return container.readBlob(OperationPurpose.SNAPSHOT_DATA, fileInfo.partName(slice));
+                                    }
 
-                                @Override
-                                public boolean markSupported() {
-                                    return false;
-                                }
-                            })) {
+                                    @Override
+                                    public boolean markSupported() {
+                                        return false;
+                                    }
+                                };
+                            }
+                            try (InputStream stream = maybeRateLimitRestores(fileStream)) {
                                 final byte[] buffer = new byte[Math.toIntExact(Math.min(bufferSize, fileInfo.length()))];
                                 int length;
                                 while ((length = stream.read(buffer)) > 0) {
@@ -4360,7 +4387,10 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             return new Tuple<>(shardSnapshots, latest);
         } else if (blobs.stream()
             .anyMatch(
-                b -> b.startsWith(SNAPSHOT_PREFIX) || b.startsWith(SNAPSHOT_INDEX_PREFIX) || b.startsWith(UPLOADED_DATA_BLOB_PREFIX)
+                b -> b.startsWith(SNAPSHOT_PREFIX)
+                    || b.startsWith(SNAPSHOT_INDEX_PREFIX)
+                    || b.startsWith(UPLOADED_DATA_BLOB_PREFIX)
+                    || b.startsWith(COPIED_DATA_BLOB_PREFIX)
             )) {
                 logger.warn(
                     "Could not find a readable index-N file in a non-empty shard snapshot directory [" + shardContainer.path() + "]"

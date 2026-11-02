@@ -110,7 +110,7 @@ public class BlobStoreIndexShardSnapshotsTests extends ESTestCase {
             expectThrows(AssertionError.class, () -> generation.withAddedSnapshot(new SnapshotFiles("snap-2", List.of(fileInfo), null)));
         }
 
-        // an equal file info in another object is the same file, so adding and retaining snapshots with it is fine
+        // an equal FileInfo in another instance is the same file, so adding and retaining snapshots with it is fine
         final FileInfo equal = new FileInfo(name, metadata, original.blob(), original.offset(), original.source());
         final BlobStoreIndexShardSnapshots withBoth = generation.withAddedSnapshot(new SnapshotFiles("snap-2", List.of(equal), null));
         final BlobStoreIndexShardSnapshots retained = withBoth.withRetainedSnapshots(

@@ -37,6 +37,8 @@ import org.elasticsearch.repositories.ShardGeneration;
 import org.elasticsearch.repositories.ShardSnapshotInfo;
 import org.elasticsearch.repositories.SnapshotMetrics;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
+import org.elasticsearch.repositories.blobstore.BlobStoreTestUtil;
+import org.elasticsearch.repositories.blobstore.ESBlobStoreRepositoryIntegTestCase;
 import org.elasticsearch.repositories.fs.FsRepository;
 import org.elasticsearch.snapshots.SnapshotException;
 import org.elasticsearch.snapshots.SnapshotId;
@@ -279,6 +281,37 @@ public class ShardSnapshotsServiceIT extends ESIntegTestCase {
             assertThat(shardSnapshotInfo.getShardId(), is(equalTo(shardId)));
             assertThat(shardSnapshotInfo.getSnapshot().getSnapshotId().getName(), is(equalTo(snapshotName)));
         }
+    }
+
+    public void testSkipsSnapshotWithFilesInsideCopiedBlobs() throws Exception {
+        final String indexName = "test";
+        createIndex(indexName, Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).build());
+        final ShardId shardId = getShardIdForIndex(indexName);
+        for (int i = 0; i < randomIntBetween(1, 50); i++) {
+            index(indexName, Integer.toString(i), Collections.singletonMap("foo", "bar"));
+        }
+
+        final String repositoryName = "repo";
+        createRepository(repositoryName, "fs", randomRepoPath(), true);
+        createSnapshot(repositoryName, "snap", indexName);
+        assertThat(getLatestShardSnapshot(shardId).isPresent(), is(true));
+
+        // once the snapshot stores its files inside a copied blob, recovery must not use that snapshot
+        final BlobStoreRepository repository = (BlobStoreRepository) internalCluster().getAnyMasterNodeInstance(RepositoriesService.class)
+            .repository(repositoryName);
+        final RepositoryData repositoryData = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository);
+        final IndexId indexId = repositoryData.resolveIndexId(indexName);
+        final List<BlobStoreIndexShardSnapshot.FileInfo> moved = BlobStoreTestUtil.moveFilesIntoCopiedBlob(
+            repository,
+            indexId,
+            shardId.id(),
+            repositoryData.shardGenerations().getShardGen(indexId, shardId.id()),
+            repositoryData.getSnapshotIds().iterator().next(),
+            fileInfo -> true,
+            randomBoolean()
+        );
+        assertThat(moved.isEmpty(), is(false));
+        assertThat(getLatestShardSnapshot(shardId).isPresent(), is(false));
     }
 
     private Optional<ShardSnapshot> getLatestShardSnapshot(ShardId shardId) throws Exception {
