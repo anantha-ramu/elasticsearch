@@ -36,6 +36,7 @@ import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.ProjectRepo;
 import org.elasticsearch.repositories.RepositoriesService;
 import org.elasticsearch.repositories.RepositoryData;
+import org.elasticsearch.repositories.ShardGeneration;
 import org.elasticsearch.repositories.ShardGenerations;
 import org.elasticsearch.repositories.blobstore.BlobStoreCorruptionUtils;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
@@ -784,30 +785,11 @@ public class RepositoryVerifyIntegrityIT extends AbstractSnapshotIntegTestCase {
     }
 
     public void testFilesInsideCopiedBlob() throws IOException {
-        final var repositoryName = randomIdentifier();
-        createRepository(repositoryName, FsRepository.TYPE, randomRepoPath());
-        final var indexName = randomIdentifier();
-        createIndex(indexName, indexSettingsNoReplicas(1).build());
-        for (int i = between(1, 100); i > 0; i--) {
-            prepareIndex(indexName).setSource("field", randomAlphaOfLength(10)).get();
-        }
-        flushAndRefresh(indexName);
-        createSnapshot(repositoryName, randomIdentifier(), List.of(indexName));
-
-        // store the snapshot's data files as byte ranges of one copied blob, as server-side copy would
-        final BlobStoreRepository repository = getRepositoryOnMaster(repositoryName);
-        final RepositoryData repositoryData = getRepositoryData(repositoryName);
-        final IndexId indexId = repositoryData.resolveIndexId(indexName);
-        final List<BlobStoreIndexShardSnapshot.FileInfo> moved = BlobStoreTestUtil.moveFilesIntoCopiedBlob(
-            repository,
-            indexId,
-            0,
-            repositoryData.shardGenerations().getShardGen(indexId, 0),
-            repositoryData.getSnapshotIds().iterator().next(),
-            fileInfo -> true,
-            randomBoolean()
-        );
-        assertFalse("no file was moved", moved.isEmpty());
+        final var copied = createSnapshotWithFilesInsideCopiedBlob();
+        final var repositoryName = copied.repositoryName();
+        final var repository = copied.repository();
+        final var indexId = copied.indexId();
+        final var moved = copied.moved();
         assertThat(getAnomalies(verifyIntegrityWithBlobContents(repositoryName)), empty());
 
         // break the copied blob in one way and expect the matching anomaly
@@ -842,6 +824,94 @@ public class RepositoryVerifyIntegrityIT extends AbstractSnapshotIntegTestCase {
         }
         assertThat(getAnomalies(verifyIntegrityWithBlobContents(repositoryName)), equalTo(Set.of(expectedAnomaly)));
     }
+
+    public void testCopiedFileRangeHoldingAnotherFile() throws IOException {
+        final var copied = createSnapshotWithFilesInsideCopiedBlob();
+        final var moved = copied.moved();
+        assertThat("need two files in the copied blob", moved.size(), greaterThanOrEqualTo(2));
+
+        // Point one file's range at another whole file in the same copied blob. That range holds a valid Lucene file, so its footer
+        // checks out, and only the comparison with the checksum recorded for the expected file can catch it.
+        final BlobStoreIndexShardSnapshot.FileInfo expected = moved.get(0);
+        final BlobStoreIndexShardSnapshot.FileInfo other = moved.get(1);
+        final StoreFileMetadata expectedMetadata = expected.metadata();
+        final var wrongRange = new BlobStoreIndexShardSnapshot.FileInfo(
+            expected.name(),
+            new StoreFileMetadata(
+                expectedMetadata.name(),
+                other.length(),
+                expectedMetadata.checksum(),
+                expectedMetadata.writtenBy(),
+                expectedMetadata.hash(),
+                expectedMetadata.writerUuid()
+            ),
+            other.blob(),
+            other.offset(),
+            other.source()
+        );
+        BlobStoreTestUtil.rewriteShardSnapshotFiles(
+            copied.repository(),
+            copied.indexId(),
+            0,
+            copied.shardGeneration(),
+            copied.snapshotId(),
+            fileInfo -> fileInfo.name().equals(expected.name()) ? wrongRange : fileInfo
+        );
+
+        final ObjectPath response = verifyIntegrityWithBlobContents(copied.repositoryName());
+        assertThat(getAnomalies(response), equalTo(Set.of("corrupt data blob")));
+        // the anomaly names the copied blob, which has no parts, rather than the file's name in the metadata, which has no blob
+        boolean found = false;
+        for (int i = 0; i < response.evaluateArraySize("log"); i++) {
+            if ("corrupt data blob".equals(response.evaluate("log." + i + ".anomaly"))) {
+                assertEquals(other.blob(), response.evaluate("log." + i + ".blob_name"));
+                assertNull(response.evaluate("log." + i + ".part_count"));
+                found = true;
+            }
+        }
+        assertTrue(found);
+    }
+
+    /**
+     * Snapshots a one-shard index, then stores the snapshot's data files as byte ranges of one copied blob, as server-side copy would.
+     */
+    private CopiedBlobSnapshot createSnapshotWithFilesInsideCopiedBlob() throws IOException {
+        final var repositoryName = randomIdentifier();
+        createRepository(repositoryName, FsRepository.TYPE, randomRepoPath());
+        final var indexName = randomIdentifier();
+        createIndex(indexName, indexSettingsNoReplicas(1).build());
+        for (int i = between(1, 100); i > 0; i--) {
+            prepareIndex(indexName).setSource("field", randomAlphaOfLength(10)).get();
+        }
+        flushAndRefresh(indexName);
+        createSnapshot(repositoryName, randomIdentifier(), List.of(indexName));
+
+        final BlobStoreRepository repository = getRepositoryOnMaster(repositoryName);
+        final RepositoryData repositoryData = getRepositoryData(repositoryName);
+        final IndexId indexId = repositoryData.resolveIndexId(indexName);
+        final ShardGeneration shardGeneration = repositoryData.shardGenerations().getShardGen(indexId, 0);
+        final SnapshotId snapshotId = repositoryData.getSnapshotIds().iterator().next();
+        final List<BlobStoreIndexShardSnapshot.FileInfo> moved = BlobStoreTestUtil.moveFilesIntoCopiedBlob(
+            repository,
+            indexId,
+            0,
+            shardGeneration,
+            snapshotId,
+            fileInfo -> true,
+            randomBoolean()
+        );
+        assertFalse("no file was moved", moved.isEmpty());
+        return new CopiedBlobSnapshot(repositoryName, repository, indexId, shardGeneration, snapshotId, moved);
+    }
+
+    private record CopiedBlobSnapshot(
+        String repositoryName,
+        BlobStoreRepository repository,
+        IndexId indexId,
+        ShardGeneration shardGeneration,
+        SnapshotId snapshotId,
+        List<BlobStoreIndexShardSnapshot.FileInfo> moved
+    ) {}
 
     private ObjectPath verifyIntegrityWithBlobContents(String repositoryName) throws IOException {
         final var request = new Request("POST", "/_snapshot/" + repositoryName + "/_verify_integrity");

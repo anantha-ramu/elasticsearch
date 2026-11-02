@@ -71,6 +71,7 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -526,7 +527,6 @@ public final class BlobStoreTestUtil {
         if (generation.snapshots().size() != 1 || generation.snapshots().get(0).snapshot().equals(snapshotId.getName()) == false) {
             throw new IllegalArgumentException("shard generation [" + shardGeneration + "] must hold only snapshot [" + snapshotId + "]");
         }
-        final SnapshotFiles snapshotFiles = generation.snapshots().get(0);
         final BlobStoreIndexShardSnapshot shardSnapshot = repository.loadShardSnapshot(shardContainer, snapshotId);
 
         final List<BlobStoreIndexShardSnapshot.FileInfo> toMove = new ArrayList<>();
@@ -563,10 +563,38 @@ public final class BlobStoreTestUtil {
             shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, copiedBlob, copiedBytes.bytes(), true);
         }
 
+        rewriteShardSnapshotFiles(repository, indexId, shardId, shardGeneration, snapshotId, f -> moved.getOrDefault(f.name(), f));
+        shardContainer.deleteBlobsIgnoringIfNotExists(
+            OperationPurpose.SNAPSHOT_DATA,
+            toMove.stream().flatMap(f -> IntStream.range(0, f.numberOfParts()).mapToObj(f::partName)).iterator()
+        );
+        return List.copyOf(moved.values());
+    }
+
+    /**
+     * Replaces the file infos of one shard snapshot with {@code rewrite}, in both its shard snapshot blob ({@code snap-<uuid>.dat}) and
+     * its shard generation blob ({@code index-<uuid>}), so that the two stay consistent. Lets tests build shard snapshots that the snapshot
+     * path does not produce. The shard generation must hold only this snapshot.
+     */
+    public static void rewriteShardSnapshotFiles(
+        BlobStoreRepository repository,
+        IndexId indexId,
+        int shardId,
+        ShardGeneration shardGeneration,
+        SnapshotId snapshotId,
+        UnaryOperator<BlobStoreIndexShardSnapshot.FileInfo> rewrite
+    ) throws IOException {
+        final BlobContainer shardContainer = repository.shardContainer(indexId, shardId);
+        final BlobStoreIndexShardSnapshots generation = repository.getBlobStoreIndexShardSnapshots(indexId, shardId, shardGeneration);
+        if (generation.snapshots().size() != 1 || generation.snapshots().get(0).snapshot().equals(snapshotId.getName()) == false) {
+            throw new IllegalArgumentException("shard generation [" + shardGeneration + "] must hold only snapshot [" + snapshotId + "]");
+        }
+        final SnapshotFiles snapshotFiles = generation.snapshots().get(0);
+        final BlobStoreIndexShardSnapshot shardSnapshot = repository.loadShardSnapshot(shardContainer, snapshotId);
         BlobStoreRepository.INDEX_SHARD_SNAPSHOT_FORMAT.write(
             new BlobStoreIndexShardSnapshot(
                 shardSnapshot.snapshot(),
-                shardSnapshot.indexFiles().stream().map(f -> moved.getOrDefault(f.name(), f)).toList(),
+                shardSnapshot.indexFiles().stream().map(rewrite).toList(),
                 shardSnapshot.startTime(),
                 shardSnapshot.time(),
                 shardSnapshot.incrementalFileCount(),
@@ -580,7 +608,7 @@ public final class BlobStoreTestUtil {
             BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(
                 new SnapshotFiles(
                     snapshotFiles.snapshot(),
-                    snapshotFiles.indexFiles().stream().map(f -> moved.getOrDefault(f.name(), f)).toList(),
+                    snapshotFiles.indexFiles().stream().map(rewrite).toList(),
                     snapshotFiles.shardStateIdentifier()
                 )
             ),
@@ -588,11 +616,6 @@ public final class BlobStoreTestUtil {
             shardGeneration.getGenerationUUID(),
             random().nextBoolean()
         );
-        shardContainer.deleteBlobsIgnoringIfNotExists(
-            OperationPurpose.SNAPSHOT_DATA,
-            toMove.stream().flatMap(f -> IntStream.range(0, f.numberOfParts()).mapToObj(f::partName)).iterator()
-        );
-        return List.copyOf(moved.values());
     }
 
     private static void maybeWriteFiller(BytesStreamOutput out, boolean withFiller) throws IOException {

@@ -602,13 +602,14 @@ class RepositoryIntegrityVerifier {
                         listener.delegateResponse((l, e) -> {
                             isRestorable = false;
                             String physicalFileName = fileInfo.physicalName();
-                            anomaly("corrupt data blob").snapshotId(snapshotId)
+                            // a copied file has no blob of its own, so report the copied blob that holds it, which has no parts
+                            final var anomaly = anomaly("corrupt data blob").snapshotId(snapshotId)
                                 .shardDescription(indexDescription, shardContainerContents.shardId())
-                                .blobName(fileInfo.name(), physicalFileName)
-                                .part(-1, fileInfo.numberOfParts())
-                                .fileLength(ByteSizeValue.ofBytes(fileInfo.length()))
-                                .exception(e)
-                                .write(l);
+                                .blobName(fileInfo.isCopied() ? fileInfo.blob() : fileInfo.name(), physicalFileName);
+                            if (fileInfo.isCopied() == false) {
+                                anomaly.part(-1, fileInfo.numberOfParts());
+                            }
+                            anomaly.fileLength(ByteSizeValue.ofBytes(fileInfo.length())).exception(e).write(l);
                         })
                     );
                 }
