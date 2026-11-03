@@ -824,14 +824,14 @@ public class AzureBlobStore implements BlobStore {
      * and blobs. Two stores are in the same storage account when their clients have the same storage endpoint. The names of the accounts
      * are not compared.
      * <ul>
-     * <li>Same storage account: this method sends a Copy Blob request. Azure does such a copy at once (in a measurement, 2 GB took 0.3
-     * seconds), and this method polls the status of the copy until Azure reports that it is done.</li>
-     * <li>Different storage accounts: Azure has to move the bytes. It runs a Copy Blob between accounts in the background and worked on
-     * only a few copies at a time. In a measurement of ten copies of 2 GB blobs at once, the ten together took between 124 and 326
-     * seconds. So this method splits the source blob into blocks of {@code copy_block_size} bytes. It asks Azure to fill each block of
-     * the new blob from a byte range of the source blob (Put Block From URL), with up to {@code max_concurrent_copy_blocks} requests at
-     * the same time. Then it sends one Put Block List request, which commits the blocks, that is, joins them into the new blob. No bytes
-     * pass through this node. The same ten copies took about six seconds this way.</li>
+     * <li>Same storage account: this method sends a Copy Blob request, and polls the status of the copy until Azure reports that it is
+     * done.</li>
+     * <li>Different storage accounts: Azure has to move the bytes. A Copy Blob request between accounts is asynchronous and best-effort,
+     * and Azure may run several pending copies one after another, so a copy of a large blob can wait for the others. Blocks that are
+     * staged, in contrast, run in parallel. So this method splits the source blob into blocks of {@code copy_block_size} bytes. It asks
+     * Azure to fill each block of the new blob from a byte range of the source blob (Put Block From URL), with up to
+     * {@code max_concurrent_copy_blocks} requests at the same time. Then it sends one Put Block List request, which commits the blocks,
+     * that is, joins them into the new blob. No bytes pass through this node.</li>
      * </ul>
      * A blob with no bytes has no byte range to copy, so it always uses Copy Blob.
      * <p>
