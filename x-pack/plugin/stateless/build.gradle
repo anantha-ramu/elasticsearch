@@ -44,6 +44,7 @@ dependencies {
   testImplementation testArtifact(project(':server'))
   internalClusterTestImplementation testArtifact(project(xpackModule('core')))
   internalClusterTestImplementation project(xpackModule('shutdown'))
+  internalClusterTestImplementation project(xpackModule('snapshot-repo-test-kit'))
   internalClusterTestImplementation project(':modules:data-streams')
   internalClusterTestImplementation project(':modules:mapper-extras')
   internalClusterTestImplementation project(':modules:lang-painless')
