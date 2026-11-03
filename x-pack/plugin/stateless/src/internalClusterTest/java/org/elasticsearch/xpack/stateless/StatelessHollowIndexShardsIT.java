@@ -66,7 +66,9 @@ import org.elasticsearch.common.component.Lifecycle;
 import org.elasticsearch.common.compress.CompressedXContent;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
+import org.elasticsearch.core.CheckedRunnable;
 import org.elasticsearch.core.Releasable;
+import org.elasticsearch.core.Releasables;
 import org.elasticsearch.core.Strings;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.datastreams.DataStreamsPlugin;
@@ -87,6 +89,8 @@ import org.elasticsearch.ingest.TestProcessor;
 import org.elasticsearch.monitor.jvm.HotThreads;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.plugins.internal.DocumentParsingProvider;
+import org.elasticsearch.repositories.RepositoriesService;
+import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.search.suggest.completion.CompletionStats;
 import org.elasticsearch.snapshots.SnapshotInfo;
@@ -94,6 +98,7 @@ import org.elasticsearch.snapshots.SnapshotState;
 import org.elasticsearch.telemetry.TelemetryProvider;
 import org.elasticsearch.telemetry.TestTelemetryPlugin;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.MockLog;
 import org.elasticsearch.test.disruption.NetworkDisruption;
 import org.elasticsearch.test.junit.annotations.TestIssueLogging;
 import org.elasticsearch.test.transport.MockTransportService;
@@ -551,6 +556,66 @@ public class StatelessHollowIndexShardsIT extends AbstractStatelessPluginIntegTe
         int numDocs,
         int maxShardSegments
     ) {}
+
+    /**
+     * Node settings that make shard snapshots copy commit blobs into the repository instead of uploading files. The snapshots then have
+     * to read the commits from the object store, and the commit info comes without the shard's engine, which a hollow shard does not have.
+     */
+    private static Settings copyNodeSettings() {
+        return Settings.builder()
+            .put(
+                StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING.getKey(),
+                randomFrom(
+                    StatelessSnapshotSettings.StatelessSnapshotEnabledStatus.READ_FROM_OBJECT_STORE,
+                    StatelessSnapshotSettings.StatelessSnapshotEnabledStatus.ENABLED
+                )
+            )
+            .put(StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING.getKey(), true)
+            .build();
+    }
+
+    /**
+     * Creates a snapshot and checks that its shard snapshots copied commit blobs, as the copy stats that they log show.
+     */
+    private SnapshotInfo createSnapshotAndExpectCopies(String repository, String snapshot, List<String> indices) {
+        final var snapshotInfo = new AtomicReference<SnapshotInfo>();
+        MockLog.assertThatLogger(
+            () -> snapshotInfo.set(createSnapshot(repository, snapshot, indices, List.of())),
+            BlobStoreRepository.class,
+            new MockLog.SeenEventExpectation(
+                "copy stats",
+                BlobStoreRepository.class.getCanonicalName(),
+                Level.INFO,
+                "*shard snapshot copy stats: new copies [*"
+            )
+        );
+        return snapshotInfo.get();
+    }
+
+    /**
+     * Blocks the copies that shard snapshots make on a node into a snapshot repository of the mock type, until the returned
+     * {@link Releasable} is closed.
+     */
+    private Releasable blockCopies(String repositoryName, String nodeName) {
+        final var released = new CountDownLatch(1);
+        final var repository = (StatelessMockRepository) internalCluster().getInstance(RepositoriesService.class, nodeName)
+            .repository(repositoryName);
+        repository.setStrategy(new StatelessMockRepositoryStrategy() {
+            @Override
+            public void blobContainerCopyBlob(
+                CheckedRunnable<IOException> originalRunnable,
+                OperationPurpose purpose,
+                BlobContainer sourceBlobContainer,
+                String sourceBlobName,
+                String blobName,
+                long blobSize
+            ) throws IOException {
+                safeAwait(released);
+                originalRunnable.run();
+            }
+        });
+        return released::countDown;
+    }
 
     private HollowShardsInfo startNodesAndHollowShards() throws Exception {
         return startNodesAndHollowShards(1);
@@ -1063,10 +1128,10 @@ public class StatelessHollowIndexShardsIT extends AbstractStatelessPluginIntegTe
     }
 
     public void testSnapshotHollowShardsAndRestore() throws Exception {
-        final var clusterInfo = startNodesAndHollowShards(randomIntBetween(1, 5));
+        final var clusterInfo = startNodesAndHollowShards(copyNodeSettings(), randomIntBetween(1, 5));
 
         createRepository("test-repo", "fs");
-        final var snapshotInfo = createSnapshot("test-repo", "test-snap", List.of(clusterInfo.indexName), List.of());
+        final var snapshotInfo = createSnapshotAndExpectCopies("test-repo", "test-snap", List.of(clusterInfo.indexName));
         final var snapshotDetails = snapshotInfo.indexSnapshotDetails().get(clusterInfo.indexName);
         assertThat(snapshotDetails.getShardCount(), equalTo(clusterInfo.numberOfShards));
         assertThat(snapshotDetails.getMaxSegmentsPerShard(), equalTo(clusterInfo.maxShardSegments));
@@ -1148,7 +1213,7 @@ public class StatelessHollowIndexShardsIT extends AbstractStatelessPluginIntegTe
     }
 
     public void testSnapshotShardsAfterUnhollowing() throws Exception {
-        final var clusterInfo = startNodesAndHollowShards(randomIntBetween(1, 5));
+        final var clusterInfo = startNodesAndHollowShards(copyNodeSettings(), randomIntBetween(1, 5));
 
         final var maxShardSegments = new AtomicInteger(0);
         final int moreDocs = randomIntBetween(clusterInfo.numDocs * 2, clusterInfo.numDocs * 4);
@@ -1165,7 +1230,7 @@ public class StatelessHollowIndexShardsIT extends AbstractStatelessPluginIntegTe
         }
 
         createRepository("test-repo", "fs");
-        final var snapshotInfo = createSnapshot("test-repo", "test-snap", List.of(clusterInfo.indexName), List.of());
+        final var snapshotInfo = createSnapshotAndExpectCopies("test-repo", "test-snap", List.of(clusterInfo.indexName));
         final var snapshotDetails = snapshotInfo.indexSnapshotDetails().get(clusterInfo.indexName);
         assertThat(snapshotDetails.getShardCount(), equalTo(clusterInfo.numberOfShards));
         assertThat(snapshotDetails.getMaxSegmentsPerShard(), equalTo(maxShardSegments.get()));
@@ -1198,13 +1263,19 @@ public class StatelessHollowIndexShardsIT extends AbstractStatelessPluginIntegTe
     }
 
     public void testSnapshotShardsWhileUnhollowing() throws Exception {
-        var clusterInfo = startNodesAndHollowShards(randomIntBetween(2, 5)); // we would like at least 2 segments that can be force merged
-        createRepository("test-repo", "fs");
+        // we would like at least 2 segments that can be force merged
+        var clusterInfo = startNodesAndHollowShards(copyNodeSettings(), randomIntBetween(2, 5));
+        // the repository is a mock one, so that the copies can be blocked
+        createRepository("test-repo", StatelessMockRepositoryPlugin.TYPE);
 
         // Fail BCC uploads to pause unhollowing (since the necessary flush will keep being retried to be uploaded)
         setNodeRepositoryFailureStrategy(clusterInfo.indexNodeB, false, true, Map.of(OperationPurpose.INDICES, ".*"));
-        // Block snapshots
-        Releasable snapshotsBlock = findPlugin(clusterInfo.indexNodeB, StatelessFileDeletionIT.TestStatelessPlugin.class).blockSnapshots();
+        // Block snapshots. A snapshot that uploads files is blocked when it opens a file. A snapshot that copies has no file to open,
+        // so block its copies as well.
+        Releasable snapshotsBlock = Releasables.wrap(
+            findPlugin(clusterInfo.indexNodeB, StatelessFileDeletionIT.TestStatelessPlugin.class).blockSnapshots(),
+            blockCopies("test-repo", clusterInfo.indexNodeB)
+        );
 
         // A force merge thread that unhollows (and could, under buggy conditions, lead to deleted blobs for the racing snapshot)
         final var forceMergeThread = new Thread(() -> {
@@ -1221,7 +1292,7 @@ public class StatelessHollowIndexShardsIT extends AbstractStatelessPluginIntegTe
         // the snapshot holding the index commit should be passed around the engine resets, so that the relevant blobs are not deleted.
         final var snapshotThread = new Thread(() -> {
             try {
-                final var snapshotInfo = createSnapshot("test-repo", "test-snap", List.of(clusterInfo.indexName), List.of());
+                final var snapshotInfo = createSnapshotAndExpectCopies("test-repo", "test-snap", List.of(clusterInfo.indexName));
                 final var snapshotDetails = snapshotInfo.indexSnapshotDetails().get(clusterInfo.indexName);
                 assertThat(snapshotDetails.getShardCount(), equalTo(clusterInfo.numberOfShards));
             } catch (Exception e) {
