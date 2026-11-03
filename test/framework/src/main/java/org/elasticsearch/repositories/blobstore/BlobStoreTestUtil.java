@@ -67,6 +67,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
@@ -574,7 +575,8 @@ public final class BlobStoreTestUtil {
     /**
      * Replaces the file infos of one shard snapshot with {@code rewrite}, in both its shard snapshot blob ({@code snap-<uuid>.dat}) and
      * its shard generation blob ({@code index-<uuid>}), so that the two stay consistent. Lets tests build shard snapshots that the snapshot
-     * path does not produce. The shard generation must hold only this snapshot.
+     * path does not produce. {@code rewrite} may return null for a file info, to drop that file from the snapshot. The shard generation
+     * must hold only this snapshot.
      */
     public static void rewriteShardSnapshotFiles(
         BlobStoreRepository repository,
@@ -594,7 +596,7 @@ public final class BlobStoreTestUtil {
         BlobStoreRepository.INDEX_SHARD_SNAPSHOT_FORMAT.write(
             new BlobStoreIndexShardSnapshot(
                 shardSnapshot.snapshot(),
-                shardSnapshot.indexFiles().stream().map(rewrite).toList(),
+                shardSnapshot.indexFiles().stream().map(rewrite).filter(Objects::nonNull).toList(),
                 shardSnapshot.startTime(),
                 shardSnapshot.time(),
                 shardSnapshot.incrementalFileCount(),
@@ -608,7 +610,7 @@ public final class BlobStoreTestUtil {
             BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(
                 new SnapshotFiles(
                     snapshotFiles.snapshot(),
-                    snapshotFiles.indexFiles().stream().map(rewrite).toList(),
+                    snapshotFiles.indexFiles().stream().map(rewrite).filter(Objects::nonNull).toList(),
                     snapshotFiles.shardStateIdentifier()
                 )
             ),

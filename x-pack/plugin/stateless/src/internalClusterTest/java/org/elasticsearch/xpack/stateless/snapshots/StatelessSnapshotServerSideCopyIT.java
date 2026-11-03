@@ -10,10 +10,12 @@ package org.elasticsearch.xpack.stateless.snapshots;
 import org.apache.logging.log4j.Level;
 import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotResponse;
 import org.elasticsearch.action.admin.cluster.snapshots.restore.RestoreSnapshotResponse;
+import org.elasticsearch.cluster.SnapshotDeletionsInProgress;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.CheckedRunnable;
 import org.elasticsearch.core.Strings;
 import org.elasticsearch.core.TimeValue;
@@ -21,11 +23,13 @@ import org.elasticsearch.index.Index;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
+import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshotsIntegritySuppressor;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoriesService;
 import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
+import org.elasticsearch.repositories.blobstore.BlobStoreTestUtil;
 import org.elasticsearch.repositories.blobstore.ESBlobStoreRepositoryIntegTestCase;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.snapshots.SnapshotInfo;
@@ -38,23 +42,29 @@ import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
 import org.elasticsearch.xpack.stateless.StatelessMockRepository;
 import org.elasticsearch.xpack.stateless.StatelessMockRepositoryPlugin;
 import org.elasticsearch.xpack.stateless.StatelessMockRepositoryStrategy;
+import org.elasticsearch.xpack.stateless.commits.StatelessCommitService;
 import org.elasticsearch.xpack.stateless.objectstore.ObjectStoreService;
 import org.elasticsearch.xpack.stateless.objectstore.gc.ObjectStoreGCTask;
 import org.elasticsearch.xpack.stateless.reshard.ReshardIndexRequest;
 import org.elasticsearch.xpack.stateless.reshard.TransportReshardAction;
 
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
@@ -65,11 +75,30 @@ import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSetti
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 
 /**
  * Shard snapshots that copy stateless commit blobs into the repository server-side, and the snapshot operations that read them: restore,
  * clone, delete, a failure part way through, a primary that moves during a snapshot, and a snapshot of a split target.
+ * <p>
+ * Terms used in the tests:
+ * <ul>
+ * <li>A commit blob is a blob in the object store that holds the files of one or more commits of a shard.</li>
+ * <li>A copied blob, {@code c__<uuid>}, is a copy of a whole commit blob that a snapshot makes inside the repository.</li>
+ * <li>An uploaded blob, {@code __<uuid>}, holds one file that a snapshot writes to the repository itself.</li>
+ * <li>A file info is the repository's record of one file of a shard snapshot. For a copied file it names the copied blob and the byte
+ * range of the file in it.</li>
+ * <li>A shard snapshot blob, {@code snap-<uuid>.dat}, lists the file infos of one shard snapshot.</li>
+ * <li>A shard generation, {@code index-<uuid>}, lists the file infos of all the snapshots of one shard.</li>
+ * <li>The repository data is the root {@code index-N} blob. It lists the snapshots, the indices and the current shard generation of every
+ * shard.</li>
+ * <li>Finalization is the last step of a snapshot. After all shard snapshots end, the master writes the snapshot's metadata and the
+ * repository data.</li>
+ * <li>TLA+ is a language for describing a design so that a tool can check every order of its steps. Two tests replay sequences that a
+ * TLA+ model of the copies found. The model is not part of this repository.</li>
+ * </ul>
  */
 public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIntegTestCase {
 
@@ -390,6 +419,544 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         assertAcked(indicesAdmin().prepareDelete(indexName));
         restore(repoName, "snap", indexName, indexName);
         assertHitCount(prepareSearch(indexName), docCount);
+    }
+
+    /**
+     * Takes snapshots into one repository with server-side copy on, then off, then on again. A busy index changes between the snapshots,
+     * and an idle index does not. A snapshot reuses a file that an earlier snapshot already stored, whether that snapshot copied or
+     * uploaded the file. A shard that has not changed since its last snapshot reuses the file list of that snapshot as it is, and copies
+     * and uploads nothing.
+     */
+    public void testCopiesOnThenOffThenOn() throws Exception {
+        final Settings settings = copySettings().build();
+        startMasterAndIndexNode(settings);
+        startSearchNode(settings);
+        final String busy = randomIdentifier();
+        final String idle = randomIdentifier();
+        // no merges, so that the files of a snapshot are still there for the next snapshot to reuse
+        final Settings indexSettings = indexSettings(1, 1).put(InternalSettingsPlugin.MERGE_ENABLED.getKey(), false).build();
+        createIndex(busy, indexSettings);
+        createIndex(idle, indexSettings);
+        ensureGreen(busy, idle);
+        final long busyDocsAtFirst = indexDocsAndFlush(busy, 1);
+        final long idleDocs = indexDocsAndFlush(idle, 1);
+        final String repoName = randomIdentifier();
+        final Path location = randomRepoPath();
+        createRepository(logger, repoName, "fs", Settings.builder().put("location", location), true);
+
+        // Server-side copy is on. Every data file of both shards is copied.
+        createSnapshot(repoName, "first", List.of(busy, idle), List.of());
+        assertAllDataFilesCopied(repoName, busy, "first");
+        assertAllDataFilesCopied(repoName, idle, "first");
+        final Set<String> busyCopies = copiedBlobs(repoName, busy, 0);
+        final Set<String> idleCopies = copiedBlobs(repoName, idle, 0);
+        final Map<String, FileInfo> idleFiles = byName(dataFiles(shardSnapshot(repoName, idle, "first", 0)));
+
+        // Server-side copy is off. The busy shard keeps the copied files of the first snapshot and uploads its new files. The idle shard
+        // has not changed, so its file list is the same as in the first snapshot, and nothing is copied or uploaded for it.
+        updateClusterSettings(Settings.builder().put(SERVER_SIDE_COPY_ENABLED_SETTING.getKey(), false));
+        final long busyDocsAtSecond = busyDocsAtFirst + indexDocsAndFlush(busy, 1);
+        createSnapshot(repoName, "second", List.of(busy, idle), List.of());
+        final List<FileInfo> busySecondFiles = dataFiles(shardSnapshot(repoName, busy, "second", 0));
+        assertTrue("no copied file in " + busySecondFiles, busySecondFiles.stream().anyMatch(FileInfo::isCopied));
+        assertTrue("no uploaded file in " + busySecondFiles, busySecondFiles.stream().anyMatch(fileInfo -> fileInfo.isCopied() == false));
+        assertThat(copiedBlobs(repoName, busy, 0), equalTo(busyCopies));
+        final Set<String> busyUploads = uploadedBlobs(repoName, busy, 0);
+        assertThat(busyUploads, not(empty()));
+        assertThat(copiedBlobs(repoName, idle, 0), equalTo(idleCopies));
+        assertThat(uploadedBlobs(repoName, idle, 0), empty());
+        assertSameFiles(idleFiles, byName(dataFiles(shardSnapshot(repoName, idle, "second", 0))));
+
+        // Server-side copy is on again. The busy shard copies its new files, and keeps the files that the repository already holds,
+        // whether they were copied or uploaded. The idle shard still has the same file list.
+        updateClusterSettings(Settings.builder().put(SERVER_SIDE_COPY_ENABLED_SETTING.getKey(), true));
+        final long busyDocsAtThird = busyDocsAtSecond + indexDocsAndFlush(busy, 1);
+        // The busy shard reuses the data files of the second snapshot by name, the copied ones and the uploaded ones. Its copy stats line
+        // counts both groups.
+        final List<FileInfo> busyReusedCopied = busySecondFiles.stream().filter(FileInfo::isCopied).toList();
+        final List<FileInfo> busyReusedUploaded = busySecondFiles.stream().filter(fileInfo -> fileInfo.isCopied() == false).toList();
+        MockLog.assertThatLogger(
+            () -> createSnapshot(repoName, "third", List.of(busy, idle), List.of()),
+            BlobStoreRepository.class,
+            new MockLog.SeenEventExpectation(
+                "files reused by name in the copy stats",
+                BlobStoreRepository.class.getCanonicalName(),
+                Level.INFO,
+                "["
+                    + repoName
+                    + "][third/*]["
+                    + busy
+                    + "][*] shard snapshot copy stats: new copies [*], copied bytes [*], total copy time [*ms], slowest copy [*ms],"
+                    + " files in new copies [*], reused copies [*], files in reused copies [*], files reused by name, uploaded ["
+                    + busyReusedUploaded.size()
+                    + "], bytes reused by name, uploaded ["
+                    + busyReusedUploaded.stream().mapToLong(FileInfo::length).sum()
+                    + "], files reused by name, copied ["
+                    + busyReusedCopied.size()
+                    + "], bytes reused by name, copied ["
+                    + busyReusedCopied.stream().mapToLong(FileInfo::length).sum()
+                    + "], uploaded files [*], uploaded bytes [*], dead bytes [*], dead bytes per new copy [*]"
+            )
+        );
+        final Set<String> busyCopiesAtThird = copiedBlobs(repoName, busy, 0);
+        assertTrue(busyCopiesAtThird.containsAll(busyCopies));
+        assertThat(busyCopiesAtThird.size(), greaterThan(busyCopies.size()));
+        assertThat(uploadedBlobs(repoName, busy, 0), equalTo(busyUploads));
+        assertThat(copiedBlobs(repoName, idle, 0), equalTo(idleCopies));
+        assertThat(uploadedBlobs(repoName, idle, 0), empty());
+        assertSameFiles(idleFiles, byName(dataFiles(shardSnapshot(repoName, idle, "third", 0))));
+
+        // every snapshot restores
+        restore(repoName, "first", busy, "busy-first");
+        assertHitCount(prepareSearch("busy-first"), busyDocsAtFirst);
+        restore(repoName, "second", busy, "busy-second");
+        assertHitCount(prepareSearch("busy-second"), busyDocsAtSecond);
+        restore(repoName, "third", busy, "busy-third");
+        assertHitCount(prepareSearch("busy-third"), busyDocsAtThird);
+        for (String snapshotName : List.of("first", "second", "third")) {
+            restore(repoName, snapshotName, idle, "idle-" + snapshotName);
+            assertHitCount(prepareSearch("idle-" + snapshotName), idleDocs);
+        }
+
+        // After the first two snapshots are deleted, the third snapshot still restores, so the deletes kept every blob that the third
+        // snapshot needs. When the third snapshot is deleted too, no copied or uploaded data blob is left in the repository.
+        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, "first", "second").get());
+        restore(repoName, "third", busy, "busy-third-again");
+        assertHitCount(prepareSearch("busy-third-again"), busyDocsAtThird);
+        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, "third").get());
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), empty());
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX), empty());
+    }
+
+    /**
+     * An index is deleted while a shard snapshot of the index is copying a commit blob. A copy call cannot be cancelled once it has
+     * started, so the test lets the blocked copy finish. The shard snapshot was aborted, so its failure cleanup then removes the copy
+     * that the shard snapshot made, and keeps the copies of the earlier snapshot. After the earlier snapshot is deleted, no snapshot in
+     * the repository contains the index, and the whole folder of the index is removed.
+     */
+    public void testIndexDeletedWhileCopying() throws Exception {
+        final Settings settings = copySettings().build();
+        final String indexNode = startMasterAndIndexNode(settings);
+        final String indexName = randomIdentifier();
+        createIndex(indexName, 1, 0);
+        ensureGreen(indexName);
+        indexDocsAndFlush(indexName, between(1, 2));
+        final String repoName = randomIdentifier();
+        final Path location = randomRepoPath();
+        // the snapshot repository uses the mock repository type, so that the copy can be blocked
+        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", location), true);
+        // The earlier snapshot adds the index to the repository data. That gives the index a folder in the repository, which the delete
+        // at the end can remove.
+        createSnapshot(repoName, "earlier", List.of(indexName), List.of());
+        final Set<String> earlierCopies = copiedBlobs(repoName, indexName, 0);
+        assertThat(earlierCopies, not(empty()));
+        final IndexId indexId = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository(repoName)).resolveIndexId(indexName);
+
+        // The later snapshot needs a new copy, which is blocked.
+        indexDocsAndFlush(indexName, 1);
+        final var copyStarted = new CountDownLatch(1);
+        final var releaseCopy = new CountDownLatch(1);
+        final var copyReturned = new CountDownLatch(1);
+        snapshotRepositoryOnNode(repoName, indexNode).setStrategy(new StatelessMockRepositoryStrategy() {
+            @Override
+            public void blobContainerCopyBlob(
+                CheckedRunnable<IOException> originalRunnable,
+                OperationPurpose purpose,
+                BlobContainer sourceBlobContainer,
+                String sourceBlobName,
+                String blobName,
+                long blobSize
+            ) throws IOException {
+                copyStarted.countDown();
+                safeAwait(releaseCopy);
+                originalRunnable.run();
+                copyReturned.countDown();
+            }
+        });
+        final var snapshotFuture = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, repoName, "later")
+            .setIndices(indexName)
+            .setPartial(true)
+            .setWaitForCompletion(true)
+            .execute();
+        safeAwait(copyStarted);
+
+        // The index is deleted while the copy is blocked. The shard snapshot is aborted, and the master drops the index from the snapshot.
+        assertAcked(indicesAdmin().prepareDelete(indexName));
+        releaseCopy.countDown();
+        safeAwait(copyReturned);
+        safeGet(snapshotFuture);
+
+        // The failure cleanup of the aborted shard snapshot removes the copy that the shard snapshot made, and keeps the copies of the
+        // earlier snapshot.
+        assertBusy(() -> assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(earlierCopies)));
+
+        // After the earlier snapshot is deleted, no snapshot in the repository contains the index, so the delete removes the whole folder
+        // of the index.
+        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, "earlier").get());
+        assertFalse(Files.exists(location.resolve("indices").resolve(indexId.getId())));
+    }
+
+    /**
+     * A snapshot fails during finalization, after its shard snapshot is done. The shard snapshot has left its blobs in the shard's
+     * folder, among them a copy of a commit blob. The repository data does not name the failed snapshot, so no snapshot in the repository
+     * refers to that copy.
+     * <p>
+     * A later snapshot copies the same commit blob again, because the shard generation it starts from does not refer to the failed
+     * snapshot's copy. Then the shard generation is lost. The next snapshot rebuilds it from the {@code snap-<uuid>.dat} blobs, among
+     * them the blob of the failed snapshot. The rebuilt shard generation holds two copies of the same commit blob, and the next snapshot
+     * has to pick one of the two without failing.
+     * <p>
+     * Every snapshot that is left can be restored, and every copied blob that is left is referred to by one of those snapshots. Java
+     * assertions are on in tests, except the integrity assertions that the test turns off. So an assertion that wrongly rejects two
+     * copies of the same commit blob would fail the snapshot.
+     */
+    public void testRebuildOfMissingShardGenerationKeepsCopies() throws Exception {
+        final Settings settings = copySettings().build();
+        final String node = startMasterAndIndexNode(settings);
+        startSearchNode(settings);
+        final String indexName = randomIdentifier();
+        createIndex(indexName, 1, 1);
+        ensureGreen(indexName);
+        long docCount = indexDocsAndFlush(indexName, 1);
+        final String repoName = randomIdentifier();
+        final Path location = randomRepoPath();
+        // the snapshot repository uses the mock repository type, so that the finalization of a snapshot can fail
+        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", location), true);
+        // The base snapshot adds the index to the repository data, so later snapshots of the index use the same folder in the repository.
+        createSnapshot(repoName, "base", List.of(indexName), List.of());
+
+        // The snapshot fails after its shard snapshot is done: every write of a meta-<uuid>.dat blob fails, and finalization starts with
+        // those writes.
+        docCount += indexDocsAndFlush(indexName, 1);
+        final var failFinalization = new AtomicBoolean(true);
+        snapshotRepositoryOnNode(repoName, node).setStrategy(new StatelessMockRepositoryStrategy() {
+            @Override
+            public void blobContainerWriteMetadataBlob(
+                CheckedRunnable<IOException> original,
+                OperationPurpose purpose,
+                String blobName,
+                boolean failIfAlreadyExists,
+                boolean atomic,
+                CheckedConsumer<OutputStream, IOException> writer
+            ) throws IOException {
+                if (failFinalization.get() && blobName.startsWith("meta-")) {
+                    throw new IOException("simulated failure of the finalization of a snapshot");
+                }
+                original.run();
+            }
+        });
+        expectThrows(
+            Exception.class,
+            () -> clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, repoName, "failed")
+                .setIndices(indexName)
+                .setWaitForCompletion(true)
+                .get()
+        );
+        failFinalization.set(false);
+        // the failed snapshot left the copy of the new commit blob behind, next to the copy of the base snapshot
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), hasSize(2));
+
+        // This snapshot starts from the shard generation that the repository data names. That generation does not refer to the failed
+        // snapshot's copy, so the snapshot copies the commit blob again.
+        createSnapshot(repoName, "second", List.of(indexName), List.of());
+        final long docsAtSecond = docCount;
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), hasSize(3));
+
+        // lose the shard generation that the repository data names
+        final BlobStoreRepository repository = repository(repoName);
+        final RepositoryData repositoryData = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository);
+        final IndexId indexId = repositoryData.resolveIndexId(indexName);
+        final String shardGeneration = repositoryData.shardGenerations().getShardGen(indexId, 0).getGenerationUUID();
+        Files.delete(
+            location.resolve("indices")
+                .resolve(indexId.getId())
+                .resolve("0")
+                .resolve(BlobStoreRepository.SNAPSHOT_INDEX_PREFIX + shardGeneration)
+        );
+
+        // The next snapshot finds that the shard generation blob is missing. The repository treats that as damage, and in tests an
+        // assertion fails the snapshot when it happens, so the test turns that assertion off. The repository then logs an error and
+        // rebuilds the generation from the snap-<uuid>.dat blobs, among them the blob of the failed snapshot. This snapshot then needs a
+        // new copy.
+        docCount += indexDocsAndFlush(indexName, 1);
+        try (
+            var ignored = new BlobStoreIndexShardSnapshotsIntegritySuppressor();
+            var mockLog = MockLog.capture(BlobStoreRepository.class)
+        ) {
+            mockLog.addExpectation(
+                new MockLog.SeenEventExpectation(
+                    "fallback message",
+                    BlobStoreRepository.class.getCanonicalName(),
+                    Level.ERROR,
+                    "index ["
+                        + indexName
+                        + "/*] shard generation [*] in [*"
+                        + repoName
+                        + "][*] not found "
+                        + "- falling back to reading all shard snapshots"
+                )
+            );
+            // If an assertion fails inside the shard snapshot, the snapshot never finishes, and the wait below fails the test.
+            final SnapshotInfo thirdSnapshot = safeGet(
+                clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, repoName, "third")
+                    .setIndices(indexName)
+                    .setWaitForCompletion(true)
+                    .execute()
+            ).getSnapshotInfo();
+            assertThat(thirdSnapshot.state(), equalTo(SnapshotState.SUCCESS));
+            mockLog.assertAllExpectationsMatched();
+        }
+        final long docsAtThird = docCount;
+
+        // Delete an older snapshot. The snapshots that are left restore, and no copy is left that none of them refers to.
+        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, "base").get());
+        restore(repoName, "second", indexName, "restored-second");
+        assertHitCount(prepareSearch("restored-second"), docsAtSecond);
+        restore(repoName, "third", indexName, "restored-third");
+        assertHitCount(prepareSearch("restored-third"), docsAtThird);
+        final Set<String> referencedCopies = new HashSet<>();
+        for (String snapshotName : List.of("second", "third")) {
+            dataFiles(shardSnapshot(repoName, indexName, snapshotName, 0)).forEach(fileInfo -> referencedCopies.add(fileInfo.blob()));
+        }
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(referencedCopies));
+    }
+
+    /**
+     * A TLA+ model of the design found this sequence of steps. The sequence loses a copy in a design that names each copy after its
+     * commit blob:
+     * <ol>
+     * <li>The first snapshot copies a commit blob.</li>
+     * <li>A delete removes the first snapshot. The delete has listed the shard's folder, written the new shard generation and the new
+     * repository data, and is no longer in the cluster state. It still has to remove the blobs that it found, among them the copy.</li>
+     * <li>The second snapshot starts from the new shard generation, which holds no copy of the commit blob, so it needs the commit blob
+     * again. With a name derived from the commit blob, the second snapshot copies to the same name as the first copy.</li>
+     * <li>The delete removes the blobs that it found, among them the second snapshot's copy.</li>
+     * </ol>
+     * Copy names are random, so the second snapshot's copy has a different name, and the delete does not remove it. The test takes a base
+     * snapshot first. It keeps the index in the repository data after the first snapshot is deleted, so the second snapshot writes into
+     * the same shard folder that the delete is cleaning.
+     */
+    public void testDeleteThatIsStillRemovingBlobsKeepsTheCopyOfALaterSnapshot() throws Exception {
+        // a blocked delete holds a snapshot thread, so leave enough of them for the second snapshot
+        final Settings settings = copySettings().put("thread_pool.snapshot.max", 10).build();
+        final String node = startMasterAndIndexNode(settings);
+        startSearchNode(settings);
+        final String indexName = randomIdentifier();
+        createIndex(indexName, 1, 1);
+        ensureGreen(indexName);
+        long docCount = indexDocsAndFlush(indexName, 1);
+        final String repoName = randomIdentifier();
+        final Path location = randomRepoPath();
+        // the snapshot repository uses the mock repository type, so that the delete can be blocked
+        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", location), true);
+        createSnapshot(repoName, "base", List.of(indexName), List.of());
+        final Set<String> baseCopies = blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX);
+
+        // 1. The first snapshot copies the commit blob of its new files.
+        docCount += indexDocsAndFlush(indexName, 1);
+        createSnapshot(repoName, "first", List.of(indexName), List.of());
+        final Set<String> firstCopies = difference(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), baseCopies);
+        assertThat(firstCopies, not(empty()));
+
+        // 2. The delete of the first snapshot is blocked just before it removes blobs. By then it has written the new repository data.
+        // The master removes the delete from the cluster state without waiting for the blobs, so the test waits for that. A new snapshot
+        // starts only when no delete is in the cluster state.
+        final var deleteBlocked = new CountDownLatch(1);
+        final var releaseDelete = new CountDownLatch(1);
+        snapshotRepositoryOnNode(repoName, node).setStrategy(new StatelessMockRepositoryStrategy() {
+            @Override
+            public void blobStoreDeleteBlobsIgnoringIfNotExists(
+                CheckedRunnable<IOException> originalRunnable,
+                OperationPurpose purpose,
+                Iterator<String> blobNames
+            ) throws IOException {
+                // block the removal of the shard's blobs, which include the copies
+                if (blobNames.hasNext() && blobNamesHaveCopy(blobNames)) {
+                    deleteBlocked.countDown();
+                    safeAwait(releaseDelete);
+                }
+                originalRunnable.run();
+            }
+        });
+        final var deleteFuture = clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, "first").execute();
+        safeAwait(deleteBlocked);
+        awaitClusterState(state -> SnapshotDeletionsInProgress.get(state).hasDeletionsInProgress() == false);
+
+        // 3. The second snapshot needs the same commit blob again, and copies it to a new name.
+        createSnapshot(repoName, "second", List.of(indexName), List.of());
+        final Set<String> secondCopies = difference(
+            blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX),
+            union(baseCopies, firstCopies)
+        );
+        assertThat(secondCopies, not(empty()));
+
+        // 4. The delete removes the blobs that it found, which are the copies of the first snapshot, and none of the second snapshot's.
+        releaseDelete.countDown();
+        assertAcked(safeGet(deleteFuture));
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(union(baseCopies, secondCopies)));
+        restore(repoName, "second", indexName, "restored-second");
+        assertHitCount(prepareSearch("restored-second"), docCount);
+    }
+
+    /**
+     * A TLA+ model of the design found this sequence of steps for a bad design, in which the failure cleanup of a snapshot deletes the
+     * blob that each new file info points at:
+     * <ol>
+     * <li>The first snapshot needs file f1 and copies the commit blob that holds it. That commit blob also holds file f2.</li>
+     * <li>The second snapshot needs f1, f2 and a file f3 that lives in another commit blob. It reuses the file info of f1. The first
+     * snapshot does not list f2, so f2 is new to the second snapshot. A copy of the commit blob of f2 already exists, so the new file
+     * info of f2 points at that copy. The second snapshot copies the commit blob of f3 under a new name.</li>
+     * <li>The second snapshot fails. The bad cleanup deletes the blob of every new file info, so it deletes the copy that the first
+     * snapshot refers to.</li>
+     * </ol>
+     * The real cleanup deletes only the copies that the failed snapshot made, so the copy of the first snapshot stays. To make f2 new to
+     * the second snapshot, the test rewrites the first shard snapshot so that it does not list f2.
+     */
+    public void testFailedSnapshotCleanupKeepsTheCopyOfAnEarlierSnapshot() throws Exception {
+        final Settings settings = copySettings()
+            // one commit in each commit blob, so that each flush makes a commit blob of its own
+            .put(StatelessCommitService.STATELESS_UPLOAD_MAX_AMOUNT_COMMITS.getKey(), 1)
+            .build();
+        final String node = startMasterAndIndexNode(settings);
+        startSearchNode(settings);
+        final String indexName = randomIdentifier();
+        // no merges, so that the files of the first commit are still there for the second snapshot
+        createIndex(indexName, indexSettings(1, 1).put(InternalSettingsPlugin.MERGE_ENABLED.getKey(), false).build());
+        ensureGreen(indexName);
+        long docCount = indexDocsAndFlush(indexName, 1);
+        final String repoName = randomIdentifier();
+        final Path location = randomRepoPath();
+        // the snapshot repository uses the mock repository type, so that a copy can fail
+        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", location), true);
+
+        // 1. The first snapshot copies the commit blob of the first commit, which holds at least two data files.
+        createSnapshot(repoName, "first", List.of(indexName), List.of());
+        final Set<String> firstCopies = copiedBlobs(repoName, indexName, 0);
+        assertThat(firstCopies, hasSize(1));
+        final String firstCopy = firstCopies.iterator().next();
+        final long firstCopyLength = Files.size(
+            location.resolve("indices").resolve(indexId(repoName, indexName)).resolve("0").resolve(firstCopy)
+        );
+        final List<FileInfo> firstFiles = dataFiles(shardSnapshot(repoName, indexName, "first", 0));
+        assertThat(firstFiles.size(), greaterThanOrEqualTo(2));
+        // A real commit blob can hold the files of several commits, so a snapshot of an earlier commit can copy files that it does not
+        // list. Here each commit blob holds one commit, so the test builds that state by rewriting the first shard snapshot to list only
+        // one of the data files of its commit.
+        final String hiddenFile = firstFiles.get(0).physicalName();
+        final BlobStoreRepository repository = repository(repoName);
+        final RepositoryData repositoryData = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository);
+        final IndexId indexId = repositoryData.resolveIndexId(indexName);
+        BlobStoreTestUtil.rewriteShardSnapshotFiles(
+            repository,
+            indexId,
+            0,
+            repositoryData.shardGenerations().getShardGen(indexId, 0),
+            snapshotId(repositoryData, "first"),
+            fileInfo -> fileInfo.physicalName().equals(hiddenFile) ? null : fileInfo
+        );
+
+        // 2. The second snapshot has a new commit with a new commit blob. The copy of that commit blob fails, so the shard snapshot
+        // fails.
+        docCount += indexDocsAndFlush(indexName, 1);
+        snapshotRepositoryOnNode(repoName, node).setStrategy(new StatelessMockRepositoryStrategy() {
+            @Override
+            public void blobContainerCopyBlob(
+                CheckedRunnable<IOException> originalRunnable,
+                OperationPurpose purpose,
+                BlobContainer sourceBlobContainer,
+                String sourceBlobName,
+                String blobName,
+                long blobSize
+            ) throws IOException {
+                throw new IOException("simulated copy failure");
+            }
+        });
+        final CreateSnapshotResponse failed = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, repoName, "second")
+            .setIndices(indexName)
+            .setPartial(true)
+            .setWaitForCompletion(true)
+            .get();
+        assertThat(failed.getSnapshotInfo().failedShards(), equalTo(1));
+        snapshotRepositoryOnNode(repoName, node).setStrategy(StatelessMockRepositoryStrategy.DEFAULT);
+
+        // 3. The cleanup of the failed shard snapshot did not delete the copy that the first snapshot refers to, and left it as it was.
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(firstCopies));
+        assertThat(
+            Files.size(location.resolve("indices").resolve(indexId.getId()).resolve("0").resolve(firstCopy)),
+            equalTo(firstCopyLength)
+        );
+
+        // A later snapshot works, and reuses that copy for the file that the first snapshot did not list.
+        createSnapshot(repoName, "third", List.of(indexName), List.of());
+        final List<FileInfo> thirdFiles = dataFiles(shardSnapshot(repoName, indexName, "third", 0));
+        assertTrue(
+            "the hidden file does not use the copy of the first snapshot: " + thirdFiles,
+            thirdFiles.stream().anyMatch(fileInfo -> fileInfo.physicalName().equals(hiddenFile) && firstCopy.equals(fileInfo.blob()))
+        );
+        restore(repoName, "third", indexName, "restored-third");
+        assertHitCount(prepareSearch("restored-third"), docCount);
+    }
+
+    /**
+     * Whether the blob names that a delete removes include a copied blob. A delete names each blob of a shard by its path from the
+     * repository root, such as {@code indices/<index id>/<shard>/<blob>}. The failure cleanup of a shard snapshot uses plain blob names
+     * with no folder, so the check for {@code /c__} does not match it. The method reads names up to the first copied blob. That is safe
+     * in the hook, because the mock repository gives the hook its own copy of the names.
+     */
+    private static boolean blobNamesHaveCopy(Iterator<String> blobNames) {
+        while (blobNames.hasNext()) {
+            if (blobNames.next().contains("/" + BlobStoreRepository.COPIED_DATA_BLOB_PREFIX)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Set<String> difference(Set<String> all, Set<String> removed) {
+        return all.stream().filter(name -> removed.contains(name) == false).collect(Collectors.toSet());
+    }
+
+    private static Set<String> union(Set<String> first, Set<String> second) {
+        return Stream.concat(first.stream(), second.stream()).collect(Collectors.toSet());
+    }
+
+    private static String indexId(String repoName, String indexName) {
+        return ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository(repoName)).resolveIndexId(indexName).getId();
+    }
+
+    private static void assertSameFiles(Map<String, FileInfo> expected, Map<String, FileInfo> actual) {
+        assertThat(actual.keySet(), equalTo(expected.keySet()));
+        for (Map.Entry<String, FileInfo> entry : expected.entrySet()) {
+            assertTrue(
+                entry.getValue() + " is not the same as " + actual.get(entry.getKey()),
+                entry.getValue().isSame(actual.get(entry.getKey()))
+            );
+        }
+    }
+
+    private Set<String> uploadedBlobs(String repoName, String indexName, int shard) throws IOException {
+        final BlobStoreRepository repository = repository(repoName);
+        final IndexId indexId = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository).resolveIndexId(indexName);
+        return repository.shardContainer(indexId, shard)
+            .listBlobs(OperationPurpose.SNAPSHOT_METADATA)
+            .keySet()
+            .stream()
+            .filter(name -> name.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX))
+            .collect(Collectors.toSet());
+    }
+
+    /**
+     * The names of the blobs that start with the given prefix, anywhere in the directory of a repository that stores its blobs as files,
+     * which is an {@code fs} repository or the mock repository. This reads the files directly, so it does not depend on the repository
+     * code that the test checks.
+     */
+    private static Set<String> blobsWithPrefix(Path location, String prefix) throws IOException {
+        try (Stream<Path> paths = Files.walk(location)) {
+            return paths.filter(Files::isRegularFile)
+                .map(path -> path.getFileName().toString())
+                .filter(name -> name.startsWith(prefix))
+                .collect(Collectors.toSet());
+        }
     }
 
     private long indexDocsAndFlush(String indexName, int segments) {
