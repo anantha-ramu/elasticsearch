@@ -4042,13 +4042,14 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             copyMillis = threadPool.rawRelativeTimeInMillis() - startMillis;
             copyStats.onCopy(copyMillis, blobLength);
             commitRef.maybeReleaseCommitRef();
-            logger.trace(
-                "[{}] copied [{}] of size [{}b] to [{}][{}] in [{}ms]",
+            logger.debug(
+                "[{}][{}]{} copied blob [{}] from [{}]: [{}] bytes in [{}ms]",
                 metadata.name(),
+                context.snapshotId(),
+                context.shardId(),
+                newCopy.blobName(),
                 source.source(),
                 blobLength,
-                shardContainer.path(),
-                newCopy.blobName(),
                 copyMillis
             );
         }

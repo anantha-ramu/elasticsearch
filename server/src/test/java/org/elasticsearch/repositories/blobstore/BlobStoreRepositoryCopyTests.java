@@ -60,6 +60,7 @@ import org.elasticsearch.snapshots.PausedSnapshotException;
 import org.elasticsearch.snapshots.Snapshot;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.MockLog;
+import org.elasticsearch.test.junit.annotations.TestLogging;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -175,6 +176,53 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             assertThat(status.asCopy().getProcessedFileCount(), equalTo(status.asCopy().getIncrementalFileCount()));
 
             shardAndRepository.restoreAndCheck(snapshot);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    /**
+     * Each copy of a commit blob is logged at debug with the name of the copy, its size and the time that the copy call took. A run can
+     * then show which copies were slow.
+     */
+    @TestLogging(reason = "the copies are logged at debug", value = "org.elasticsearch.repositories.blobstore.BlobStoreRepository:DEBUG")
+    public void testEachCopyIsLoggedAtDebug() throws IOException {
+        final var shardAndRepository = new ShardAndRepository();
+        try {
+            shardAndRepository.indexSegments(between(2, 4));
+            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
+                between(1, 3),
+                name -> true,
+                0
+            );
+            final Snapshot snapshot = shardAndRepository.newSnapshot();
+            final Map<String, BlobMetadata> objectStoreBlobs = shardAndRepository.objectStore.listBlobs(OperationPurpose.SNAPSHOT_METADATA);
+            final Map<String, String> blobNameBySource = new HashMap<>();
+            for (SnapshotShardContext.CopySource source : sources.values()) {
+                blobNameBySource.put(source.source(), source.blobName());
+            }
+            // one line for each commit blob, with the length of the commit blob, which the copy has as well
+            final List<MockLog.LoggingExpectation> expectations = new ArrayList<>();
+            for (Map.Entry<String, String> entry : blobNameBySource.entrySet()) {
+                expectations.add(
+                    new MockLog.SeenEventExpectation(
+                        "copy of " + entry.getKey(),
+                        BlobStoreRepository.class.getCanonicalName(),
+                        Level.DEBUG,
+                        shardAndRepository.logPrefix(snapshot)
+                            + " copied blob [c__*] from ["
+                            + entry.getKey()
+                            + "]: ["
+                            + objectStoreBlobs.get(entry.getValue()).length()
+                            + "] bytes in [*ms]"
+                    )
+                );
+            }
+            MockLog.assertThatLogger(
+                () -> runUnchecked(() -> shardAndRepository.snapshot(snapshot, sources::get)),
+                BlobStoreRepository.class,
+                expectations.toArray(MockLog.LoggingExpectation[]::new)
+            );
         } finally {
             shardAndRepository.close();
         }
@@ -660,7 +708,14 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
          * numbers.
          */
         String copyStatsPrefix(Snapshot snapshot) {
-            return "[" + repository.getMetadata().name() + "][" + snapshot.getSnapshotId() + "]" + shardId + " shard snapshot copy stats";
+            return logPrefix(snapshot) + " shard snapshot copy stats";
+        }
+
+        /**
+         * The start of every log line of a shard snapshot of this shard that names the repository, the snapshot and the shard.
+         */
+        String logPrefix(Snapshot snapshot) {
+            return "[" + repository.getMetadata().name() + "][" + snapshot.getSnapshotId() + "]" + shardId;
         }
 
         long fileLength(String file) throws IOException {
