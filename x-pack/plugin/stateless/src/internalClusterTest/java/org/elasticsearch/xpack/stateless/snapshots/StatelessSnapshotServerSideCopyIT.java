@@ -8,10 +8,14 @@
 package org.elasticsearch.xpack.stateless.snapshots;
 
 import org.apache.logging.log4j.Level;
+import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotResponse;
 import org.elasticsearch.action.admin.cluster.snapshots.restore.RestoreSnapshotResponse;
 import org.elasticsearch.cluster.SnapshotDeletionsInProgress;
+import org.elasticsearch.cluster.SnapshotsInProgress;
+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;
 import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.settings.Settings;
@@ -36,6 +40,7 @@ import org.elasticsearch.snapshots.SnapshotInfo;
 import org.elasticsearch.snapshots.SnapshotState;
 import org.elasticsearch.test.InternalSettingsPlugin;
 import org.elasticsearch.test.MockLog;
+import org.elasticsearch.test.NodeShutdownTestUtils;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.threadpool.ThreadPoolStats;
 import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
@@ -55,6 +60,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -895,6 +901,291 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         );
         restore(repoName, "third", indexName, "restored-third");
         assertHitCount(prepareSearch("restored-third"), docCount);
+    }
+
+    /**
+     * A node that runs a shard snapshot gets a shutdown marker (type SIGTERM) while the snapshot copies a commit blob. The marker makes
+     * the shard snapshot pause, so that the master can give it to another node. A copy call cannot be interrupted, so the pause can start
+     * only after the call returns. The test holds the copy call before it makes the copy, marks the node, waits until the node has seen
+     * the marker, and only then lets the call run. Each run of a shard snapshot on a node is an attempt. The first attempt pauses,
+     * deletes the copy it made, and logs the copies it made and the time they took. The master then gives the shard snapshot to the
+     * second index node, and the attempt there makes its own copies. At the end the snapshot can be restored, and no copy is left that
+     * the snapshot does not refer to.
+     */
+    public void testShutdownMarkerPausesTheShardSnapshotAfterTheCopy() throws Exception {
+        // copySettings() picks this setting at random. Only "enabled" lets a shard snapshot run on a node that does not host the primary.
+        final Settings settings = copySettings().put(STATELESS_SNAPSHOT_ENABLED_SETTING.getKey(), "enabled").build();
+        startMasterOnlyNode(settings);
+        final String pausedNode = startIndexNode(settings);
+        startSearchNode(settings);
+        final String indexName = randomIdentifier();
+        createIndex(indexName, 1, 1);
+        ensureGreen(indexName);
+        final long docCount = indexDocsAndFlush(indexName, between(1, 2));
+        // A second index node. The shard snapshot moves to it when pausedNode pauses.
+        startIndexNode(settings);
+        ensureStableCluster(4);
+        final String repoName = randomIdentifier();
+        // the snapshot repository uses the mock repository type, so that the copy can be blocked
+        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", randomRepoPath()), true);
+        final var copyStarted = new CountDownLatch(1);
+        final var releaseCopy = new CountDownLatch(1);
+        snapshotRepositoryOnNode(repoName, pausedNode).setStrategy(blockCopies(copyStarted, releaseCopy));
+
+        MockLog.assertThatLogger(() -> {
+            final var snapshotFuture = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, repoName, "snap")
+                .setIndices(indexName)
+                .setPartial(true)
+                .setWaitForCompletion(true)
+                .execute();
+            safeAwait(copyStarted);
+            // Wait until the paused node itself has seen that it must pause. The copy call is still held, so the pause cannot start until
+            // the call runs and returns.
+            NodeShutdownTestUtils.putShutdownMetadata(
+                pausedNode,
+                internalCluster().getCurrentMasterNodeInstance(ClusterService.class),
+                EnumSet.of(SingleNodeShutdownMetadata.Type.SIGTERM)
+            );
+            awaitClusterState(pausedNode, state -> SnapshotsInProgress.get(state).isNodeIdForRemoval(getNodeId(pausedNode)));
+            // The copy call runs and returns, the attempt pauses, and the second index node runs the shard snapshot.
+            releaseCopy.countDown();
+            assertThat(safeGet(snapshotFuture).getSnapshotInfo().state(), equalTo(SnapshotState.SUCCESS));
+        },
+            BlobStoreRepository.class,
+            new MockLog.SeenEventExpectation(
+                "copy stats of the paused attempt",
+                BlobStoreRepository.class.getCanonicalName(),
+                Level.INFO,
+                "["
+                    + repoName
+                    + "][snap/*]["
+                    + indexName
+                    + "][*] shard snapshot copy stats: attempt [paused], copies made [*], copied bytes [*], total copy time [*ms]"
+            )
+        );
+
+        // Only the copies that the snapshot refers to are left, so the paused attempt has deleted its copy.
+        assertAllDataFilesCopied(repoName, indexName, "snap");
+        restore(repoName, "snap", indexName, "restored");
+        assertHitCount(prepareSearch("restored"), docCount);
+    }
+
+    /**
+     * A node makes a copy for a shard snapshot and then crashes. No file info refers to the copy, and the node never deletes it. The next
+     * delete of a snapshot that has this shard lists the shard folder and removes every copy that no remaining snapshot refers to, so it
+     * removes this copy too. The test cannot crash a node at exactly this point, so it fakes the crash. It lets the copy finish, then
+     * makes the copy call fail and every blob delete on that node fail. The shard snapshot fails and its cleanup cannot remove the copy.
+     * A crash leaves the same unreferenced copy behind.
+     */
+    public void testCopyOfACrashedNodeIsRemovedByTheNextDelete() throws Exception {
+        final Settings settings = copySettings().build();
+        startMasterOnlyNode(settings);
+        final String indexNode = startIndexNode(settings);
+        startSearchNode(settings);
+        final String indexName = randomIdentifier();
+        createIndex(indexName, 1, 1);
+        ensureGreen(indexName);
+        final long docCountOfKept = indexDocsAndFlush(indexName, 1);
+        final String repoName = randomIdentifier();
+        final Path location = randomRepoPath();
+        // the snapshot repository uses the mock repository type, so that the node can be made to fail
+        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", location), true);
+        createSnapshot(repoName, "kept", List.of(indexName), List.of());
+        final Set<String> keptCopies = blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX);
+        assertThat(keptCopies, not(empty()));
+        indexDocsAndFlush(indexName, 1);
+        createSnapshot(repoName, "deleted", List.of(indexName), List.of());
+        final Set<String> deletedCopies = difference(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), keptCopies);
+        assertThat(deletedCopies, not(empty()));
+
+        // The third snapshot makes a copy, and then its node "crashes". The copy call fails, and so does every blob delete on that node,
+        // including the cleanup of the failed shard snapshot.
+        indexDocsAndFlush(indexName, 1);
+        final var copyDone = new CountDownLatch(1);
+        final var crash = new CountDownLatch(1);
+        final var crashed = new AtomicBoolean();
+        snapshotRepositoryOnNode(repoName, indexNode).setStrategy(new StatelessMockRepositoryStrategy() {
+            @Override
+            public void blobContainerCopyBlob(
+                CheckedRunnable<IOException> originalRunnable,
+                OperationPurpose purpose,
+                BlobContainer sourceBlobContainer,
+                String sourceBlobName,
+                String blobName,
+                long blobSize
+            ) throws IOException {
+                originalRunnable.run();
+                copyDone.countDown();
+                safeAwait(crash);
+                throw new IOException("the node crashed");
+            }
+
+            @Override
+            public void blobStoreDeleteBlobsIgnoringIfNotExists(
+                CheckedRunnable<IOException> originalRunnable,
+                OperationPurpose purpose,
+                Iterator<String> blobNames
+            ) throws IOException {
+                if (crashed.get()) {
+                    throw new IOException("the node crashed");
+                }
+                originalRunnable.run();
+            }
+        });
+        final var crashedSnapshotFuture = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, repoName, "crashed")
+            .setIndices(indexName)
+            .setPartial(true)
+            .setWaitForCompletion(true)
+            .execute();
+        safeAwait(copyDone);
+        crashed.set(true);
+        crash.countDown();
+        assertThat(safeGet(crashedSnapshotFuture).getSnapshotInfo().state(), equalTo(SnapshotState.PARTIAL));
+        // An orphan is a copy that no file info refers to. The crashed snapshot left one.
+        final Set<String> orphans = difference(
+            blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX),
+            union(keptCopies, deletedCopies)
+        );
+        assertThat(orphans, not(empty()));
+
+        // The delete of the second snapshot removes its own copies and the orphan, and it keeps the copies of the first snapshot.
+        assertAcked(safeGet(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, "deleted").execute()));
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(keptCopies));
+        restore(repoName, "kept", indexName, "restored");
+        assertHitCount(prepareSearch("restored"), docCountOfKept);
+    }
+
+    /**
+     * The master changes while a delete is about to write the new repository data. Until that write, the delete has only added blobs,
+     * such as new shard generations, and the cluster state still lists the delete as in progress. The new master runs the delete again
+     * and finishes it. Then a new snapshot runs under the new master and makes copies of its own. After that the test lets the blocked
+     * write of the old master continue. That late write must not remove the copies of the new snapshot. The test checks that these copies
+     * are still there and that each remaining snapshot can be restored.
+     */
+    public void testMasterFailoverDuringDelete() throws Exception {
+        final Settings settings = copySettings().build();
+        startMasterOnlyNode(settings);
+        startMasterOnlyNode(settings);
+        startIndexNode(settings);
+        startSearchNode(settings);
+        ensureStableCluster(4);
+        final String indexName = randomIdentifier();
+        createIndex(indexName, 1, 1);
+        ensureGreen(indexName);
+        final long docCountOfBase = indexDocsAndFlush(indexName, 1);
+        final String repoName = randomIdentifier();
+        final Path location = randomRepoPath();
+        // the snapshot repository uses the mock repository type, so that the delete can be blocked
+        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", location), true);
+        createSnapshot(repoName, "base", List.of(indexName), List.of());
+        final Set<String> baseCopies = blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX);
+        assertThat(baseCopies, not(empty()));
+        final long docCountOfDeleted = docCountOfBase + indexDocsAndFlush(indexName, 1);
+        createSnapshot(repoName, "deleted", List.of(indexName), List.of());
+        assertThat(difference(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), baseCopies), not(empty()));
+
+        // The delete of the second snapshot is blocked on the master, right before it writes the new repository data.
+        final String oldMaster = internalCluster().getMasterName();
+        final var writeBlocked = new CountDownLatch(1);
+        final var releaseWrite = new CountDownLatch(1);
+        snapshotRepositoryOnNode(repoName, oldMaster).setStrategy(new StatelessMockRepositoryStrategy() {
+            @Override
+            public void blobContainerWriteMetadataBlob(
+                CheckedRunnable<IOException> original,
+                OperationPurpose purpose,
+                String blobName,
+                boolean failIfAlreadyExists,
+                boolean atomic,
+                CheckedConsumer<OutputStream, IOException> writer
+            ) throws IOException {
+                // The repository data is the root blob index-N, where N is a number. A shard generation is index-<uuid>, so the pattern
+                // skips it.
+                if (blobName.matches("index-\\d+")) {
+                    writeBlocked.countDown();
+                    safeAwait(releaseWrite);
+                }
+                original.run();
+            }
+        });
+        // The test does not use the result of this request. The master changes while it runs, so it can succeed or fail.
+        clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, "deleted").execute();
+        safeAwait(writeBlocked);
+
+        // Mark the old master for shutdown. In stateless, a node with a shutdown marker may not win an election, so the old master hands
+        // over to the other master, which then runs the delete again.
+        final var masterClusterService = internalCluster().getCurrentMasterNodeInstance(ClusterService.class);
+        safeAwait(
+            (ActionListener<Void> listener) -> NodeShutdownTestUtils.putShutdownMetadata(
+                masterClusterService,
+                SingleNodeShutdownMetadata.builder()
+                    .setType(SingleNodeShutdownMetadata.Type.SIGTERM)
+                    .setStartedAtMillis(masterClusterService.threadPool().absoluteTimeInMillis())
+                    .setReason("test")
+                    .setGracePeriod(TimeValue.timeValueSeconds(60)),
+                oldMaster,
+                listener
+            )
+        );
+        awaitMasterNode();
+        assertThat(internalCluster().getMasterName(), not(equalTo(oldMaster)));
+        awaitClusterState(state -> SnapshotDeletionsInProgress.get(state).hasDeletionsInProgress() == false);
+        assertBusy(() -> assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(baseCopies)));
+
+        // A snapshot that runs under the new master makes copies.
+        final long docCountOfAfter = docCountOfDeleted + indexDocsAndFlush(indexName, 1);
+        createSnapshot(repoName, "after", List.of(indexName), List.of());
+        final Set<String> afterCopies = difference(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), baseCopies);
+        assertThat(afterCopies, not(empty()));
+
+        // Let the blocked write of the old master continue. The cluster state names a newer generation of the repository data, which the
+        // new master wrote, and the old master can no longer change the cluster state. So the delete of the old master fails before it
+        // removes any blob.
+        releaseWrite.countDown();
+        assertSnapshotThreadPoolIdle(oldMaster);
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(union(baseCopies, afterCopies)));
+        restore(repoName, "base", indexName, "restored-base");
+        assertHitCount(prepareSearch("restored-base"), docCountOfBase);
+        restore(repoName, "after", indexName, "restored-after");
+        assertHitCount(prepareSearch("restored-after"), docCountOfAfter);
+    }
+
+    /**
+     * Returns a strategy that holds each copy of a commit blob. When the copy call starts, it counts down {@code copyStarted}. It then
+     * waits for {@code releaseCopy} before it makes the copy.
+     */
+    private static StatelessMockRepositoryStrategy blockCopies(CountDownLatch copyStarted, CountDownLatch releaseCopy) {
+        return new StatelessMockRepositoryStrategy() {
+            @Override
+            public void blobContainerCopyBlob(
+                CheckedRunnable<IOException> originalRunnable,
+                OperationPurpose purpose,
+                BlobContainer sourceBlobContainer,
+                String sourceBlobName,
+                String blobName,
+                long blobSize
+            ) throws IOException {
+                if (blobName.startsWith(BlobStoreRepository.COPIED_DATA_BLOB_PREFIX)) {
+                    copyStarted.countDown();
+                    safeAwait(releaseCopy);
+                }
+                originalRunnable.run();
+            }
+        };
+    }
+
+    /**
+     * Waits until the node's snapshot thread pool has no task running and none queued. The tests use it to wait for snapshot work, such
+     * as the blob deletes after a snapshot delete.
+     */
+    private static void assertSnapshotThreadPoolIdle(String nodeName) throws Exception {
+        assertBusy(() -> {
+            for (ThreadPoolStats.Stats stats : internalCluster().getInstance(ThreadPool.class, nodeName).stats()) {
+                if (stats.name().equals(ThreadPool.Names.SNAPSHOT)) {
+                    assertThat(stats.active(), equalTo(0));
+                    assertThat(stats.queue(), equalTo(0));
+                }
+            }
+        });
     }
 
     /**
