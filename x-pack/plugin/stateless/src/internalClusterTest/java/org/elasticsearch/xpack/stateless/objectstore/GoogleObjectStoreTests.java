@@ -12,6 +12,7 @@ import fixture.gcs.GoogleCloudStorageHttpHandler;
 import fixture.gcs.TestUtils;
 
 import com.google.cloud.storage.Storage;
+import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 
 import org.elasticsearch.cluster.metadata.ProjectId;
@@ -23,6 +24,7 @@ import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.settings.MockSecureSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.CollectionUtils;
+import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.repositories.RepositoryStats;
@@ -36,6 +38,7 @@ import org.mockito.Mockito;
 
 import java.io.IOException;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
@@ -51,6 +54,9 @@ import static org.mockito.Mockito.doAnswer;
 
 public class GoogleObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
 
+    @SuppressForbidden(reason = "this test uses a HttpServer to emulate a GCS endpoint")
+    private InterceptableGcsHttpHandler gcsHttpHandler;
+
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
         return CollectionUtils.appendToCopy(super.nodePlugins(), TestGoogleCloudStoragePlugin.class);
@@ -58,7 +64,8 @@ public class GoogleObjectStoreTests extends AbstractMockObjectStoreIntegTestCase
 
     @Override
     protected Map<String, HttpHandler> createHttpHandlers() {
-        return Map.of("/", new GoogleCloudStorageHttpHandler("bucket"), "/token", new FakeOAuth2HttpHandler());
+        gcsHttpHandler = new InterceptableGcsHttpHandler("bucket");
+        return Map.of("/", gcsHttpHandler, "/token", new FakeOAuth2HttpHandler());
     }
 
     @Override
@@ -135,6 +142,46 @@ public class GoogleObjectStoreTests extends AbstractMockObjectStoreIntegTestCase
         assertMetricStats(expectedMetrics, actualStats.actionStats);
     }
 
+    @Override
+    protected boolean canRefuseCopies() {
+        return true;
+    }
+
+    @SuppressForbidden(reason = "this test uses a HttpServer to emulate a GCS endpoint")
+    @Override
+    protected void refuseCopiesAfterTheFirst(AtomicInteger copyRequests) {
+        gcsHttpHandler.interceptor = exchange -> {
+            // a copy is a rewrite request
+            if (exchange.getRequestMethod().equals("POST")
+                && exchange.getRequestURI().getPath().contains("/rewriteTo/")
+                && copyRequests.incrementAndGet() > 1) {
+                try (exchange) {
+                    final byte[] response = ("{\"error\":{\"code\":403,\"message\":\""
+                        + accessDeniedText()
+                        + "\","
+                        + "\"errors\":[{\"message\":\""
+                        + accessDeniedText()
+                        + "\",\"domain\":\"global\",\"reason\":\"forbidden\"}]}}").getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
+                    exchange.sendResponseHeaders(403, response.length);
+                    exchange.getResponseBody().write(response);
+                }
+                return true;
+            }
+            return false;
+        };
+    }
+
+    @Override
+    protected Set<String> blobPathsInFakeStorage() {
+        return Set.copyOf(gcsHttpHandler.blobs().keySet());
+    }
+
+    @Override
+    protected String accessDeniedText() {
+        return "the caller does not have storage.objects.get access";
+    }
+
     public void testRecoverySucceedAgainstTransientCSPError() throws Exception {
         final var settings = Settings.builder()
             .put("gcs.client.test.max_retries", 0) // disable sdk client retries
@@ -191,6 +238,30 @@ public class GoogleObjectStoreTests extends AbstractMockObjectStoreIntegTestCase
         } finally {
             internalCluster().stopNode(node);
         }
+    }
+
+    @SuppressForbidden(reason = "this test uses a HttpServer to emulate a GCS endpoint")
+    private static class InterceptableGcsHttpHandler extends GoogleCloudStorageHttpHandler {
+        volatile Interceptor interceptor;
+
+        InterceptableGcsHttpHandler(String bucket) {
+            super(bucket);
+        }
+
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (interceptor == null || interceptor.intercept(exchange) == false) {
+                super.handle(exchange);
+            }
+        }
+    }
+
+    @SuppressForbidden(reason = "this test uses a HttpServer to emulate a GCS endpoint")
+    private interface Interceptor {
+        /**
+         * Returns true if it has answered the request, and false if the request is for the fake service to answer.
+         */
+        boolean intercept(HttpExchange exchange) throws IOException;
     }
 
     public static class TestGoogleCloudStoragePlugin extends GoogleCloudStoragePlugin {

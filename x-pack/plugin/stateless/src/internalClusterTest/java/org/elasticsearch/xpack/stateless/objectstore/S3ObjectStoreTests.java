@@ -558,6 +558,45 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
         }
     }
 
+    @Override
+    protected boolean canRefuseCopies() {
+        return true;
+    }
+
+    @SuppressForbidden(reason = "this test uses a HttpServer to emulate an S3 endpoint")
+    @Override
+    protected void refuseCopiesAfterTheFirst(AtomicInteger copyRequests) {
+        s3HttpHandler.setInterceptor(exchange -> {
+            // a copy is a request with an X-amz-copy-source header
+            if (exchange.getRequestHeaders().containsKey(S3HttpHandler.COPY_SOURCE_HEADER) && copyRequests.incrementAndGet() > 1) {
+                try (exchange) {
+                    final byte[] response = Strings.format("""
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <Error>
+                          <Code>AccessDenied</Code>
+                          <Message>Access Denied</Message>
+                          <RequestId>%s</RequestId>
+                        </Error>""", randomUUID()).getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().add("Content-Type", "application/xml");
+                    exchange.sendResponseHeaders(403, response.length);
+                    exchange.getResponseBody().write(response);
+                }
+                return true;
+            }
+            return false;
+        });
+    }
+
+    @Override
+    protected Set<String> blobPathsInFakeStorage() {
+        return Set.copyOf(s3HttpHandler.blobs().keySet());
+    }
+
+    @Override
+    protected String accessDeniedText() {
+        return "Access Denied";
+    }
+
     public void testRetryOn403ForPutAndPost() throws IOException {
         final Set<String> requestsErroredFor403 = ConcurrentCollections.newConcurrentSet();
         s3HttpHandler.setInterceptor(new Interceptor() {
