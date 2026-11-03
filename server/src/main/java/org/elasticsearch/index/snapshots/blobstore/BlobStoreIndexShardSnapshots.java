@@ -205,7 +205,8 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
 
     /**
      * Finds the copied blob that is a copy of the given commit blob, so that a new snapshot that needs a file from that commit blob can
-     * point its file info at the existing copy instead of copying the commit blob again.
+     * point its file info at the existing copy instead of copying the commit blob again. If this object holds several copies of the commit
+     * blob, the method returns one of them, and which one is not defined. The same object returns the same copy on every call.
      *
      * @param source path of a commit blob, see {@link FileInfo#source()}
      * @return the name of the copied blob, or null if no file info refers to a copy of {@code source}
@@ -216,11 +217,13 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
             bySource = new HashMap<>();
             for (FileInfo fileInfo : files.values()) {
                 if (fileInfo.isCopied()) {
-                    final String otherBlob = bySource.putIfAbsent(fileInfo.source(), fileInfo.blob());
-                    // A snapshot is meant to reuse an existing copy of a commit blob instead of copying it again, so two copies of one
-                    // commit blob in a shard generation point to a bug.
-                    assert otherBlob == null || otherBlob.equals(fileInfo.blob())
-                        : "commit blob [" + fileInfo.source() + "] copied twice, to [" + otherBlob + "] and [" + fileInfo.blob() + "]";
+                    // This object can hold two copies of the same commit blob. index-<uuid> is the blob that lists the files of every
+                    // snapshot of the shard, and snap-<uuid>.dat is the blob that lists the files of a single snapshot. If index-<uuid>
+                    // is missing, the repository rebuilds it from all the snap-<uuid>.dat blobs. Then the copy that a failed snapshot
+                    // left behind comes in next to the copy of a later snapshot. Keep the first copy found. The map has no order, so the
+                    // pick is arbitrary, and either copy is safe to reuse. The snapshot that reuses a copy writes a new index-<uuid>
+                    // that refers to that copy, so a later snapshot delete does not remove the copy.
+                    bySource.putIfAbsent(fileInfo.source(), fileInfo.blob());
                 }
             }
             copiedBlobsBySource = bySource;

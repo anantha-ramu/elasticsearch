@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Set;
 
+import static org.hamcrest.Matchers.either;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.nullValue;
 
@@ -119,7 +120,9 @@ public class BlobStoreIndexShardSnapshotsTests extends ESTestCase {
         assertThat(retained.copiedBlobNames(), equalTo(Set.of("c__first")));
     }
 
-    public void testOneCopyPerCommitBlob() {
+    public void testTwoCopiesOfOneCommitBlob() {
+        // A shard generation rebuilt from snap-<uuid>.dat blobs can hold two copies of the same commit blob: the copy of a failed
+        // snapshot and the copy of a later snapshot. This test builds that case by putting both copies in one snapshot.
         final BlobStoreIndexShardSnapshots generation = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(
             new SnapshotFiles(
                 "snap-1",
@@ -127,10 +130,12 @@ public class BlobStoreIndexShardSnapshotsTests extends ESTestCase {
                 null
             )
         );
-        // delete still keeps both copies, because each one is referenced
+        // a snapshot delete keeps both copies, because a file info refers to each copy
         assertThat(generation.copiedBlobNames(), equalTo(Set.of("c__first", "c__second")));
-        // but two copies of one commit blob in a generation means a snapshot failed to reuse the first copy
-        expectThrows(AssertionError.class, () -> generation.findCopiedBlob(FIRST_SOURCE));
+        // a new snapshot can reuse either copy, and asking the same object again returns the same copy
+        final String reused = generation.findCopiedBlob(FIRST_SOURCE);
+        assertThat(reused, either(equalTo("c__first")).or(equalTo("c__second")));
+        assertThat(generation.findCopiedBlob(FIRST_SOURCE), equalTo(reused));
     }
 
     private static FileInfo copiedFile(String physicalName, String blob, long offset, String source) {
