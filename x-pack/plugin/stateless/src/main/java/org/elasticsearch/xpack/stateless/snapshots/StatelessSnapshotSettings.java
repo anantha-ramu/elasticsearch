@@ -99,6 +99,35 @@ public class StatelessSnapshotSettings {
         Setting.Property.Dynamic
     );
 
+    /**
+     * Whether a shard snapshot copies its new files into the snapshot repository instead of uploading them. A new file is a file that no
+     * earlier snapshot of the shard has stored. Stateless Elasticsearch stores the files of a shard in the object store, in commit blobs.
+     * A commit blob holds the new files of one or more Lucene commits. With this setting on, the object store itself copies a whole commit
+     * blob into the snapshot repository, so the node reads and sends no file data. The copy is called a copied blob, and the shard's
+     * snapshot metadata records each new file as a byte range of the copied blob. With this setting off, the node reads each new file and
+     * uploads it.
+     * <p>
+     * Nothing reads this setting yet. The code that copies ships in a later release, and this release registers the setting before that
+     * code ships. Elasticsearch rejects a setting that it does not know. A node whose configuration contains an unknown setting refuses to
+     * start. A settings update that contains an unknown setting is rejected as a whole, and none of its other settings are applied.
+     * During an upgrade, some nodes still run a release without the setting. So every node must know the setting before anyone sets it
+     * to {@code true}.
+     * <p>
+     * The code that ships later is meant to copy only when this setting is on and every node in the cluster has the cluster feature
+     * {@link org.elasticsearch.snapshots.SnapshotCopiedBlobFeatures#COPIED_BLOB_RANGES}, which says that the node can read copied files.
+     * It also needs {@link #STATELESS_SNAPSHOT_ENABLED_SETTING} to be {@code read_from_object_store} or {@code enabled}, because only
+     * then do shard snapshots read from the object store.
+     * <p>
+     * The setting is dynamic and operator-only. It can be changed while nodes are running. On a cluster that has operator privileges
+     * turned on, only operator users can change it.
+     */
+    public static final Setting<Boolean> SERVER_SIDE_COPY_ENABLED_SETTING = Setting.boolSetting(
+        "stateless.snapshot.server_side_copy.enabled",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.OperatorDynamic
+    );
+
     public static final Setting<TimeValue> STATELESS_SNAPSHOT_WAIT_FOR_ACTIVE_PRIMARY_TIMEOUT_SETTING = Setting.positiveTimeSetting(
         "stateless.snapshot.wait_for_active_primary_timeout",
         TimeValue.timeValueMinutes(5),
