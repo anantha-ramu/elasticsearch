@@ -21,7 +21,6 @@ import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.CheckedRunnable;
-import org.elasticsearch.core.Strings;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.shard.ShardId;
@@ -303,7 +302,7 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
 
         // a clone refers to the same copies, so deleting the original keeps them, and the clone restores from them
         assertAcked(clusterAdmin().prepareCloneSnapshot(TEST_REQUEST_TIMEOUT, repoName, "first", "clone").setIndices(indexName).get());
-        deleteSnapshotAndAwaitCleanup(repoName, indexName, "first");
+        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, "first").get());
         assertTrue(copiedBlobs(repoName, indexName, 0).containsAll(firstCopies));
         restore(repoName, "clone", indexName, "restored-clone");
         assertHitCount(prepareSearch("restored-clone"), firstDocCount);
@@ -313,7 +312,7 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         final long laterDocCount = firstDocCount + indexDocsAndFlush(indexName, 1);
         assertThat(indicesAdmin().prepareForceMerge(indexName).setMaxNumSegments(1).setFlush(true).get().getFailedShards(), equalTo(0));
         createSnapshot(repoName, "later", List.of(indexName), List.of());
-        deleteSnapshotAndAwaitCleanup(repoName, indexName, "clone");
+        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, "clone").get());
         final Set<String> remaining = copiedBlobs(repoName, indexName, 0);
         assertTrue("old copies " + firstCopies + " are still in " + remaining, firstCopies.stream().noneMatch(remaining::contains));
         restore(repoName, "later", indexName, "restored-later");
@@ -1291,31 +1290,6 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
             assertThat(blobs.stream().filter(name -> name.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX)).toList(), empty());
             assertThat(copiedBlobs(repoName, indexName, shard), equalTo(referencedCopies));
         }
-    }
-
-    /**
-     * Deletes a snapshot and waits until its shard-level blobs are cleaned up. The delete API responds before those blobs are deleted. So
-     * wait until the deleted snapshot's {@code snap-<uuid>.dat} blob in the shard folder is gone, which shows the cleanup has started, and
-     * then until the master's snapshot thread pool is idle, which shows it has finished.
-     */
-    private void deleteSnapshotAndAwaitCleanup(String repoName, String indexName, String snapshotName) throws Exception {
-        final BlobStoreRepository repository = repository(repoName);
-        final RepositoryData repositoryData = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository);
-        final BlobContainer shardContainer = repository.shardContainer(repositoryData.resolveIndexId(indexName), 0);
-        final String shardSnapshotBlob = Strings.format(
-            BlobStoreRepository.SNAPSHOT_NAME_FORMAT,
-            snapshotId(repositoryData, snapshotName).getUUID()
-        );
-        assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, repoName, snapshotName).get());
-        assertBusy(() -> assertFalse(shardContainer.blobExists(OperationPurpose.SNAPSHOT_METADATA, shardSnapshotBlob)));
-        final String masterName = internalCluster().getMasterName();
-        assertBusy(() -> {
-            for (ThreadPoolStats.Stats stats : internalCluster().getInstance(ThreadPool.class, masterName).stats()) {
-                if (stats.name().equals(ThreadPool.Names.SNAPSHOT)) {
-                    assertThat(stats.active(), equalTo(0));
-                }
-            }
-        });
     }
 
     /**
