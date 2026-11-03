@@ -9,6 +9,7 @@ package org.elasticsearch.xpack.stateless.snapshots;
 
 import org.apache.lucene.tests.util.TestUtil;
 import org.elasticsearch.action.admin.cluster.snapshots.restore.RestoreSnapshotResponse;
+import org.elasticsearch.client.Request;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.blobstore.support.BlobMetadata;
@@ -17,19 +18,25 @@ import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
+import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoriesService;
 import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 import org.elasticsearch.repositories.blobstore.ESBlobStoreRepositoryIntegTestCase;
+import org.elasticsearch.repositories.blobstore.testkit.SnapshotRepositoryTestKit;
 import org.elasticsearch.snapshots.SnapshotCopiedBlobFeatures;
 import org.elasticsearch.snapshots.SnapshotId;
+import org.elasticsearch.test.rest.ObjectPath;
 import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -49,8 +56,8 @@ import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.startsWith;
 
 /**
- * Checks that a node can restore, clone and delete snapshots that hold copied files, and that the copy setting and the cluster feature
- * for copied files are registered.
+ * Checks that a node can restore, clone, delete and verify the integrity of snapshots that hold copied files, and that the copy setting
+ * and the cluster feature for copied files are registered.
  * <p>
  * The terms are:
  * <ul>
@@ -101,6 +108,18 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
     @Override
     protected boolean addMockFsRepository() {
         return false;
+    }
+
+    @Override
+    protected boolean addMockHttpTransport() {
+        return false; // enable HTTP, which the verify integrity API needs
+    }
+
+    @Override
+    protected Collection<Class<? extends Plugin>> nodePlugins() {
+        final var plugins = new ArrayList<>(super.nodePlugins());
+        plugins.add(SnapshotRepositoryTestKit.class);
+        return List.copyOf(plugins);
     }
 
     /**
@@ -205,6 +224,41 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
     }
 
     /**
+     * Verifies the integrity of the repository, including the content of every blob. The copied blobs in the repository are real commit
+     * blobs, with the headers and padding that the writer left around the files. The verifier must read each copied file as a byte range
+     * of such a blob, and find nothing wrong.
+     */
+    public void testVerifyIntegrityOfSnapshotsThatHoldCopiedFiles() throws Exception {
+        startNodes();
+        registerRepository();
+
+        final var request = new Request("POST", "/_snapshot/" + REPOSITORY + "/_verify_integrity");
+        request.addParameter("verify_blob_contents", null);
+        final var response = getRestClient().performRequest(request);
+        assertEquals(200, response.getStatusLine().getStatusCode());
+        final var responseObjectPath = ObjectPath.createFromResponse(response);
+        assertEquals(0, (int) responseObjectPath.evaluate("results.total_anomalies"));
+        assertEquals("pass", responseObjectPath.evaluate("results.result"));
+
+        // The verifier looked at the three snapshots, and found all of them restorable.
+        final Set<String> seenSnapshotNames = new HashSet<>();
+        boolean seenIndex = false;
+        for (int i = 0; i < responseObjectPath.evaluateArraySize("log"); i++) {
+            final String snapshotName = responseObjectPath.evaluate("log." + i + ".snapshot.snapshot");
+            if (snapshotName != null) {
+                seenSnapshotNames.add(snapshotName);
+            } else {
+                assertEquals(INDEX, responseObjectPath.evaluate("log." + i + ".index.name"));
+                assertEquals(3, (int) responseObjectPath.evaluate("log." + i + ".snapshot_restorability.total_snapshot_count"));
+                assertEquals(3, (int) responseObjectPath.evaluate("log." + i + ".snapshot_restorability.restorable_snapshot_count"));
+                seenIndex = true;
+            }
+        }
+        assertEquals(Set.of(UPLOADED, MIXED, MERGED), seenSnapshotNames);
+        assertTrue(seenIndex);
+    }
+
+    /**
      * Checks that every node accepts {@link StatelessSnapshotSettings#SERVER_SIDE_COPY_ENABLED_SETTING}, and that the cluster has
      * {@link SnapshotCopiedBlobFeatures#COPIED_BLOB_RANGES}. Each node publishes that feature to say that it can read copied files.
      */
@@ -265,7 +319,9 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
     }
 
     /**
-     * Deletes snapshots. The delete responds only after the repository has removed the blobs that no remaining snapshot refers to.
+     * Deletes snapshots. The response comes only after the blobs that no remaining snapshot refers to are removed. The wait is in
+     * {@code SnapshotsService}, which completes the delete listener only when the whole deletion is done. {@code BlobStoreRepository}
+     * reports earlier, as soon as it has written the new repository data, and removes the blobs after that.
      */
     private void deleteSnapshots(String... snapshotNames) {
         assertAcked(clusterAdmin().prepareDeleteSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, snapshotNames).get());
