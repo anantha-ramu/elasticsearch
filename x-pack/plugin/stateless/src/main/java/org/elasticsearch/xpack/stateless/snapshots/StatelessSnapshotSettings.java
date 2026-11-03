@@ -107,16 +107,16 @@ public class StatelessSnapshotSettings {
      * snapshot metadata records each new file as a byte range of the copied blob. With this setting off, the node reads each new file and
      * uploads it.
      * <p>
-     * Nothing reads this setting yet. The code that copies ships in a later release, and this release registers the setting before that
-     * code ships. Elasticsearch rejects a setting that it does not know. A node whose configuration contains an unknown setting refuses to
-     * start. A settings update that contains an unknown setting is rejected as a whole, and none of its other settings are applied.
-     * During an upgrade, some nodes still run a release without the setting. So every node must know the setting before anyone sets it
-     * to {@code true}.
+     * Every node must know this setting before anyone sets it to {@code true}. Elasticsearch rejects a setting that it does not know. A
+     * node whose configuration contains an unknown setting refuses to start. A settings update that contains an unknown setting is
+     * rejected as a whole, and none of its other settings are applied. During an upgrade, some nodes still run a release without the
+     * setting.
      * <p>
-     * The code that ships later is meant to copy only when this setting is on and every node in the cluster has the cluster feature
+     * A shard snapshot copies only when this setting is on and every node in the cluster has the cluster feature
      * {@link org.elasticsearch.snapshots.SnapshotCopiedBlobFeatures#COPIED_BLOB_RANGES}, which says that the node can read copied files.
-     * It also needs {@link #STATELESS_SNAPSHOT_ENABLED_SETTING} to be {@code read_from_object_store} or {@code enabled}, because only
-     * then do shard snapshots read from the object store.
+     * Until every node has the feature, the shard snapshot uploads its new files and logs that it does. A shard snapshot also needs
+     * {@link #STATELESS_SNAPSHOT_ENABLED_SETTING} to be {@code read_from_object_store} or {@code enabled}, because only then do shard
+     * snapshots read from the object store.
      * <p>
      * The setting is dynamic and operator-only. It can be changed while nodes are running. On a cluster that has operator privileges
      * turned on, only operator users can change it.
