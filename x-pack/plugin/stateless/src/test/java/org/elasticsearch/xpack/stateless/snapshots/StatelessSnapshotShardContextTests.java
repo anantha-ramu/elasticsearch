@@ -14,6 +14,7 @@ import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.Version;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.PlainActionFuture;
 import org.elasticsearch.common.blobstore.BlobContainer;
@@ -30,6 +31,9 @@ import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.engine.Engine;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.snapshots.IndexShardSnapshotStatus;
+import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
+import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
+import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.index.store.StoreFileMetadata;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.ShardGeneration;
@@ -56,6 +60,8 @@ import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.Mockito.mock;
 
 public class StatelessSnapshotShardContextTests extends ESTestCase {
@@ -135,6 +141,56 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
         for (CloseTrackingInputStream inputStream : allOpenedStreams) {
             assertTrue("Expected all opened input streams to be closed", inputStream.isClosed());
         }
+    }
+
+    /**
+     * A snapshot repository keeps one folder for all indices that have the same name. So an index that is deleted and created again with
+     * the same name shares the folder, and the shard generation in it, with the old index. The new index must not reuse a copy of a commit
+     * blob of the old index. A copy is found by the source path of its commit blob, so the path must differ between the two indices. It
+     * does, because it holds the index UUID.
+     */
+    public void testCopySourceDiffersForIndicesWithTheSameName() throws IOException {
+        final String indexName = randomIdentifier();
+        final int shard = between(0, 5);
+        final var blobLocation = new BlobLocation(
+            new BlobFile("stateless_commit_7", new PrimaryTermAndGeneration(1L, 7L)),
+            between(0, 50),
+            between(100, 1000)
+        );
+        final var oldCopySource = copySource(new ShardId(new Index(indexName, randomUUID()), shard), blobLocation);
+        final var newCopySource = copySource(new ShardId(new Index(indexName, randomUUID()), shard), blobLocation);
+        assertThat(newCopySource.source(), not(equalTo(oldCopySource.source())));
+
+        // The shard generation holds a copy of the old index's commit blob. The old index finds it, and the new index does not.
+        final var metadata = new StoreFileMetadata("_0.cfs", blobLocation.fileLength(), "checksum", Version.LATEST.toString());
+        final var generation = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(
+            new SnapshotFiles(
+                "snapshot",
+                List.of(new FileInfo("__file", metadata, "c__old", oldCopySource.offset(), oldCopySource.source())),
+                null
+            )
+        );
+        assertThat(generation.findCopiedBlob(oldCopySource.source()), equalTo("c__old"));
+        assertThat(generation.findCopiedBlob(newCopySource.source()), nullValue());
+    }
+
+    private static SnapshotShardContext.CopySource copySource(ShardId shardId, BlobLocation blobLocation) throws IOException {
+        final var context = new StatelessSnapshotShardContext(
+            shardId,
+            new SnapshotId(randomIdentifier(), randomUUID()),
+            new IndexId(shardId.getIndexName(), randomUUID()),
+            randomIdentifier(),
+            IndexShardSnapshotStatus.newInitializing(ShardGeneration.newGeneration(), randomLongBetween(1, Long.MAX_VALUE)),
+            IndexVersion.current(),
+            randomNonNegativeLong(),
+            null,
+            Map.of("file", blobLocation),
+            (s, g) -> mock(BlobContainer.class),
+            null,
+            true,
+            new PlainActionFuture<>()
+        );
+        return context.copySource("file");
     }
 
     public void testFileReaderThrowsWhenSnapshotAborted() throws IOException {

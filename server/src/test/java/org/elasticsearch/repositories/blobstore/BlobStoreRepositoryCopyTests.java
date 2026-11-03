@@ -86,6 +86,7 @@ import java.util.stream.Collectors;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 
 /**
@@ -227,6 +228,76 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             assertThat(hiddenFileInfo.blob(), equalTo(copiesAfterFirst.iterator().next()));
             assertThat(status.asCopy().getIncrementalFileCount(), equalTo(1));
             assertThat(status.asCopy().getProcessedFileCount(), equalTo(1));
+
+            shardAndRepository.restoreAndCheck(second);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    /**
+     * The shard snapshot copy stats log line counts the files that a snapshot reuses by name. These are files that an earlier snapshot
+     * already holds with the same name, length and checksum. The line splits them by how the earlier snapshot stored them. Here the first
+     * snapshot uploads one data file and copies all the other data files. The second snapshot adds one segment and reuses those data
+     * files by name, so the line shows one uploaded file and the copied files.
+     */
+    public void testStatsCountFilesReusedByName() throws IOException {
+        final var shardAndRepository = new ShardAndRepository();
+        try {
+            shardAndRepository.indexSegments(between(2, 4));
+            final Map<String, SnapshotShardContext.CopySource> sources = new HashMap<>(
+                shardAndRepository.writeCommitBlobs(1, name -> true, 0)
+            );
+            // the first snapshot has no copy source for one data file, so it uploads that file
+            final String uploaded = randomFrom(sources.keySet());
+            final Snapshot first = shardAndRepository.newSnapshot();
+            final ShardGeneration firstGeneration = shardAndRepository.snapshot(
+                first,
+                IndexShardSnapshotStatus.newInitializing(null, randomLongBetween(1, Long.MAX_VALUE)),
+                name -> name.equals(uploaded) ? null : sources.get(name),
+                name -> true
+            );
+
+            // One more segment adds new data files. They go into one new commit blob, which the second snapshot copies. The data files of
+            // the first snapshot are still in the commit, so the second snapshot finds their file infos in the generation of the first
+            // snapshot by name, length and checksum, and reuses them.
+            shardAndRepository.indexSegments(1);
+            final Set<String> known = Set.copyOf(sources.keySet());
+            sources.putAll(shardAndRepository.writeCommitBlobs(1, name -> known.contains(name) == false, 0));
+            final Map<String, StoreFileMetadata> commitFiles = shardAndRepository.commitFiles();
+            final List<FileInfo> reusedFiles = shardAndRepository.loadShardSnapshot(first)
+                .indexFiles()
+                .stream()
+                .filter(
+                    fileInfo -> commitFiles.containsKey(fileInfo.physicalName())
+                        && fileInfo.isSame(commitFiles.get(fileInfo.physicalName()))
+                )
+                .toList();
+            final List<FileInfo> reusedCopied = reusedFiles.stream().filter(FileInfo::isCopied).toList();
+            final List<FileInfo> reusedUploaded = reusedFiles.stream()
+                .filter(fileInfo -> fileInfo.isCopied() == false && fileInfo.metadata().hashEqualsContents() == false)
+                .toList();
+            assertThat(reusedUploaded.size(), equalTo(1));
+
+            final Snapshot second = shardAndRepository.newSnapshot();
+            assertCopyStatsLogged(
+                () -> shardAndRepository.snapshot(
+                    second,
+                    IndexShardSnapshotStatus.newInitializing(firstGeneration, randomLongBetween(1, Long.MAX_VALUE)),
+                    sources::get,
+                    name -> true
+                ),
+                shardAndRepository.copyStatsPrefix(second)
+                    + ": new copies [1], copied bytes [*], total copy time [*ms], slowest copy [*ms], files in new copies [*],"
+                    + " reused copies [0], files in reused copies [0], files reused by name, uploaded [1],"
+                    + " bytes reused by name, uploaded ["
+                    + reusedUploaded.get(0).length()
+                    + "], files reused by name, copied ["
+                    + reusedCopied.size()
+                    + "], bytes reused by name, copied ["
+                    + reusedCopied.stream().mapToLong(FileInfo::length).sum()
+                    + "], uploaded files [0], uploaded bytes [0], dead bytes [*], dead bytes per new copy [*]"
+            );
 
             shardAndRepository.restoreAndCheck(second);
         } finally {
@@ -379,6 +450,49 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             // the check of the copies failed before snap-<uuid>.dat was written, and the failure cleanup deleted any copy still in the
             // shard's folder
             shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    /**
+     * The status of a finished shard snapshot comes from its {@code snap-<uuid>.dat} blob. A copied file counts like an uploaded file:
+     * once, and with its own length, not with the length of the copied blob that holds it. The second snapshot copies a new commit blob and
+     * reuses the files of the first snapshot, so only its new files count as incremental.
+     */
+    public void testSnapshotStatusCountsCopiedFilesByTheirOwnLength() throws IOException {
+        final var shardAndRepository = new ShardAndRepository();
+        try {
+            shardAndRepository.indexSegments(between(1, 3));
+            final Map<String, SnapshotShardContext.CopySource> sources = new HashMap<>(
+                shardAndRepository.writeCommitBlobs(between(1, 3), name -> true, 0)
+            );
+            final Collection<StoreFileMetadata> firstFiles = shardAndRepository.commitFiles().values();
+            final Snapshot first = shardAndRepository.newSnapshot();
+            final ShardGeneration firstGeneration = shardAndRepository.snapshot(first, sources::get);
+            // every file is new in the first snapshot
+            shardAndRepository.assertStatusCounts(first, firstFiles, firstFiles);
+
+            // The second snapshot has a new segment next to the files of the first snapshot. It copies the new commit blob, and reuses the
+            // files that the first snapshot has.
+            shardAndRepository.indexSegments(1);
+            final Map<String, StoreFileMetadata> secondFiles = shardAndRepository.commitFiles();
+            final List<StoreFileMetadata> newFiles = secondFiles.values()
+                .stream()
+                .filter(file -> firstFiles.stream().noneMatch(firstFile -> firstFile.name().equals(file.name())))
+                .toList();
+            assertThat(newFiles, not(empty()));
+            final Set<String> known = Set.copyOf(sources.keySet());
+            sources.putAll(shardAndRepository.writeCommitBlobs(between(1, 2), name -> known.contains(name) == false, 0));
+            final Snapshot second = shardAndRepository.newSnapshot();
+            shardAndRepository.snapshot(
+                second,
+                IndexShardSnapshotStatus.newInitializing(firstGeneration, randomLongBetween(1, Long.MAX_VALUE)),
+                sources::get,
+                name -> true
+            );
+            shardAndRepository.assertStatusCounts(second, secondFiles.values(), newFiles);
+            assertThat(copiedBlobs(shardAndRepository.shardContainer()), not(empty()));
         } finally {
             shardAndRepository.close();
         }
@@ -606,6 +720,28 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 }
             }
             return sources;
+        }
+
+        /**
+         * The files of the shard's last commit, by name.
+         */
+        Map<String, StoreFileMetadata> commitFiles() throws IOException {
+            try (Engine.IndexCommitRef commitRef = shard.acquireLastIndexCommit(true)) {
+                return shard.store().getMetadata(commitRef.getIndexCommit()).fileMetadataMap();
+            }
+        }
+
+        /**
+         * Checks the counts in the status of a finished shard snapshot, which the repository reads from the snapshot's blob: the number and
+         * the total length of all the files in the commit, and of the files that were new in the snapshot.
+         */
+        void assertStatusCounts(Snapshot snapshot, Collection<StoreFileMetadata> allFiles, Collection<StoreFileMetadata> newFiles) {
+            final IndexShardSnapshotStatus.Copy status = repository.getShardSnapshotStatus(snapshot.getSnapshotId(), indexId, shardId);
+            assertThat(status.getStage(), equalTo(IndexShardSnapshotStatus.Stage.DONE));
+            assertThat(status.getTotalFileCount(), equalTo(allFiles.size()));
+            assertThat(status.getTotalSize(), equalTo(allFiles.stream().mapToLong(StoreFileMetadata::length).sum()));
+            assertThat(status.getIncrementalFileCount(), equalTo(newFiles.size()));
+            assertThat(status.getIncrementalSize(), equalTo(newFiles.stream().mapToLong(StoreFileMetadata::length).sum()));
         }
 
         /**
