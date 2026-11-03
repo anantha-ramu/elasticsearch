@@ -9,9 +9,11 @@
 package org.elasticsearch.repositories.blobstore;
 
 import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.core.LogEvent;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.tests.util.TestUtil;
+import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.support.PlainActionFuture;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.routing.RecoverySource;
@@ -29,6 +31,7 @@ import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.collect.Iterators;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
+import org.elasticsearch.common.regex.Regex;
 import org.elasticsearch.core.CheckedRunnable;
 import org.elasticsearch.core.FixForMultiProject;
 import org.elasticsearch.core.IOUtils;
@@ -53,6 +56,7 @@ import org.elasticsearch.repositories.ShardGeneration;
 import org.elasticsearch.repositories.ShardSnapshotResult;
 import org.elasticsearch.repositories.SnapshotIndexCommit;
 import org.elasticsearch.repositories.SnapshotShardContext;
+import org.elasticsearch.snapshots.PausedSnapshotException;
 import org.elasticsearch.snapshots.Snapshot;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.MockLog;
@@ -66,18 +70,23 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.notNullValue;
 
 /**
  * Tests the server-side copy path of shard snapshots. A plain FS container stands in for the stateless object store: the shard's data
@@ -369,6 +378,75 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             assertThat(e.getMessage(), e.getMessage().contains("none, it is missing"), equalTo(dropCopy));
             // the check of the copies failed before snap-<uuid>.dat was written, and the failure cleanup deleted any copy still in the
             // shard's folder
+            shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    /**
+     * An attempt that fails after it has made copies logs what it spent on copies. It logs that before the failure cleanup deletes the
+     * copies.
+     */
+    public void testFailedAttemptLogsCopyStatsBeforeCleanup() throws IOException {
+        // The copy calls return, but the copies are then missing or one byte short, so the check of the copies fails after all the copies
+        // are made.
+        final boolean dropCopy = randomBoolean();
+        final var statsLogged = new AtomicBoolean();
+        final var statsLoggedBeforeCleanup = new AtomicReference<Boolean>();
+        final var shardAndRepository = new ShardAndRepository(
+            container -> new RunBeforeDelete(
+                new BrokenCopies(container, dropCopy),
+                () -> statsLoggedBeforeCleanup.compareAndSet(null, statsLogged.get())
+            )
+        );
+        try {
+            shardAndRepository.indexSegments(between(1, 3));
+            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
+                between(1, 3),
+                name -> true,
+                0
+            );
+            final long copies = sources.values().stream().map(SnapshotShardContext.CopySource::blobName).distinct().count();
+            final Snapshot snapshot = shardAndRepository.newSnapshot();
+            final String message = shardAndRepository.copyStatsPrefix(snapshot)
+                + ": attempt [failed], copies made ["
+                + copies
+                + "], copied bytes [*], total copy time [*ms]";
+            MockLog.assertThatLogger(
+                () -> expectThrows(Exception.class, () -> shardAndRepository.snapshot(snapshot, sources::get)),
+                BlobStoreRepository.class,
+                new LogMessageSeen(message, statsLogged)
+            );
+            assertThat(statsLoggedBeforeCleanup.get(), equalTo(true));
+            shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    /**
+     * An attempt that pauses after a copy, as a shard snapshot does when its node is shutting down, logs what it spent on copies.
+     */
+    public void testPausedAttemptLogsCopyStats() throws IOException {
+        final var statusRef = new AtomicReference<IndexShardSnapshotStatus>();
+        final var shardAndRepository = new ShardAndRepository(container -> new PausingAfterCopy(container, statusRef::get));
+        try {
+            shardAndRepository.indexSegments(between(1, 3));
+            // one commit blob, so the shard snapshot makes one copy, and pauses right after it
+            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(1, name -> true, 0);
+            final Snapshot snapshot = shardAndRepository.newSnapshot();
+            final var status = IndexShardSnapshotStatus.newInitializing(null, randomLongBetween(1, Long.MAX_VALUE));
+            statusRef.set(status);
+            final String message = shardAndRepository.copyStatsPrefix(snapshot)
+                + ": attempt [paused], copies made [1], copied bytes [*], total copy time [*ms]";
+            MockLog.assertThatLogger(() -> {
+                final Exception e = expectThrows(
+                    Exception.class,
+                    () -> shardAndRepository.snapshot(snapshot, status, sources::get, name -> true)
+                );
+                assertThat(ExceptionsHelper.unwrap(e, PausedSnapshotException.class), notNullValue());
+            }, BlobStoreRepository.class, new LogMessageSeen(message, new AtomicBoolean()));
             shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
         } finally {
             shardAndRepository.close();
@@ -758,6 +836,85 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         @Override
         protected BlobContainer wrapChild(BlobContainer child) {
             return new BrokenCopies(child, dropCopy);
+        }
+    }
+
+    /**
+     * Expects at least one INFO message that matches the given pattern, in which {@code *} matches any text, and sets the flag as soon as
+     * it has seen one. The flag lets a test check what happened before the message, not only that the message came.
+     */
+    private static final class LogMessageSeen implements MockLog.LoggingExpectation {
+        private final String pattern;
+        private final AtomicBoolean seen;
+
+        LogMessageSeen(String pattern, AtomicBoolean seen) {
+            this.pattern = pattern;
+            this.seen = seen;
+        }
+
+        @Override
+        public void match(LogEvent event) {
+            if (event.getLevel() == Level.INFO && Regex.simpleMatch(pattern, event.getMessage().getFormattedMessage())) {
+                seen.set(true);
+            }
+        }
+
+        @Override
+        public void assertMatched() {
+            assertTrue("no log message matched [" + pattern + "]", seen.get());
+        }
+    }
+
+    /**
+     * A shard container that runs an action right before each call that deletes blobs, and then deletes them.
+     */
+    private static final class RunBeforeDelete extends FilterBlobContainer {
+        private final Runnable beforeDelete;
+
+        RunBeforeDelete(BlobContainer delegate, Runnable beforeDelete) {
+            super(delegate);
+            this.beforeDelete = beforeDelete;
+        }
+
+        @Override
+        public void deleteBlobsIgnoringIfNotExists(OperationPurpose purpose, Iterator<String> blobNames) throws IOException {
+            beforeDelete.run();
+            super.deleteBlobsIgnoringIfNotExists(purpose, blobNames);
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new RunBeforeDelete(child, beforeDelete);
+        }
+    }
+
+    /**
+     * A shard container that pauses the shard snapshot once a copy has been made, as a node that is shutting down does.
+     */
+    private static final class PausingAfterCopy extends FilterBlobContainer {
+        private final Supplier<IndexShardSnapshotStatus> status;
+
+        PausingAfterCopy(BlobContainer delegate, Supplier<IndexShardSnapshotStatus> status) {
+            super(delegate);
+            this.status = status;
+        }
+
+        @Override
+        public void copyBlob(
+            OperationPurpose purpose,
+            BlobContainer sourceBlobContainer,
+            String sourceBlobName,
+            String blobName,
+            long blobSize,
+            @Nullable Executor executor
+        ) throws IOException {
+            super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
+            status.get().pauseIfNotCompleted(notifyOnPaused -> notifyOnPaused.onResponse(() -> {}));
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new PausingAfterCopy(child, status);
         }
     }
 

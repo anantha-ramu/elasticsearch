@@ -171,6 +171,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
@@ -3826,6 +3827,11 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 snapshotStatus.moveToDone(threadPool.absoluteTimeInMillis(), shardSnapshotResult);
                 context.onResponse(shardSnapshotResult);
             }, e -> {
+                // This attempt may have spent time on copies. The cleanup below deletes them, and a later attempt makes its own, so log
+                // what this attempt spent first. Otherwise the time of an attempt that fails or pauses shows up nowhere.
+                if (copyStats.attemptCopied()) {
+                    copyStats.logAttempt(metadata.name(), snapshotId, shardId, e);
+                }
                 try {
                     snapshotStatus.updateStatusDescription("all files uploaded: cleaning up data files, exception while finalizing: " + e);
                     shardContainer.deleteBlobsIgnoringIfNotExists(
@@ -3947,7 +3953,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
         for (NewCopy newCopy : newCopies) {
             shardSnapshotTaskRunner.enqueueBlobCopy(context, () -> {
                 if (failed.get() == false) {
-                    copyStats.onCopy(copyBlob(context, shardContainer, newCopy, sourceLengths.get(newCopy.copySource().source())));
+                    copyBlob(context, shardContainer, newCopy, sourceLengths.get(newCopy.copySource().source()), copyStats);
                 }
             }, tasksListener);
         }
@@ -4001,10 +4007,11 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     }
 
     /**
-     * Copies one commit blob, whole and server-side, into the shard's folder under the name the {@link CopyPlan} chose for it. Returns how
-     * many milliseconds the copy call took.
+     * Copies one commit blob, whole and server-side, into the shard's folder under the name the {@link CopyPlan} chose for it. The time
+     * the copy call took goes into {@code copyStats}, also when the call fails.
      */
-    private long copyBlob(SnapshotShardContext context, BlobContainer shardContainer, NewCopy newCopy, long blobLength) throws IOException {
+    private void copyBlob(SnapshotShardContext context, BlobContainer shardContainer, NewCopy newCopy, long blobLength, CopyStats copyStats)
+        throws IOException {
         final IndexShardSnapshotStatus snapshotStatus = context.status();
         final FileInfo firstFile = newCopy.files().getFirst();
         ensureNotAborted(context.shardId(), context.snapshotId(), snapshotStatus, firstFile.physicalName());
@@ -4019,15 +4026,21 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             // The source container comes from the object store, whose containers may be wrapped differently from this repository's.
             // copyBlob accepts only its own repository type's container as the source, so pass the innermost one. No executor, so a
             // multipart copy copies one part at a time, as an upload writes one part at a time.
-            shardContainer.copyBlob(
-                OperationPurpose.SNAPSHOT_DATA,
-                FilterBlobContainer.unwrap(source.container()),
-                source.blobName(),
-                newCopy.blobName(),
-                blobLength,
-                null
-            );
+            try {
+                shardContainer.copyBlob(
+                    OperationPurpose.SNAPSHOT_DATA,
+                    FilterBlobContainer.unwrap(source.container()),
+                    source.blobName(),
+                    newCopy.blobName(),
+                    blobLength,
+                    null
+                );
+            } catch (Exception e) {
+                copyStats.onFailedCopy(threadPool.rawRelativeTimeInMillis() - startMillis);
+                throw e;
+            }
             copyMillis = threadPool.rawRelativeTimeInMillis() - startMillis;
+            copyStats.onCopy(copyMillis, blobLength);
             commitRef.maybeReleaseCommitRef();
             logger.trace(
                 "[{}] copied [{}] of size [{}b] to [{}][{}] in [{}ms]",
@@ -4040,7 +4053,6 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             );
         }
         snapshotStatus.addProcessedFiles(newCopy.files().size(), newCopy.files().stream().mapToLong(FileInfo::length).sum());
-        return copyMillis;
     }
 
     /**
@@ -4204,7 +4216,11 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     /**
      * Measurements of one shard snapshot that stores files as byte ranges of copied commit blobs (see {@link CopyPlan}). They are logged
      * once, after the shard snapshot has written all its blobs, so that a test or benchmark run can read them for each shard snapshot. A
-     * shard snapshot that fails, or that stores no new file as a byte range, logs nothing.
+     * shard snapshot that stores no new file as a byte range logs nothing.
+     * <p>
+     * An attempt that fails or pauses after it has spent time on copies logs a shorter line, see {@link #logAttempt}. The cleanup after
+     * the failure deletes the copies of that attempt, and a later attempt makes its own, so without that line the time spent on the first
+     * attempt would show up nowhere. The line counts only the copy calls that have returned, and the time of a copy call that failed.
      * <ul>
      *     <li>Why a log line: the line can list the dead bytes of every new copy, which a counter in node stats or metrics cannot, and it
      *     needs no new field in the snapshot status API, which would change the wire format between nodes. That API already has the time
@@ -4241,6 +4257,8 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
         private final long uploadedBytes;
         private final AtomicLong copyMillis = new AtomicLong();
         private final AtomicLong slowestCopyMillis = new AtomicLong();
+        private final AtomicInteger copiesMade = new AtomicInteger();
+        private final AtomicLong bytesCopied = new AtomicLong();
         private volatile Map<String, Long> sourceLengths = Map.of();
 
         CopyStats(CopyPlan copyPlan, Collection<FileInfo> filesToUpload) {
@@ -4266,9 +4284,42 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             sourceLengths = lengths;
         }
 
-        void onCopy(long millis) {
+        void onCopy(long millis, long blobLength) {
+            copiesMade.incrementAndGet();
+            bytesCopied.addAndGet(blobLength);
             copyMillis.addAndGet(millis);
             slowestCopyMillis.accumulateAndGet(millis, Math::max);
+        }
+
+        /**
+         * A copy call that failed still took time. That time counts toward the total copy time, but the call is not a copy made.
+         */
+        void onFailedCopy(long millis) {
+            copyMillis.addAndGet(millis);
+        }
+
+        /**
+         * Whether this attempt has spent any time on copies so far, in a copy call that returned or in one that failed.
+         */
+        boolean attemptCopied() {
+            return copiesMade.get() > 0 || copyMillis.get() > 0;
+        }
+
+        /**
+         * Logs what an attempt that failed or paused has spent on copies so far. A pause is the {@link PausedSnapshotException} that a
+         * shard snapshot gets when its node shuts down. Every other failure counts as a failure, including an abort.
+         */
+        void logAttempt(String repository, SnapshotId snapshotId, ShardId shardId, Exception failure) {
+            logger.info(
+                "[{}][{}]{} shard snapshot copy stats: attempt [{}], copies made [{}], copied bytes [{}], total copy time [{}ms]",
+                repository,
+                snapshotId,
+                shardId,
+                ExceptionsHelper.unwrap(failure, PausedSnapshotException.class) != null ? "paused" : "failed",
+                copiesMade.get(),
+                bytesCopied.get(),
+                copyMillis.get()
+            );
         }
 
         void log(String repository, SnapshotId snapshotId, ShardId shardId) {
