@@ -67,6 +67,7 @@ import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.discovery.DiscoveryModule;
 import org.elasticsearch.env.Environment;
 import org.elasticsearch.env.NodeEnvironment;
+import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.health.HealthIndicatorService;
 import org.elasticsearch.index.IndexModule;
 import org.elasticsearch.index.IndexService;
@@ -556,6 +557,7 @@ public class StatelessPlugin extends Plugin
     private final SetOnce<EstimatedHeapUsageRecoveryGate> estimatedHeapUsageRecoveryGate = new SetOnce<>();
     private final SetOnce<EstimatedHeapSettings> estimatedHeapSettings = new SetOnce<>();
     private final SetOnce<Client> clientRef = new SetOnce<>();
+    private final SetOnce<FeatureService> featureServiceRef = new SetOnce<>();
 
     private final PluggableDirectoryMetricsHolder<BlobStoreCacheDirectoryMetrics> metricHolder = new ThreadLocalDirectoryMetricHolder<>(
         BlobStoreCacheDirectoryMetrics::new
@@ -599,6 +601,10 @@ public class StatelessPlugin extends Plugin
 
     public Client getClient() {
         return Objects.requireNonNull(this.clientRef.get());
+    }
+
+    public FeatureService getFeatureService() {
+        return Objects.requireNonNull(this.featureServiceRef.get());
     }
 
     public StatelessPlugin(Settings settings) {
@@ -794,6 +800,7 @@ public class StatelessPlugin extends Plugin
         checkLicense();
         this.projectResolver.set(services.projectResolver());
         Client client = setAndGet(this.clientRef, services.client());
+        setAndGet(this.featureServiceRef, services.featureService());
         ClusterService clusterService = services.clusterService();
         this.clusterService.set(clusterService);
         ShardRoutingRoleStrategy shardRoutingRoleStrategy = services.allocationService().getShardRoutingRoleStrategy();

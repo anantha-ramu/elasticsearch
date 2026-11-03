@@ -11,8 +11,10 @@ import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.SubscribableListener;
 import org.elasticsearch.action.support.TransportActions;
 import org.elasticsearch.client.internal.Client;
+import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.settings.ClusterSettings;
+import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.snapshots.IndexShardSnapshotStatus;
@@ -24,6 +26,7 @@ import org.elasticsearch.repositories.ShardSnapshotResult;
 import org.elasticsearch.repositories.SnapshotShardContext;
 import org.elasticsearch.repositories.SnapshotShardContextFactory;
 import org.elasticsearch.snapshots.Snapshot;
+import org.elasticsearch.snapshots.SnapshotCopiedBlobFeatures;
 import org.elasticsearch.xpack.stateless.StatelessPlugin;
 import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.StatelessSnapshotEnabledStatus;
 
@@ -50,6 +53,8 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
     private final SnapshotsCommitService snapshotsCommitService;
     private final LocalPrimarySnapshotShardContextFactory localPrimaryFactory;
     private final Client client;
+    private final ClusterService clusterService;
+    private final FeatureService featureService;
 
     public StatelessSnapshotShardContextFactory() {
         throw new IllegalStateException("This no arg constructor only exists for SPI validation");
@@ -59,14 +64,13 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
         this.shardBlobContainerFunc = stateless.shardBlobContainerFunc();
         this.snapshotsCommitService = stateless.getSnapshotsCommitService();
         this.client = stateless.getClient();
-        final ClusterSettings clusterSettings = stateless.getClusterService().getClusterSettings();
+        this.clusterService = stateless.getClusterService();
+        this.featureService = stateless.getFeatureService();
+        final ClusterSettings clusterSettings = clusterService.getClusterSettings();
         clusterSettings.initializeAndWatch(STATELESS_SNAPSHOT_ENABLED_SETTING, this::setStatelessSnapshotEnabledStatus);
         clusterSettings.initializeAndWatch(RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING, this::setRelocationDuringSnapshotEnabled);
         clusterSettings.initializeAndWatch(SERVER_SIDE_COPY_ENABLED_SETTING, value -> serverSideCopyEnabled = value);
-        this.localPrimaryFactory = new LocalPrimarySnapshotShardContextFactory(
-            stateless.getClusterService(),
-            stateless.getIndicesService()
-        );
+        this.localPrimaryFactory = new LocalPrimarySnapshotShardContextFactory(clusterService, stateless.getIndicesService());
     }
 
     @Override
@@ -112,7 +116,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
                         snapshotCommitInfo.blobLocations(),
                         shardBlobContainerFunc,
                         snapshotCommitInfo.isShardRelocated(),
-                        serverSideCopyEnabled,
+                        shouldCopyServerSide(shardId, snapshot),
                         snapshotCommitInfo.snapshotIndexCommit().closingBefore(listener)
                     )
                 );
@@ -154,6 +158,43 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
         return relocationDuringSnapshotEnabled;
     }
 
+    /**
+     * Whether this shard snapshot copies its new files instead of uploading them. A copied file is a file that the snapshot stores as a
+     * byte range of a copied blob. A copied blob is a copy of a whole commit blob, which is the blob in the object store that holds the
+     * file. The object store makes that copy itself.
+     * <p>
+     * The shard snapshot copies only if {@link StatelessSnapshotSettings#SERVER_SIDE_COPY_ENABLED_SETTING} is on and every node in the
+     * cluster has {@link SnapshotCopiedBlobFeatures#COPIED_BLOB_RANGES}. A node has that feature when it can read copied files. Every node
+     * needs it, because a node without it cannot parse the shard's snapshot metadata, which lists the files of each snapshot, once that
+     * metadata records a copied file. That node then fails on the shard.
+     * <p>
+     * The check is made for each shard snapshot, on the node that runs it, with the cluster state that the node has applied. An
+     * out-of-date state can lack the feature although every node has it now. The shard snapshot then uploads, which is always safe. The
+     * reverse cannot happen. The master rejects a node that joins without a feature that every node already has, so no cluster state shows
+     * the feature while a node without it is in the cluster. This relies on the feature never being an assumed feature, see
+     * {@link SnapshotCopiedBlobFeatures}.
+     * <p>
+     * If the setting is on but the feature is missing, the method logs one INFO line for the shard snapshot that says why the shard
+     * snapshot uploads.
+     */
+    private boolean shouldCopyServerSide(ShardId shardId, Snapshot snapshot) {
+        if (serverSideCopyEnabled == false) {
+            return false;
+        }
+        if (featureService.clusterHasFeature(clusterService.state(), SnapshotCopiedBlobFeatures.COPIED_BLOB_RANGES)) {
+            return true;
+        }
+        logger.info(
+            "{} uploads its new files in snapshot [{}] instead of copying commit blobs: setting [{}] is on, but not every node in the "
+                + "cluster has cluster feature [{}], which says that a node can read copied files",
+            shardId,
+            snapshot,
+            SERVER_SIDE_COPY_ENABLED_SETTING.getKey(),
+            SnapshotCopiedBlobFeatures.COPIED_BLOB_RANGES.id()
+        );
+        return false;
+    }
+
     private SubscribableListener<SnapshotShardContext> asyncCreateOnRemoteNode(
         ShardId shardId,
         Snapshot snapshot,
@@ -185,7 +226,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
                             response.blobLocations(),
                             shardBlobContainerFunc,
                             null,
-                            serverSideCopyEnabled,
+                            shouldCopyServerSide(shardId, snapshot),
                             listener
                         )
                     );

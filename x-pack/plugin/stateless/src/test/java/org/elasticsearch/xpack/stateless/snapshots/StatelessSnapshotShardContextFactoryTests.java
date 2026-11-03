@@ -7,6 +7,7 @@
 
 package org.elasticsearch.xpack.stateless.snapshots;
 
+import org.apache.logging.log4j.core.LogEvent;
 import org.apache.lucene.index.IndexCommit;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.elasticsearch.action.ActionListener;
@@ -20,16 +21,22 @@ import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.ProjectId;
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.cluster.node.DiscoveryNodeUtils;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.routing.RecoverySource;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.routing.ShardRoutingHelper;
 import org.elasticsearch.cluster.routing.UnassignedInfo;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.settings.ClusterSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
 import org.elasticsearch.common.util.set.Sets;
 import org.elasticsearch.core.IOUtils;
+import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexNotFoundException;
 import org.elasticsearch.index.IndexService;
@@ -52,9 +59,11 @@ import org.elasticsearch.repositories.ShardSnapshotResult;
 import org.elasticsearch.repositories.SnapshotIndexCommit;
 import org.elasticsearch.repositories.SnapshotShardContext;
 import org.elasticsearch.snapshots.Snapshot;
+import org.elasticsearch.snapshots.SnapshotCopiedBlobFeatures;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.ClusterServiceUtils;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.MockLog;
 import org.elasticsearch.xpack.stateless.StatelessPlugin;
 import org.elasticsearch.xpack.stateless.commits.BlobFile;
 import org.elasticsearch.xpack.stateless.commits.BlobLocation;
@@ -64,12 +73,17 @@ import org.junit.After;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.elasticsearch.test.ActionListenerUtils.anyActionListener;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING;
+import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.sameInstance;
 import static org.hamcrest.core.Is.isA;
 import static org.mockito.ArgumentMatchers.any;
@@ -80,6 +94,8 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 public class StatelessSnapshotShardContextFactoryTests extends ESTestCase {
+
+    private static final String DATA_FILE = "_0.cfs";
 
     private TestHarness testHarness;
 
@@ -217,6 +233,146 @@ public class StatelessSnapshotShardContextFactoryTests extends ESTestCase {
         assertThat(snapshotShardContext.stateIdentifier(), equalTo(expectedShardStateId));
     }
 
+    public void testCopiesOnlyWhenEveryNodeHasTheFeatureOnLocalPrimary() throws IOException {
+        assertCopiesOnlyWhenEveryNodeHasTheFeature(false);
+    }
+
+    public void testCopiesOnlyWhenEveryNodeHasTheFeatureOnRemoteNode() throws IOException {
+        assertCopiesOnlyWhenEveryNodeHasTheFeature(true);
+    }
+
+    /**
+     * Checks the rule that decides whether a shard snapshot copies its files or uploads them. The factory builds a
+     * {@link SnapshotShardContext} in two ways. If {@code remote} is false, the primary is on the same node as the factory, and the
+     * factory acquires the commit from the local primary. If {@code remote} is true, the primary is on another node, and the factory asks
+     * that node for the blob locations of the commit. The shard snapshot must copy only when the setting is on and every node has the
+     * cluster feature for copied files. If the setting is on and a node lacks the feature, the shard snapshot must upload its files and log
+     * one INFO line that says why.
+     */
+    private void assertCopiesOnlyWhenEveryNodeHasTheFeature(boolean remote) throws IOException {
+        testHarness = createTestHarness(
+            Settings.builder()
+                // only "enabled" lets the factory ask another node for the commit
+                .put(STATELESS_SNAPSHOT_ENABLED_SETTING.getKey(), remote ? "enabled" : "read_from_object_store")
+                .put(SERVER_SIDE_COPY_ENABLED_SETTING.getKey(), true)
+                .build()
+        );
+        final var blobLocations = Map.of(
+            DATA_FILE,
+            new BlobLocation(new BlobFile("stateless_commit_7", new PrimaryTermAndGeneration(1L, 7L)), randomLongBetween(0, 50), 500L)
+        );
+        if (remote) {
+            // the primary is not on this node, so the commit info comes from another node
+            when(
+                testHarness.snapshotsCommitService()
+                    .acquireAndMaybeRegisterCommitForSnapshot(eq(testHarness.shardId()), any(Snapshot.class), anyBoolean(), any())
+            ).thenThrow(new ShardNotFoundException(testHarness.shardId()));
+            final var client = mock(Client.class);
+            final var projectClient = mock(ProjectClient.class);
+            when(testHarness.stateless().getClient()).thenReturn(client);
+            when(client.projectClient(any(ProjectId.class))).thenReturn(projectClient);
+            doAnswer(invocation -> {
+                final ActionListener<GetShardSnapshotCommitInfoResponse> listener = invocation.getArgument(2);
+                listener.onResponse(new GetShardSnapshotCommitInfoResponse(blobLocations, randomIdentifier()));
+                return null;
+            }).when(projectClient)
+                .execute(
+                    eq(TransportGetShardSnapshotCommitInfoAction.TYPE),
+                    any(GetShardSnapshotCommitInfoRequest.class),
+                    anyActionListener()
+                );
+        } else {
+            final var indexCommit = mock(IndexCommit.class);
+            when(indexCommit.getGeneration()).thenReturn(7L);
+            when(
+                testHarness.snapshotsCommitService()
+                    .acquireAndMaybeRegisterCommitForSnapshot(eq(testHarness.shardId()), any(Snapshot.class), anyBoolean(), any())
+            ).thenAnswer(
+                invocation -> new SnapshotsCommitService.SnapshotCommitInfo(
+                    new SnapshotIndexCommit(new Engine.IndexCommitRef(indexCommit, () -> {})),
+                    blobLocations,
+                    randomIdentifier(),
+                    () -> false
+                )
+            );
+        }
+        final DiscoveryNode otherNode = DiscoveryNodeUtils.create(randomIdentifier());
+
+        // One node lacks the feature. The shard snapshot uploads, and logs why once.
+        setNodeFeatures(otherNode, false);
+        try (var mockLog = MockLog.capture(StatelessSnapshotShardContextFactory.class)) {
+            mockLog.addExpectation(logMessagesContaining("instead of copying commit blobs", 1));
+            // no copy source for the file means that the file is uploaded
+            assertThat(createContext().copySource(DATA_FILE), nullValue());
+            mockLog.assertAllExpectationsMatched();
+        }
+
+        // Every node has the feature. The shard snapshot copies, and logs nothing.
+        setNodeFeatures(otherNode, true);
+        try (var mockLog = MockLog.capture(StatelessSnapshotShardContextFactory.class)) {
+            mockLog.addExpectation(logMessagesContaining("instead of copying commit blobs", 0));
+            assertThat(createContext().copySource(DATA_FILE), notNullValue());
+            mockLog.assertAllExpectationsMatched();
+        }
+
+        // The setting is off, so the shard snapshot uploads and logs nothing, whichever nodes have the feature.
+        testHarness.stateless()
+            .getClusterService()
+            .getClusterSettings()
+            .applySettings(Settings.builder().put(SERVER_SIDE_COPY_ENABLED_SETTING.getKey(), false).build());
+        for (boolean everyNodeHasFeature : new boolean[] { false, true }) {
+            setNodeFeatures(otherNode, everyNodeHasFeature);
+            try (var mockLog = MockLog.capture(StatelessSnapshotShardContextFactory.class)) {
+                mockLog.addExpectation(logMessagesContaining("instead of copying commit blobs", 0));
+                assertThat(createContext().copySource(DATA_FILE), nullValue());
+                mockLog.assertAllExpectationsMatched();
+            }
+        }
+    }
+
+    private SnapshotShardContext createContext() throws IOException {
+        return safeAwait(testHarness.asyncCreate(new PlainActionFuture<>()));
+    }
+
+    /**
+     * Sets the cluster state to two nodes: the local node, which always has the cluster feature for copied files, and {@code otherNode},
+     * which has the feature only if {@code otherNodeHasFeature} is true.
+     */
+    private void setNodeFeatures(DiscoveryNode otherNode, boolean otherNodeHasFeature) {
+        final ClusterService clusterService = testHarness.stateless().getClusterService();
+        final ClusterState state = clusterService.state();
+        final Set<String> featureIds = Set.of(SnapshotCopiedBlobFeatures.COPIED_BLOB_RANGES.id());
+        ClusterServiceUtils.setState(
+            clusterService,
+            ClusterState.builder(state)
+                .nodes(DiscoveryNodes.builder(state.nodes()).add(otherNode))
+                .nodeFeatures(
+                    Map.of(state.nodes().getLocalNodeId(), featureIds, otherNode.getId(), otherNodeHasFeature ? featureIds : Set.of())
+                )
+        );
+    }
+
+    /**
+     * Expects exactly {@code expectedCount} log messages that contain {@code text}. MockLog's own expectations only check that a message is
+     * seen at least once, or never, so they would not catch the same message being logged twice.
+     */
+    private static MockLog.LoggingExpectation logMessagesContaining(String text, int expectedCount) {
+        final var seen = new AtomicInteger();
+        return new MockLog.LoggingExpectation() {
+            @Override
+            public void match(LogEvent event) {
+                if (event.getMessage().getFormattedMessage().contains(text)) {
+                    seen.incrementAndGet();
+                }
+            }
+
+            @Override
+            public void assertMatched() {
+                assertThat(seen.get(), equalTo(expectedCount));
+            }
+        };
+    }
+
     private record TestHarness(
         StatelessPlugin stateless,
         ShardId shardId,
@@ -278,6 +434,8 @@ public class StatelessSnapshotShardContextFactoryTests extends ESTestCase {
             )
         );
         when(stateless.getClusterService()).thenReturn(clusterService);
+        when(stateless.getFeatureService()).thenReturn(new FeatureService(List.of(new SnapshotCopiedBlobFeatures())));
+        when(stateless.shardBlobContainerFunc()).thenReturn((shardId, primaryTerm) -> mock(BlobContainer.class));
         final var indicesService = mock(IndicesService.class);
         when(stateless.getIndicesService()).thenReturn(indicesService);
 
