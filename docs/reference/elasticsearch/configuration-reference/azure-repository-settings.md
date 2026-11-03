@@ -139,6 +139,12 @@ PUT _snapshot/my_backup
 `max_concurrent_batch_deletes`
 :   (integer) Sets the maximum number of concurrent batch delete requests that will be submitted for any individual bulk delete with `BlobBatch`. Note that the effective number of concurrent deletes is further limited by the Azure client connection and event loop thread limits. Defaults to 10, minimum is 1, maximum is 100.
 
+`copy_block_size` {applies_to}`stack: ga 9.7+`
+:   ([byte value](/reference/elasticsearch/rest-apis/api-conventions.md#byte-units)) The size of the blocks that a copy between two Azure storage accounts is split into. A block is a part of a blob. Azure keeps the blocks apart until a [Put Block List](https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-list) request commits them, that is, joins them into the blob. {{es}} asks Azure to fill each block of the new blob from a byte range of the source blob (the [Put Block From URL](https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-from-url) operation), and then sends one Put Block List request. The new blob appears only after that request. A blob can have at most 50,000 blocks, so a copy fails if the blob needs more blocks than that. A copy between two storage accounts needs the `sas_token` setting on the client of the source. Defaults to `100mb`, minimum is `1b`, maximum is `4000mb`. A copy inside one storage account does not use blocks.
+
+`max_concurrent_copy_blocks` {applies_to}`stack: ga 9.7+`
+:   (integer) The maximum number of blocks of a single copy between two storage accounts that {{es}} copies at the same time. Each block that is being copied uses one connection of the Azure client, so the number is also limited by `azure.client.CLIENT_NAME.max_connections`. All requests that use the same client share those connections. Defaults to 8, minimum is 1, maximum is 100.
+
 `data_access_tier` {applies_to}`stack: ga 9.5`
 :   Sets the azure access tier for data blobs in the repository. These blobs hold the files that make up each snapshotted shard and make up most of the repository volume, but are only read when restoring a shard or accessing its contents (for example, searchable snapshots read this data).
 

@@ -154,6 +154,8 @@ public class AzureBlobStore implements BlobStore {
     private final int maxConcurrentBatchDeletes;
     private final int multipartUploadMaxConcurrency;
     private final TimeValue copyPollInterval;
+    private final ByteSizeValue copyBlockSize;
+    private final int maxConcurrentCopyBlocks;
 
     private final RequestMetricsRecorder requestMetricsRecorder;
     private final AzureClientProvider.RequestMetricsHandler requestMetricsHandler;
@@ -185,6 +187,8 @@ public class AzureBlobStore implements BlobStore {
         this.maxConcurrentBatchDeletes = Repository.MAX_CONCURRENT_BATCH_DELETES_SETTING.get(metadata.settings());
         this.multipartUploadMaxConcurrency = service.getMultipartUploadMaxConcurrency();
         this.copyPollInterval = Repository.COPY_POLL_INTERVAL.get(metadata.settings());
+        this.copyBlockSize = Repository.COPY_BLOCK_SIZE_SETTING.get(metadata.settings());
+        this.maxConcurrentCopyBlocks = Repository.MAX_CONCURRENT_COPY_BLOCKS_SETTING.get(metadata.settings());
         this.dataAccessTier = initAccessTier(dataAccessTier);
         this.metadataAccessTier = initAccessTier(metadataAccessTier);
 
@@ -195,6 +199,7 @@ public class AzureBlobStore implements BlobStore {
                 Operation.GET_BLOB
             ),
             new RequestMatcher(AzureBlobStore::isListRequest, Operation.LIST_BLOBS),
+            new RequestMatcher(AzureBlobStore::isPutBlockFromUrlRequest, Operation.PUT_BLOCK_FROM_URL),
             new RequestMatcher(AzureBlobStore::isPutBlockRequest, Operation.PUT_BLOCK),
             new RequestMatcher(AzureBlobStore::isPutBlockListRequest, Operation.PUT_BLOCK_LIST),
             new RequestMatcher(
@@ -202,7 +207,7 @@ public class AzureBlobStore implements BlobStore {
                 // The only URI parameter allowed for put-blob operation is "timeout", but if a sas token is used,
                 // it's possible that the URI parameters contain additional parameters unrelated to the upload type.
                 httpRequest -> httpRequest.getHttpMethod() == HttpMethod.PUT
-                    && isPutBlockRequest(httpRequest) == false
+                    && isStageBlockRequest(httpRequest) == false
                     && isPutBlockListRequest(httpRequest) == false
                     && isCopyRequest(httpRequest) == false,
                 Operation.PUT_BLOB
@@ -262,6 +267,21 @@ public class AzureBlobStore implements BlobStore {
 
     // https://docs.microsoft.com/en-us/rest/api/storageservices/put-block
     private static boolean isPutBlockRequest(HttpRequest httpRequest) {
+        return isStageBlockRequest(httpRequest) && hasCopySource(httpRequest) == false;
+    }
+
+    // https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-from-url
+    private static boolean isPutBlockFromUrlRequest(HttpRequest httpRequest) {
+        return isStageBlockRequest(httpRequest) && hasCopySource(httpRequest);
+    }
+
+    /**
+     * Whether the request stages a block. To stage a block is to upload it as an uncommitted block, which stays apart until a Put Block
+     * List request commits it. Azure has two such requests. Put Block sends the bytes in the body. Put Block From URL names a source blob
+     * in the {@code x-ms-copy-source} header and has no body. The two have the same method and query. Only Put Block From URL has a copy
+     * source.
+     */
+    private static boolean isStageBlockRequest(HttpRequest httpRequest) {
         final URL url = httpRequest.getUrl();
         String queryParams = url.getQuery() == null ? "" : url.getQuery();
         return httpRequest.getHttpMethod() == HttpMethod.PUT && queryParams.contains("comp=block") && queryParams.contains("blockid=");
@@ -276,8 +296,11 @@ public class AzureBlobStore implements BlobStore {
 
     // https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob
     private static boolean isCopyRequest(HttpRequest httpRequest) {
-        return httpRequest.getHttpMethod() == HttpMethod.PUT
-            && httpRequest.getHeaders().get(HttpHeaderName.fromString("x-ms-copy-source")) != null;
+        return httpRequest.getHttpMethod() == HttpMethod.PUT && hasCopySource(httpRequest) && isStageBlockRequest(httpRequest) == false;
+    }
+
+    private static boolean hasCopySource(HttpRequest httpRequest) {
+        return httpRequest.getHeaders().get(HttpHeaderName.fromString("x-ms-copy-source")) != null;
     }
 
     public long getReadChunkSize() {
@@ -794,7 +817,40 @@ public class AzureBlobStore implements BlobStore {
         return service.getClientsManager().getClientSettings(projectId, clientName);
     }
 
-    public void copyBlob(OperationPurpose purpose, String sourceBlobName, AzureBlobStore sourceBlobStore, String blobName)
+    /**
+     * Copies the blob {@code sourceBlobName} of {@code sourceBlobStore} to the blob {@code blobName} of this store.
+     * <p>
+     * How the copy runs depends on the storage accounts of the two stores. A storage account is the Azure resource that holds containers
+     * and blobs. Two stores are in the same storage account when their clients have the same storage endpoint. The names of the accounts
+     * are not compared.
+     * <ul>
+     * <li>Same storage account: this method sends a Copy Blob request. Azure does such a copy at once (in a measurement, 2 GB took 0.3
+     * seconds), and this method polls the status of the copy until Azure reports that it is done.</li>
+     * <li>Different storage accounts: Azure has to move the bytes. It runs a Copy Blob between accounts in the background and worked on
+     * only a few copies at a time. In a measurement of ten copies of 2 GB blobs at once, the ten together took between 124 and 326
+     * seconds. So this method splits the source blob into blocks of {@code copy_block_size} bytes. It asks Azure to fill each block of
+     * the new blob from a byte range of the source blob (Put Block From URL), with up to {@code max_concurrent_copy_blocks} requests at
+     * the same time. Then it sends one Put Block List request, which commits the blocks, that is, joins them into the new blob. No bytes
+     * pass through this node. The same ten copies took about six seconds this way.</li>
+     * </ul>
+     * A blob with no bytes has no byte range to copy, so it always uses Copy Blob.
+     * <p>
+     * Azure reads the source blob by its URL. So when the two stores are in different storage accounts, the client of the source store
+     * needs a SAS (shared access signature) token. This is checked first, so an empty blob needs the token too.
+     * <p>
+     * In a copy in blocks, the new blob appears only when the block list is committed. If the copy fails before that, the blocks that
+     * Azure has already copied stay uncommitted. Azure does not show them as a blob, and it discards them after a week, see
+     * https://docs.microsoft.com/en-us/rest/api/storageservices/put-block#remarks. A delete of the new blob after such a failure may find
+     * no blob, and the caller can ignore that.
+     *
+     * @param blobSize the exact length of the source blob in bytes. A copy between two storage accounts uses it to work out the blocks
+     *                 and does not check it, so a value below the real length gives a shorter new blob without an error. A copy inside
+     *                 one storage account does not use it.
+     * @throws NoSuchFileException      if the source blob does not exist
+     * @throws IllegalArgumentException if the stores are in different storage accounts and the source has no SAS token
+     * @throws IOException              if the copy fails, or if the blob needs more than 50,000 blocks of the chosen size
+     */
+    public void copyBlob(OperationPurpose purpose, String sourceBlobName, AzureBlobStore sourceBlobStore, String blobName, long blobSize)
         throws IOException {
 
         try (var sourceClient = sourceBlobStore.getAzureBlobServiceClientClient(purpose)) {
@@ -803,50 +859,149 @@ public class AzureBlobStore implements BlobStore {
                 .getBlobClient(sourceBlobName);
             String sourceUrl = sourceBlobSyncClient.getBlobUrl();
             final AzureStorageSettings sourceStorageSettings = sourceBlobStore.getStorageSettings();
+            final boolean sameStorageAccount = sourceStorageSettings.getStorageEndpoint().equals(getStorageSettings().getStorageEndpoint());
             String sasToken = sourceStorageSettings.getSasToken();
-            if (Strings.hasText(sasToken)) {
-                sourceUrl += "?" + sasToken;
-            } else {
-                final AzureStorageSettings.StorageEndpoint storageEndpoint = getStorageSettings().getStorageEndpoint();
-                if (sourceStorageSettings.getStorageEndpoint().equals(storageEndpoint) == false) {
-                    // learn.microsoft.com/en-us/rest/api/storageservices/copy-blob
-                    // As of now we only expect to copy across the same storage account
-                    throw new IllegalArgumentException(
-                        "Cannot copy blob ["
-                            + sourceBlobName
-                            + "] to ["
-                            + blobName
-                            + "] across different Azure storage accounts without an SAS token"
-                    );
-                }
+            final boolean hasSasToken = Strings.hasText(sasToken);
+            if (hasSasToken) {
+                // The SAS token that the Azure portal shows starts with a question mark. The code adds its own question mark between the
+                // URL and the token, so it drops the one in the token.
+                sourceUrl += "?" + (sasToken.startsWith("?") ? sasToken.substring(1) : sasToken);
+            } else if (sameStorageAccount == false) {
+                // Azure reads the source blob by its URL, for Copy Blob and for Put Block From URL, and this code authorizes the read
+                // with a SAS token. So a source in another storage account needs one. See
+                // https://learn.microsoft.com/en-us/rest/api/storageservices/copy-blob and
+                // https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-from-url
+                throw new IllegalArgumentException(
+                    "Cannot copy blob ["
+                        + sourceBlobName
+                        + "] to ["
+                        + blobName
+                        + "] across different Azure storage accounts without an SAS token"
+                );
             }
 
-            try (var client = getAzureBlobServiceClientClient(purpose)) {
-                final BlobServiceClient syncClient = client.getSyncClient();
-                final BlobClient blobSyncClient = syncClient.getBlobContainerClient(container).getBlobClient(blobName);
-                try {
-                    final var copyOptions = new BlobBeginCopyOptions(sourceUrl).setPollInterval(
-                        Duration.ofMillis(copyPollInterval.millis())
-                    );
-                    resolveAccessTier(purpose).ifPresent(copyOptions::setTier);
-                    PollResponse<BlobCopyInfo> response = blobSyncClient.beginCopy(copyOptions).waitForCompletion();
-                    LongRunningOperationStatus status = response.getStatus();
-                    if (status != LongRunningOperationStatus.SUCCESSFULLY_COMPLETED) {
-                        throw new IOException("Copy from " + sourceBlobName + " to " + blobName + " failed: " + response.getStatus());
-                    }
-                } catch (BlobStorageException e) {
-                    boolean blobNotFound = BlobErrorCode.BLOB_NOT_FOUND.equals(e.getErrorCode());
-                    boolean blobNotFoundWithSasToken = Strings.hasText(sasToken)
-                        && BlobErrorCode.CANNOT_VERIFY_COPY_SOURCE.equals(e.getErrorCode())
-                        && e.getServiceMessage() != null
-                        && e.getServiceMessage().contains("<CopySourceErrorCode>BlobNotFound</CopySourceErrorCode>");
-                    if (e.getStatusCode() == RestStatus.NOT_FOUND.getStatus() && (blobNotFound || blobNotFoundWithSasToken)) {
-                        throw new NoSuchFileException("Copy source [" + sourceBlobName + "] not found: " + e.getMessage());
-                    }
-                    throw new IOException("Unable to copy object [" + blobName + "] from [" + sourceBlobName + "]", e);
-                }
+            if (sameStorageAccount || blobSize == 0) {
+                copyBlobWithCopyBlob(purpose, sourceUrl, sourceBlobName, blobName, hasSasToken);
+            } else {
+                copyBlobInBlocks(purpose, sourceUrl, sourceBlobName, blobName, blobSize, hasSasToken);
             }
         }
+    }
+
+    private void copyBlobWithCopyBlob(
+        OperationPurpose purpose,
+        String sourceUrl,
+        String sourceBlobName,
+        String blobName,
+        boolean hasSasToken
+    ) throws IOException {
+        try (var client = getAzureBlobServiceClientClient(purpose)) {
+            final BlobServiceClient syncClient = client.getSyncClient();
+            final BlobClient blobSyncClient = syncClient.getBlobContainerClient(container).getBlobClient(blobName);
+            try {
+                final var copyOptions = new BlobBeginCopyOptions(sourceUrl).setPollInterval(Duration.ofMillis(copyPollInterval.millis()));
+                resolveAccessTier(purpose).ifPresent(copyOptions::setTier);
+                PollResponse<BlobCopyInfo> response = blobSyncClient.beginCopy(copyOptions).waitForCompletion();
+                LongRunningOperationStatus status = response.getStatus();
+                if (status != LongRunningOperationStatus.SUCCESSFULLY_COMPLETED) {
+                    throw new IOException("Copy from " + sourceBlobName + " to " + blobName + " failed: " + response.getStatus());
+                }
+            } catch (BlobStorageException e) {
+                throw copyFailure(e, hasSasToken, sourceBlobName, blobName);
+            }
+        }
+    }
+
+    private void copyBlobInBlocks(
+        OperationPurpose purpose,
+        String sourceUrl,
+        String sourceBlobName,
+        String blobName,
+        long blobSize,
+        boolean hasSasToken
+    ) throws IOException {
+        final List<CopyBlock> blocks = computeCopyBlocks(blobName, blobSize, copyBlockSize.getBytes());
+        logger.debug(
+            "{}: copying [{}] bytes from [{}] in [{}] blocks, at most [{}] at a time",
+            blobName,
+            blobSize,
+            sourceBlobName,
+            blocks.size(),
+            maxConcurrentCopyBlocks
+        );
+        try (var client = getAzureBlobServiceClientClient(purpose)) {
+            final BlockBlobAsyncClient asyncClient = client.getAsyncClient()
+                .getBlobContainerAsyncClient(container)
+                .getBlobAsyncClient(blobName)
+                .getBlockBlobAsyncClient();
+            Flux.fromIterable(blocks)
+                .flatMap(block -> stageBlockFromUrl(asyncClient, sourceUrl, blobName, block), maxConcurrentCopyBlocks)
+                // If a block fails, the commit does not run, and the blocks that Azure has already copied stay uncommitted. See the
+                // Javadoc of copyBlob.
+                .then(Mono.defer(() -> {
+                    logger.debug("{}: all [{}] blocks copied, now committing", blobName, blocks.size());
+                    final var commitOptions = new BlockBlobCommitBlockListOptions(blocks.stream().map(CopyBlock::blockId).toList());
+                    resolveAccessTier(purpose).ifPresent(commitOptions::setTier);
+                    return asyncClient.commitBlockListWithResponse(commitOptions);
+                }))
+                .block();
+        } catch (BlobStorageException e) {
+            throw copyFailure(e, hasSasToken, sourceBlobName, blobName);
+        } catch (RuntimeException e) {
+            throw new IOException("Unable to copy object [" + blobName + "] from [" + sourceBlobName + "]", e);
+        }
+    }
+
+    private static Mono<Void> stageBlockFromUrl(BlockBlobAsyncClient asyncClient, String sourceUrl, String blobName, CopyBlock block) {
+        logger.debug("{}: copying block of [{}] bytes from offset [{}] of the source", blobName, block.length(), block.offset());
+        return asyncClient.stageBlockFromUrl(block.blockId(), sourceUrl, new BlobRange(block.offset(), block.length()))
+            .doOnSuccess(unused -> logger.debug("{}: copied block from offset [{}] of the source", blobName, block.offset()));
+    }
+
+    /**
+     * A block of a copy between two storage accounts: a byte range of the source blob, and the id of the block in the new blob.
+     */
+    private record CopyBlock(String blockId, long offset, long length) {}
+
+    private static List<CopyBlock> computeCopyBlocks(String blobName, long blobSize, long blockSize) throws IOException {
+        if (blobSize <= 0 || blockSize <= 0) {
+            throw new IllegalArgumentException("Blob size [" + blobSize + "] and block size [" + blockSize + "] must be greater than zero");
+        }
+        final long blockCount = blobSize / blockSize + (blobSize % blockSize == 0 ? 0 : 1);
+        if (blockCount > AzureRepository.Repository.MAX_BLOCK_NUMBER) {
+            throw new IOException(
+                "Cannot copy blob ["
+                    + blobName
+                    + "]: its ["
+                    + blobSize
+                    + "] bytes need ["
+                    + blockCount
+                    + "] blocks of ["
+                    + blockSize
+                    + "] bytes, and a blob can have at most ["
+                    + AzureRepository.Repository.MAX_BLOCK_NUMBER
+                    + "] blocks. Raise the repository setting ["
+                    + AzureRepository.Repository.COPY_BLOCK_SIZE_SETTING.getKey()
+                    + "]"
+            );
+        }
+        final List<CopyBlock> blocks = new ArrayList<>(Math.toIntExact(blockCount));
+        for (long offset = 0; offset < blobSize; offset += blockSize) {
+            blocks.add(new CopyBlock(makeMultipartBlockId(), offset, Math.min(blockSize, blobSize - offset)));
+        }
+        return blocks;
+    }
+
+    private static IOException copyFailure(BlobStorageException e, boolean hasSasToken, String sourceBlobName, String blobName) {
+        boolean blobNotFound = BlobErrorCode.BLOB_NOT_FOUND.equals(e.getErrorCode());
+        boolean blobNotFoundWithSasToken = hasSasToken
+            && BlobErrorCode.CANNOT_VERIFY_COPY_SOURCE.equals(e.getErrorCode())
+            && e.getServiceMessage() != null
+            && e.getServiceMessage().contains("<CopySourceErrorCode>BlobNotFound</CopySourceErrorCode>");
+        if (e.getStatusCode() == RestStatus.NOT_FOUND.getStatus() && (blobNotFound || blobNotFoundWithSasToken)) {
+            return new NoSuchFileException("Copy source [" + sourceBlobName + "] not found: " + e.getMessage());
+        }
+        return new IOException("Unable to copy object [" + blobName + "] from [" + sourceBlobName + "]", e);
     }
 
     private static final Base64.Encoder base64Encoder = Base64.getEncoder().withoutPadding();
@@ -1141,6 +1296,7 @@ public class AzureBlobStore implements BlobStore {
         PUT_BLOB("PutBlob"),
         PUT_BLOCK("PutBlock"),
         PUT_BLOCK_LIST("PutBlockList"),
+        PUT_BLOCK_FROM_URL("PutBlockFromURL"),
         BLOB_BATCH("BlobBatch"),
         COPY_BLOB("CopyBlob");
 

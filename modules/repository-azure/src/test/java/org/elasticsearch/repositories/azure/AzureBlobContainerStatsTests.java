@@ -103,7 +103,8 @@ public class AzureBlobContainerStatsTests extends AbstractAzureServerTestCase {
 
         String blobName = randomIdentifier();
         // PUT_BLOB
-        blobStore.writeBlob(purpose, blobName, BytesReference.fromByteBuffer(ByteBuffer.wrap(randomBlobContent())), false);
+        final byte[] smallBlob = randomBlobContent();
+        blobStore.writeBlob(purpose, blobName, BytesReference.fromByteBuffer(ByteBuffer.wrap(smallBlob)), false);
         // LIST_BLOBS
         blobStore.listBlobsByPrefix(purpose, randomIdentifier(), randomIdentifier());
         // GET_BLOB_PROPERTIES
@@ -117,7 +118,7 @@ public class AzureBlobContainerStatsTests extends AbstractAzureServerTestCase {
         // BLOB_BATCH
         blobStore.deleteBlobs(purpose, List.of(randomIdentifier(), randomIdentifier(), randomIdentifier()).iterator());
         // COPY_BLOB
-        blobStore.copyBlob(purpose, blobName, blobStore, randomIdentifier());
+        blobStore.copyBlob(purpose, blobName, blobStore, randomIdentifier(), smallBlob.length);
 
         Map<String, BlobStoreActionStats> stats = blobStore.stats();
         String statsMapString = stats.toString();
@@ -142,7 +143,8 @@ public class AzureBlobContainerStatsTests extends AbstractAzureServerTestCase {
 
             String blobName = randomIdentifier();
             // PUT_BLOB
-            blobStore.writeBlob(purpose, blobName, BytesReference.fromByteBuffer(ByteBuffer.wrap(randomBlobContent())), false);
+            final byte[] smallBlob = randomBlobContent();
+            blobStore.writeBlob(purpose, blobName, BytesReference.fromByteBuffer(ByteBuffer.wrap(smallBlob)), false);
             // LIST_BLOBS
             blobStore.listBlobsByPrefix(purpose, randomIdentifier(), randomIdentifier());
             // GET_BLOB_PROPERTIES
@@ -156,7 +158,7 @@ public class AzureBlobContainerStatsTests extends AbstractAzureServerTestCase {
             // BLOB_BATCH
             blobStore.deleteBlobs(purpose, List.of(randomIdentifier(), randomIdentifier(), randomIdentifier()).iterator());
             // COPY_BLOB
-            blobStore.copyBlob(purpose, blobName, blobStore, randomIdentifier());
+            blobStore.copyBlob(purpose, blobName, blobStore, randomIdentifier(), smallBlob.length);
         }
 
         Map<String, BlobStoreActionStats> stats = blobStore.stats();

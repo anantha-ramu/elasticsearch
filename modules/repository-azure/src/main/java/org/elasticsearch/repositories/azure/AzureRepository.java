@@ -175,6 +175,37 @@ public class AzureRepository extends MeteredBlobStoreRepository {
         );
 
         /**
+         * The largest block that Azure accepts in a Put Block From URL request. A version of the Azure REST API is a date. The limit is
+         * 4000 MiB for version 2019-12-12 and later, and 100 MiB for earlier versions. The Azure SDK that this module uses sends a later
+         * version. See https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-from-url
+         */
+        static final ByteSizeValue MAX_COPY_BLOCK_SIZE = ByteSizeValue.of(4000, ByteSizeUnit.MB);
+
+        /**
+         * The size of the blocks that a copy between two storage accounts is split into. A block is a part of a blob that Azure keeps
+         * apart until a Put Block List request commits it, that is, joins the blocks into the blob. The code asks Azure to fill each
+         * block of the new blob from a byte range of the source blob (Put Block From URL), and then sends one Put Block List request. The
+         * last block can be shorter than the others.
+         */
+        static final Setting<ByteSizeValue> COPY_BLOCK_SIZE_SETTING = Setting.byteSizeSetting(
+            "copy_block_size",
+            ByteSizeValue.of(100, ByteSizeUnit.MB),
+            MIN_CHUNK_SIZE,
+            MAX_COPY_BLOCK_SIZE,
+            Property.NodeScope
+        );
+
+        /**
+         * How many blocks of a single copy between two storage accounts are copied at the same time. A block that is being copied holds
+         * one connection of the destination client until Azure has copied it. The client has a limited number of connections. The limit
+         * is {@code azure.client.CLIENT_NAME.max_connections}, which defaults to {@code
+         * repository.azure.http_client.max_open_connections}. All requests that use the same client share the connections, including
+         * other copies. A request that finds no free connection waits for one, for at most {@code
+         * repository.azure.http_client.connection_timeout}, and then the attempt fails.
+         */
+        static final Setting<Integer> MAX_CONCURRENT_COPY_BLOCKS_SETTING = Setting.intSetting("max_concurrent_copy_blocks", 8, 1, 100);
+
+        /**
          * The batch size for batched delete requests
          */
         static final Setting<Integer> DELETION_BATCH_SIZE_SETTING = Setting.intSetting(

@@ -63,6 +63,7 @@ public class AzureHttpHandler implements HttpHandler {
     static final String X_MS_BLOB_TYPE = "x-ms-blob-type";
     static final String X_MS_BLOB_CONTENT_LENGTH = "x-ms-blob-content-length";
     static final String X_MS_COPY_SOURCE = "x-ms-copy-source";
+    static final String X_MS_SOURCE_RANGE = "x-ms-source-range";
     static final String X_MS_ACCESS_TIER = "x-ms-access-tier";
 
     private final String account;
@@ -141,12 +142,25 @@ public class AzureHttpHandler implements HttpHandler {
         }
         try {
             if (Regex.simpleMatch("PUT /" + account + "/" + container + "/*blockid=*", request)) {
-                // Put Block (https://docs.microsoft.com/en-us/rest/api/storageservices/put-block)
+                // Put Block (https://docs.microsoft.com/en-us/rest/api/storageservices/put-block), or Put Block From URL
+                // (https://learn.microsoft.com/en-us/rest/api/storageservices/put-block-from-url), which has a copy source and no body
                 final var params = RequestParams.fromQueryString(exchange.getRequestURI().getRawQuery());
 
                 final String blockId = params.get("blockid");
                 assert assertValidBlockId(blockId);
-                mockAzureBlobStore.putBlock(blobPath(exchange), blockId, Streams.readFully(exchange.getRequestBody()), leaseId(exchange));
+                final BytesReference body = Streams.readFully(exchange.getRequestBody());
+                final String copySourceUrl = exchange.getRequestHeaders().getFirst(X_MS_COPY_SOURCE);
+                final BytesReference blockContent;
+                if (copySourceUrl == null) {
+                    blockContent = body;
+                } else {
+                    assert body.length() == 0 : "Put Block From URL should have no body but had " + body.length() + " bytes";
+                    blockContent = readSourceRange(exchange, copySourceUrl);
+                    if (blockContent == null) {
+                        return; // readSourceRange has already sent the error response
+                    }
+                }
+                mockAzureBlobStore.putBlock(blobPath(exchange), blockId, blockContent, leaseId(exchange));
                 exchange.sendResponseHeaders(RestStatus.CREATED.getStatus(), -1);
 
             } else if (Regex.simpleMatch("PUT /" + account + "/" + container + "/*comp=blocklist*", request)) {
@@ -544,6 +558,59 @@ public class AzureHttpHandler implements HttpHandler {
         }
     }
 
+    /**
+     * Returns the bytes that a Put Block From URL request asks for: the part of the source blob that the {@code x-ms-source-range} header
+     * selects, or the whole blob if the request has no such header.
+     * <p>
+     * The fixture reads the source from its own store, so the source must be a blob of this account and container. Any other source fails
+     * an assertion. The fixture does not check the query of the source URL, which is where a SAS token goes.
+     * <p>
+     * If the source blob does not exist, this method sends a 404 error and returns null, and the caller must stop handling the request. A
+     * bad range is thrown as an error, and the catch block of the handler sends it.
+     */
+    @Nullable
+    private BytesReference readSourceRange(HttpExchange exchange, String copySourceUrl) throws IOException {
+        final String sourceBlobPath = stripPrefix(
+            "/" + account + "/" + container + "/",
+            URI.create(RestUtils.decodeComponent(copySourceUrl)).getPath()
+        );
+        final BytesReference contents;
+        try {
+            contents = mockAzureBlobStore.getBlob(sourceBlobPath, null).getContents();
+        } catch (MockAzureBlobStore.BlobNotFoundException e) {
+            // Azure uses the code CannotVerifyCopySource when it cannot read the copy source, and the body says why. We assume the same
+            // for Put Block From URL. AzureBlobStore.copyFailure reads the body to tell a missing source from other errors.
+            sendError(
+                exchange,
+                RestStatus.NOT_FOUND,
+                "CannotVerifyCopySource",
+                e.getMessage(),
+                "<CopySourceStatusCode>404</CopySourceStatusCode><CopySourceErrorCode>BlobNotFound</CopySourceErrorCode>"
+            );
+            return null;
+        }
+        final String sourceRange = exchange.getRequestHeaders().getFirst(X_MS_SOURCE_RANGE);
+        if (sourceRange == null) {
+            return contents;
+        }
+        final HttpHeaderParser.Range range = HttpHeaderParser.parseRangeHeader(sourceRange);
+        if (range == null || range.isSuffixRange()) {
+            throw new MockAzureBlobStore.BadRequestException(
+                "InvalidHeaderValue",
+                "Source range header does not match expected format: " + sourceRange
+            );
+        }
+        final HttpHeaderParser.ResolvedRange resolved = range.resolveAgainst(contents.length());
+        if (resolved == null) {
+            throw new MockAzureBlobStore.AzureBlobStoreError(
+                RestStatus.REQUESTED_RANGE_NOT_SATISFIED,
+                "InvalidRange",
+                "The range specified is invalid for the current size of the resource."
+            );
+        }
+        return contents.slice(Math.toIntExact(resolved.start()), Math.toIntExact(resolved.length()));
+    }
+
     private String requireHeader(HttpExchange exchange, String headerName) {
         final String headerValue = exchange.getRequestHeaders().getFirst(headerName);
         if (headerValue == null) {
@@ -603,6 +670,17 @@ public class AzureHttpHandler implements HttpHandler {
     }
 
     public static void sendError(HttpExchange exchange, RestStatus restStatus, String errorCode, String errorMessage) throws IOException {
+        sendError(exchange, restStatus, errorCode, errorMessage, "");
+    }
+
+    /**
+     * Sends an Azure error response. The body has the error code and the message, then {@code extraElements}. None of the three is XML
+     * escaped.
+     *
+     * @param extraElements XML elements to add to the error body after the message, or an empty string
+     */
+    public static void sendError(HttpExchange exchange, RestStatus restStatus, String errorCode, String errorMessage, String extraElements)
+        throws IOException {
         final Headers headers = exchange.getResponseHeaders();
         headers.add("Content-Type", "application/xml");
 
@@ -623,8 +701,8 @@ public class AzureHttpHandler implements HttpHandler {
                 <?xml version="1.0" encoding="UTF-8"?>
                 <Error>
                     <Code>%s</Code>
-                    <Message>%s</Message>
-                </Error>""", errorCode, errorMessage)).getBytes(StandardCharsets.UTF_8);
+                    <Message>%s</Message>%s
+                </Error>""", errorCode, errorMessage, extraElements)).getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(restStatus.getStatus(), response.length);
             exchange.getResponseBody().write(response);
         }
