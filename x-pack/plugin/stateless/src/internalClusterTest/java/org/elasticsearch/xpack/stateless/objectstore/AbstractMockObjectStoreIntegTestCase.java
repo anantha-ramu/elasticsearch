@@ -9,13 +9,16 @@ package org.elasticsearch.xpack.stateless.objectstore;
 
 import com.sun.net.httpserver.HttpHandler;
 
+import org.apache.logging.log4j.Level;
 import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotResponse;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.Maps;
 import org.elasticsearch.core.SuppressForbidden;
+import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 import org.elasticsearch.repositories.blobstore.ESMockAPIBasedRepositoryIntegTestCase;
 import org.elasticsearch.snapshots.SnapshotInfo;
 import org.elasticsearch.snapshots.SnapshotState;
+import org.elasticsearch.test.MockLog;
 import org.elasticsearch.xpack.stateless.commits.StatelessCommitService;
 import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings;
 import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.StatelessSnapshotEnabledStatus;
@@ -27,6 +30,7 @@ import org.junit.BeforeClass;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
@@ -134,18 +138,31 @@ public abstract class AbstractMockObjectStoreIntegTestCase extends AbstractObjec
         final var copyRequests = new AtomicInteger();
         refuseCopiesAfterTheFirst(copyRequests);
 
-        final CreateSnapshotResponse response = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, "backup", "snapshot")
-            .setIndices(indexName)
-            .setPartial(true)
-            .setWaitForCompletion(true)
-            .get();
-        final SnapshotInfo snapshotInfo = response.getSnapshotInfo();
+        // The failed attempt logs the copies it made before its cleanup deletes them. Exactly one copy returned, the allowed one.
+        final var response = new AtomicReference<CreateSnapshotResponse>();
+        MockLog.assertThatLogger(
+            () -> response.set(
+                clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, "backup", "snapshot")
+                    .setIndices(indexName)
+                    .setPartial(true)
+                    .setWaitForCompletion(true)
+                    .get()
+            ),
+            BlobStoreRepository.class,
+            new MockLog.SeenEventExpectation(
+                "the failed attempt made the allowed copy",
+                BlobStoreRepository.class.getCanonicalName(),
+                Level.INFO,
+                "*shard snapshot copy stats: attempt [failed], copies made [1], copied bytes [*], total copy time [*ms]"
+            )
+        );
+        final SnapshotInfo snapshotInfo = response.get().getSnapshotInfo();
         assertThat(snapshotInfo.state(), equalTo(SnapshotState.PARTIAL));
         assertThat(snapshotInfo.shardFailures(), hasSize(1));
         assertThat(snapshotInfo.shardFailures().get(0).reason(), containsString(accessDeniedText()));
         // there was a copy that was allowed, and a copy that was refused
         assertThat(copyRequests.get(), greaterThanOrEqualTo(2));
-        // the allowed copy was deleted
+        // the allowed copy was made, as the log line above says, and the failure cleanup deleted it
         assertThat(blobPathsInFakeStorage().stream().filter(path -> path.contains("/c__")).toList(), empty());
     }
 }
