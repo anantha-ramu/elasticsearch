@@ -11,6 +11,7 @@ import org.apache.logging.log4j.Level;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotResponse;
 import org.elasticsearch.action.admin.cluster.snapshots.restore.RestoreSnapshotResponse;
+import org.elasticsearch.client.Request;
 import org.elasticsearch.cluster.SnapshotDeletionsInProgress;
 import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;
@@ -34,12 +35,14 @@ import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 import org.elasticsearch.repositories.blobstore.BlobStoreTestUtil;
 import org.elasticsearch.repositories.blobstore.ESBlobStoreRepositoryIntegTestCase;
+import org.elasticsearch.repositories.blobstore.testkit.SnapshotRepositoryTestKit;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.snapshots.SnapshotInfo;
 import org.elasticsearch.snapshots.SnapshotState;
 import org.elasticsearch.test.InternalSettingsPlugin;
 import org.elasticsearch.test.MockLog;
 import org.elasticsearch.test.NodeShutdownTestUtils;
+import org.elasticsearch.test.rest.ObjectPath;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.threadpool.ThreadPoolStats;
 import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
@@ -112,12 +115,18 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         final var plugins = new ArrayList<>(super.nodePlugins());
         plugins.add(StatelessMockRepositoryPlugin.class);
         plugins.add(InternalSettingsPlugin.class);
+        plugins.add(SnapshotRepositoryTestKit.class);
         return List.copyOf(plugins);
     }
 
     @Override
     protected boolean addMockFsRepository() {
         return false;
+    }
+
+    @Override
+    protected boolean addMockHttpTransport() {
+        return false; // enable HTTP, which the verify integrity API needs
     }
 
     /**
@@ -424,6 +433,9 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         assertAcked(indicesAdmin().prepareDelete(indexName));
         restore(repoName, "snap", indexName, indexName);
         assertHitCount(prepareSearch(indexName), docCount);
+
+        // the targets started with copies of their source's commit blobs, so check the content of every copied file in the repository
+        assertVerifyIntegrityPasses(repoName, indexName, "snap");
     }
 
     /**
@@ -1290,6 +1302,44 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
             assertThat(blobs.stream().filter(name -> name.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX)).toList(), empty());
             assertThat(copiedBlobs(repoName, indexName, shard), equalTo(referencedCopies));
         }
+    }
+
+    /**
+     * Runs the verify integrity API on the repository, with the contents of every blob checked. Each problem that the API finds is reported
+     * as an anomaly. This method checks that there is no anomaly, that the API really read blob contents, and that it finds the snapshot
+     * restorable.
+     * <p>
+     * For a copied file, the API reads the byte range that the file info names in the copied blob. The API then compares the checksum of
+     * that range with the checksum in the file info. If the offset or length is wrong, the checksums differ, so the API reports an anomaly.
+     */
+    private void assertVerifyIntegrityPasses(String repoName, String indexName, String snapshotName) throws IOException {
+        final var request = new Request("POST", "/_snapshot/" + repoName + "/_verify_integrity");
+        request.addParameter("verify_blob_contents", null);
+        final var response = getRestClient().performRequest(request);
+        assertEquals(200, response.getStatusLine().getStatusCode());
+        final var responseObjectPath = ObjectPath.createFromResponse(response);
+        assertEquals(0, (int) responseObjectPath.evaluate("results.total_anomalies"));
+        assertEquals("pass", responseObjectPath.evaluate("results.result"));
+        // verify_blob_contents makes the API read the bytes of each blob, so a verified size above zero shows the contents were checked
+        final Number verifiedBytes = responseObjectPath.evaluate("results.status.blobs.verified_size_in_bytes");
+        assertThat(verifiedBytes.longValue(), greaterThan(0L));
+
+        // no anomalies could also mean the API looked at nothing, so check that the API saw the snapshot and found the index restorable
+        final Set<String> seenSnapshotNames = new HashSet<>();
+        boolean seenIndex = false;
+        for (int i = 0; i < responseObjectPath.evaluateArraySize("log"); i++) {
+            final String loggedSnapshotName = responseObjectPath.evaluate("log." + i + ".snapshot.snapshot");
+            if (loggedSnapshotName != null) {
+                seenSnapshotNames.add(loggedSnapshotName);
+            } else {
+                assertEquals(indexName, responseObjectPath.evaluate("log." + i + ".index.name"));
+                assertEquals(1, (int) responseObjectPath.evaluate("log." + i + ".snapshot_restorability.total_snapshot_count"));
+                assertEquals(1, (int) responseObjectPath.evaluate("log." + i + ".snapshot_restorability.restorable_snapshot_count"));
+                seenIndex = true;
+            }
+        }
+        assertEquals(Set.of(snapshotName), seenSnapshotNames);
+        assertTrue(seenIndex);
     }
 
     /**
