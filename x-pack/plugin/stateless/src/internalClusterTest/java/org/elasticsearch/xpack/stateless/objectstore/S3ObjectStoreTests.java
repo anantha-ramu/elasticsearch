@@ -7,6 +7,7 @@
 
 package org.elasticsearch.xpack.stateless.objectstore;
 
+import fixture.s3.BlobEntry;
 import fixture.s3.S3ConsistencyModel;
 import fixture.s3.S3HttpHandler;
 
@@ -16,12 +17,14 @@ import com.sun.net.httpserver.HttpHandler;
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.core.LogEvent;
 import org.elasticsearch.ExceptionsHelper;
+import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotResponse;
 import org.elasticsearch.blobcache.shared.SharedBlobCacheService;
 import org.elasticsearch.blobcache.shared.SharedBytes;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.project.ProjectResolver;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.regex.Regex;
@@ -35,13 +38,22 @@ import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
+import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.plugins.Plugin;
+import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoriesService;
+import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.repositories.RepositoryStats;
+import org.elasticsearch.repositories.ShardGeneration;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
+import org.elasticsearch.repositories.blobstore.ESBlobStoreRepositoryIntegTestCase;
 import org.elasticsearch.repositories.blobstore.ESMockAPIBasedRepositoryIntegTestCase;
 import org.elasticsearch.repositories.s3.S3RepositoryPlugin;
 import org.elasticsearch.rest.RestStatus;
+import org.elasticsearch.snapshots.SnapshotId;
+import org.elasticsearch.snapshots.SnapshotInfo;
+import org.elasticsearch.snapshots.SnapshotState;
 import org.elasticsearch.tasks.CancellableTask;
 import org.elasticsearch.tasks.TaskId;
 import org.elasticsearch.telemetry.metric.MeterRegistry;
@@ -54,6 +66,9 @@ import org.elasticsearch.xpack.stateless.TestUtils;
 import org.elasticsearch.xpack.stateless.action.NewCommitNotificationRequest;
 import org.elasticsearch.xpack.stateless.action.TransportNewCommitNotificationAction;
 import org.elasticsearch.xpack.stateless.commits.BatchedCompoundCommit;
+import org.elasticsearch.xpack.stateless.commits.StatelessCommitService;
+import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings;
+import org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.StatelessSnapshotEnabledStatus;
 import org.junit.Before;
 
 import java.io.IOException;
@@ -62,6 +77,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -83,10 +99,13 @@ import static org.elasticsearch.rest.RestStatus.TOO_MANY_REQUESTS;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
 import static org.elasticsearch.xpack.stateless.cache.SearchCommitPrefetcherDynamicSettings.PREFETCH_COMMITS_UPON_NOTIFICATIONS_ENABLED_SETTING;
 import static org.hamcrest.Matchers.anEmptyMap;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.everyItem;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
@@ -96,6 +115,7 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
     private static final Set<String> EXPECTED_MAIN_STORE_REQUEST_NAMES;
     private static final Set<String> EXPECTED_OBS_REQUEST_NAMES;
     private static final ByteSizeValue MULTIPART_UPLOAD_BUFFER_SIZE = ByteSizeValue.ofMb(5);
+    private static final String COPY_ERROR_MESSAGE = "We encountered an internal error. Please try again.";
 
     static {
         final var mainStorePurposeNames = Set.of("ClusterState", "Indices", "Translog");
@@ -595,6 +615,261 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
     @Override
     protected String accessDeniedText() {
         return "Access Denied";
+    }
+
+    /**
+     * A copy request that S3 answers with HTTP status 200 and an error document in the body fails the shard snapshot. The S3 client reads
+     * the body and finds the error. The error code is InternalError, so the client retries the copy. Every retry gets the same error, so
+     * the client gives up and throws, and {@code S3BlobContainer.copyBlob} fails.
+     * <p>
+     * Before a shard snapshot writes its shard snapshot blob, {@code snap-<uuid>.dat}, it checks the copies that it made. Each copy is a
+     * copied blob in the repository, named {@code c__<uuid>}, and it is a copy of a commit blob from the object store. A commit blob
+     * holds the files of a commit. The check is that each copied blob exists and has the length of its commit blob. A failed check has
+     * "but expected" in its message. The check runs only after every copy call has returned normally. Here a copy call throws, so the
+     * shard snapshot never reaches the check.
+     */
+    public void testCopyThatAnswers200WithAnErrorBodyFailsTheShardSnapshot() throws Exception {
+        final String reason = snapshotWhileCopiesAnswer200WithAnError("", true);
+        // copyBlob fails with "Unable to copy object", and wraps the exception that the S3 client threw
+        assertThat(reason, containsString("Unable to copy object"));
+        // the exception of the S3 client has the message of the error document
+        assertThat(reason, containsString(COPY_ERROR_MESSAGE));
+        // a reason without "but expected" shows that the shard snapshot failed in copyBlob, and not in the check of the copies
+        assertThat(reason, not(containsString("but expected")));
+    }
+
+    /**
+     * Same as the test above, but the response starts with whitespace, which S3 sends during a long copy so that the connection does not
+     * time out. The test picks at random whether the error document starts with an XML declaration, the {@code <?xml ... ?>} line. With a
+     * declaration, the whitespace comes before the declaration, so the S3 client cannot parse the body and throws, because an XML
+     * declaration has to be the first thing in a document. Without a declaration, the client skips the whitespace, reads the error
+     * document and throws the error, as in the test above. In both cases {@code S3BlobContainer.copyBlob} fails.
+     */
+    public void testCopyThatAnswers200WithKeepAliveWhitespaceThenAnErrorBodyFailsTheShardSnapshot() throws Exception {
+        final boolean xmlDeclaration = randomBoolean();
+        final String reason = snapshotWhileCopiesAnswer200WithAnError(randomKeepAliveWhitespace(), xmlDeclaration);
+        assertThat(reason, containsString("Unable to copy object"));
+        if (xmlDeclaration) {
+            assertThat(reason, containsString("Could not parse XML response"));
+        } else {
+            assertThat(reason, containsString(COPY_ERROR_MESSAGE));
+        }
+        assertThat(reason, not(containsString("but expected")));
+    }
+
+    /**
+     * The S3 client retries a copy request when the error document in the response has the code InternalError. Here each copy request
+     * fails once and then works, so the shard snapshot succeeds. The failed request leaves no blob, so the retry makes the whole copy.
+     * Each copied file names a copied blob and a byte range inside that blob. After the retries, every copied file lies inside the blob
+     * that the file names.
+     */
+    public void testCopyThatAnswers200WithAnErrorBodyOnceIsRetried() throws Exception {
+        final String indexName = startNodeAndIndexWithThreeCommitBlobs();
+        final var copyRequests = new AtomicInteger();
+        final Set<String> failedFirstAttempts = ConcurrentCollections.newConcurrentSet();
+        answerCopiesWith200AndAnError(targetPath -> {
+            copyRequests.incrementAndGet();
+            // true for the first request of a copy, so the retry of the copy goes to the fake service
+            return failedFirstAttempts.add(targetPath);
+        }, "", true);
+
+        createSnapshot("backup", "snapshot", List.of(indexName), List.of());
+
+        // each copy was requested twice: the request that failed, and the retry
+        assertThat(failedFirstAttempts, not(empty()));
+        assertThat(copyRequests.get(), equalTo(2 * failedFirstAttempts.size()));
+        assertCopiedFilesFitTheirBlobs("backup", greaterThan(0));
+    }
+
+    /**
+     * Between one and 64 whitespace characters, spaces and newlines in a random order.
+     */
+    private static String randomKeepAliveWhitespace() {
+        final var whitespace = new StringBuilder();
+        for (int i = between(1, 64); i > 0; i--) {
+            whitespace.append(randomFrom(" ", "\n"));
+        }
+        return whitespace.toString();
+    }
+
+    /**
+     * Starts a node, and creates an index with three commits and a repository. Each commit is in a commit blob of its own, which is a blob
+     * in the object store that holds the files of a commit. The snapshots of the index copy the commit blobs into the repository.
+     *
+     * @return the name of the index
+     */
+    private String startNodeAndIndexWithThreeCommitBlobs() throws Exception {
+        final Settings settings = Settings.builder()
+            // copies need shard snapshots that read from the object store
+            .put(
+                StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING.getKey(),
+                randomFrom(StatelessSnapshotEnabledStatus.READ_FROM_OBJECT_STORE, StatelessSnapshotEnabledStatus.ENABLED)
+            )
+            .put(StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING.getKey(), true)
+            // one commit in each commit blob, so that each flush adds a commit blob to copy
+            .put(StatelessCommitService.STATELESS_UPLOAD_MAX_AMOUNT_COMMITS.getKey(), 1)
+            .build();
+        startMasterAndIndexNode(settings);
+        final String indexName = randomIndexName();
+        createIndex(indexName, 1, 0);
+        ensureGreen(indexName);
+        for (int commit = 0; commit < 3; commit++) {
+            indexDocs(indexName, between(10, 50));
+            flush(indexName);
+        }
+        createRepository("backup", repositorySettings());
+        return indexName;
+    }
+
+    /**
+     * Makes the fake S3 service answer some copy requests the way S3 answers a copy that fails after the copy has started. The service
+     * does this for the requests that {@code failsCopy} accepts, and it makes no copy for them. {@code failsCopy} gets the path of the
+     * blob that the request would make. By then S3 has already sent the status 200, so S3 reports the failure as an error document in the
+     * body of the response. All other requests go to the fake service as usual.
+     * <p>
+     * With a {@code keepAlive} that is not empty, the response first sends that whitespace, as S3 does during a long copy so that the
+     * connection does not time out. The whitespace is sent on its own, before the error document. {@code xmlDeclaration} says whether the
+     * error document starts with an XML declaration, the {@code <?xml ... ?>} line.
+     */
+    @SuppressForbidden(reason = "this test uses a HttpServer to emulate an S3 endpoint")
+    private void answerCopiesWith200AndAnError(Predicate<String> failsCopy, String keepAlive, boolean xmlDeclaration) {
+        s3HttpHandler.setInterceptor(exchange -> {
+            // a copy is a request with an X-amz-copy-source header
+            if (exchange.getRequestHeaders().containsKey(S3HttpHandler.COPY_SOURCE_HEADER)
+                && failsCopy.test(exchange.getRequestURI().getPath())) {
+                try (exchange) {
+                    final byte[] error = Strings.format("""
+                        %s<Error>
+                          <Code>InternalError</Code>
+                          <Message>%s</Message>
+                          <RequestId>%s</RequestId>
+                        </Error>""", xmlDeclaration ? "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" : "", COPY_ERROR_MESSAGE, randomUUID())
+                        .getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().add("Content-Type", "application/xml");
+                    if (keepAlive.isEmpty()) {
+                        exchange.sendResponseHeaders(RestStatus.OK.getStatus(), error.length);
+                    } else {
+                        // a length of 0 makes the response chunked, so the length does not have to be known when the response starts
+                        exchange.sendResponseHeaders(RestStatus.OK.getStatus(), 0);
+                        exchange.getResponseBody().write(keepAlive.getBytes(StandardCharsets.UTF_8));
+                        // send the whitespace now, so that it reaches the client before the error document does
+                        exchange.getResponseBody().flush();
+                    }
+                    exchange.getResponseBody().write(error);
+                }
+                return true;
+            }
+            return false;
+        });
+    }
+
+    /**
+     * Snapshots an index with three commit blobs while the fake S3 service answers every copy request but the first with HTTP status 200
+     * and an error document, and checks what the repository holds afterwards. The shard snapshot must fail. It must leave no copied blob
+     * and write no shard snapshot blob, and no copied file in the repository may name a blob that is missing or too short. The first copy
+     * works, so that the failure cleanup has a copy to delete.
+     *
+     * @return the reason that the shard snapshot failed
+     */
+    private String snapshotWhileCopiesAnswer200WithAnError(String keepAlive, boolean xmlDeclaration) throws Exception {
+        final String indexName = startNodeAndIndexWithThreeCommitBlobs();
+        final var copyRequests = new AtomicInteger();
+        answerCopiesWith200AndAnError(targetPath -> copyRequests.incrementAndGet() > 1, keepAlive, xmlDeclaration);
+
+        // The failed shard snapshot logs how many copies it made, before its cleanup deletes the copied blobs. It made exactly one copy,
+        // the first copy, which the fake service lets work.
+        final var response = new AtomicReference<CreateSnapshotResponse>();
+        MockLog.assertThatLogger(
+            () -> response.set(
+                clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, "backup", "snapshot")
+                    .setIndices(indexName)
+                    .setPartial(true)
+                    .setWaitForCompletion(true)
+                    .get()
+            ),
+            BlobStoreRepository.class,
+            new MockLog.SeenEventExpectation(
+                "the failed attempt made the allowed copy",
+                BlobStoreRepository.class.getCanonicalName(),
+                Level.INFO,
+                "*shard snapshot copy stats: attempt [failed], copies made [1], copied bytes [*], total copy time [*ms]"
+            )
+        );
+        final SnapshotInfo snapshotInfo = response.get().getSnapshotInfo();
+        assertThat(snapshotInfo.state(), equalTo(SnapshotState.PARTIAL));
+        assertThat(snapshotInfo.shardFailures(), hasSize(1));
+        // the first copy request worked, and at least one more copy request was answered with an error
+        assertThat(copyRequests.get(), greaterThanOrEqualTo(2));
+        // the failure cleanup deleted the copy that worked, and the shard snapshot blob was never written
+        assertThat(copiedBlobPathsInFakeStorage(), empty());
+        assertThat(
+            blobPathsInFakeStorage().stream()
+                .filter(path -> path.contains("/indices/") && path.contains("/" + BlobStoreRepository.SNAPSHOT_PREFIX))
+                .toList(),
+            empty()
+        );
+        // the only shard snapshot failed, so no shard snapshot finished and the repository has no copied file that names a missing blob
+        assertCopiedFilesFitTheirBlobs("backup", equalTo(0));
+        return snapshotInfo.shardFailures().get(0).reason();
+    }
+
+    /**
+     * The paths of the copied blobs in the fake S3 service.
+     */
+    private Set<String> copiedBlobPathsInFakeStorage() {
+        return blobPathsInFakeStorage().stream()
+            .filter(path -> path.contains("/" + BlobStoreRepository.COPIED_DATA_BLOB_PREFIX))
+            .collect(Collectors.toUnmodifiableSet());
+    }
+
+    /**
+     * Checks the copied files of the shard snapshots in the repository against the blobs that the fake S3 service holds, which are what a
+     * restore reads. A shard snapshot lists a copied file with the copied blob that holds it and the byte range of the file inside that
+     * blob. That blob must exist and be long enough to hold the range. Every copied blob in the repository must also be named by at least
+     * one copied file. The files come from the blob of each shard snapshot and from the shard generation that the next snapshot of the
+     * shard starts from.
+     *
+     * @param copiedFileCount a matcher for how many copied files were checked, so that the assertion fails when no file was checked but
+     *                        files are expected
+     */
+    private void assertCopiedFilesFitTheirBlobs(String repoName, org.hamcrest.Matcher<Integer> copiedFileCount) throws IOException {
+        final var repository = (BlobStoreRepository) internalCluster().getCurrentMasterNodeInstance(RepositoriesService.class)
+            .repository(repoName);
+        final RepositoryData repositoryData = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository);
+        final Set<String> pointedAtBlobPaths = new HashSet<>();
+        int checkedFiles = 0;
+        for (IndexId indexId : repositoryData.getIndices().values()) {
+            // a shard without a shard generation has no shard snapshot that finished successfully, so the shard has no copied file
+            final List<ShardGeneration> shardGenerations = repositoryData.shardGenerations().getGens(indexId);
+            for (int shard = 0; shard < shardGenerations.size(); shard++) {
+                final BlobContainer shardContainer = repository.shardContainer(indexId, shard);
+                final List<FileInfo> files = new ArrayList<>();
+                for (SnapshotFiles snapshot : repository.getBlobStoreIndexShardSnapshots(indexId, shard, shardGenerations.get(shard))
+                    .snapshots()) {
+                    files.addAll(snapshot.indexFiles());
+                }
+                for (SnapshotId snapshotId : repositoryData.getSnapshots(indexId)) {
+                    files.addAll(repository.loadShardSnapshot(shardContainer, snapshotId).indexFiles());
+                }
+                for (FileInfo file : files) {
+                    if (file.isCopied()) {
+                        // the fake S3 service keys a blob by its path, which starts with the name of the bucket
+                        final String blobPath = "/bucket/" + shardContainer.path().buildAsString() + file.blob();
+                        pointedAtBlobPaths.add(blobPath);
+                        final BlobEntry blob = s3HttpHandler.blobs().get(blobPath);
+                        assertNotNull("blob [" + blobPath + "] of the copied file " + file + " is missing", blob);
+                        assertThat(
+                            "blob [" + blobPath + "] is too short for the copied file " + file,
+                            (long) blob.contents().length(),
+                            greaterThanOrEqualTo(file.offset() + file.length())
+                        );
+                        checkedFiles++;
+                    }
+                }
+            }
+        }
+        assertThat(copiedBlobPathsInFakeStorage(), equalTo(pointedAtBlobPaths));
+        assertThat(checkedFiles, copiedFileCount);
     }
 
     public void testRetryOn403ForPutAndPost() throws IOException {
