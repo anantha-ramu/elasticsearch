@@ -32,6 +32,7 @@ import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoriesService;
 import org.elasticsearch.repositories.RepositoryData;
+import org.elasticsearch.repositories.ShardGeneration;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 import org.elasticsearch.repositories.blobstore.BlobStoreTestUtil;
 import org.elasticsearch.repositories.blobstore.ESBlobStoreRepositoryIntegTestCase;
@@ -920,8 +921,14 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
      * only after the call returns. The test holds the copy call before it makes the copy, marks the node, waits until the node has seen
      * the marker, and only then lets the call run. Each run of a shard snapshot on a node is an attempt. The first attempt pauses,
      * deletes the copy it made, and logs the copies it made and the time they took. The master then gives the shard snapshot to the
-     * second index node, and the attempt there makes its own copies. At the end the snapshot can be restored, and no copy is left that
-     * the snapshot does not refer to.
+     * second index node, and the attempt there makes its own copies. When the snapshot is done, the test checks that:
+     * <ul>
+     * <li>the log line of the first attempt shows at least one copy made, which proves that the attempt had a copy to delete;</li>
+     * <li>the repository holds exactly the copied blobs that the current shard generation refers to, which shows that the first
+     * attempt left no copy behind;</li>
+     * <li>the verify integrity API, which reads the contents of every blob, finds no problem;</li>
+     * <li>the snapshot can be restored.</li>
+     * </ul>
      */
     public void testShutdownMarkerPausesTheShardSnapshotAfterTheCopy() throws Exception {
         // copySettings() picks this setting at random. Only "enabled" lets a shard snapshot run on a node that does not host the primary.
@@ -937,12 +944,15 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         startIndexNode(settings);
         ensureStableCluster(4);
         final String repoName = randomIdentifier();
+        final Path location = randomRepoPath();
         // the snapshot repository uses the mock repository type, so that the copy can be blocked
-        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", randomRepoPath()), true);
+        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", location), true);
         final var copyStarted = new CountDownLatch(1);
         final var releaseCopy = new CountDownLatch(1);
         snapshotRepositoryOnNode(repoName, pausedNode).setStrategy(blockCopies(copyStarted, releaseCopy));
 
+        // The first attempt logs its copy stats when it pauses. The pattern below needs at least one copy made, so the test cannot pass
+        // when the first attempt had no copy to delete. A wildcard for the number of copies would also match 0.
         MockLog.assertThatLogger(() -> {
             final var snapshotFuture = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, repoName, "snap")
                 .setIndices(indexName)
@@ -963,20 +973,27 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
             assertThat(safeGet(snapshotFuture).getSnapshotInfo().state(), equalTo(SnapshotState.SUCCESS));
         },
             BlobStoreRepository.class,
-            new MockLog.SeenEventExpectation(
-                "copy stats of the paused attempt",
+            new MockLog.PatternSeenEventExpectation(
+                "copy stats of the paused attempt, with at least one copy made",
                 BlobStoreRepository.class.getCanonicalName(),
                 Level.INFO,
-                "["
+                "\\["
                     + repoName
-                    + "][snap/*]["
+                    + "\\]\\[snap/[^\\]]+\\]\\["
                     + indexName
-                    + "][*] shard snapshot copy stats: attempt [paused], copies made [*], copied bytes [*], total copy time [*ms]"
+                    + "\\]\\[\\d+\\] shard snapshot copy stats: attempt \\[paused\\], copies made \\[[1-9]\\d*\\], "
+                    + "copied bytes \\[\\d+\\], total copy time \\[\\d+ms\\]"
             )
         );
 
         // Only the copies that the snapshot refers to are left, so the paused attempt has deleted its copy.
         assertAllDataFilesCopied(repoName, indexName, "snap");
+        // The first attempt deletes its copy before it reports the pause, and the master starts the second attempt only after that
+        // report. The snapshot ends after the second attempt, so the test can list the repository's files without a retry.
+        assertCopiedBlobsMatchShardGenerations(repoName, indexName, location);
+        // The verify integrity API reads each file of the snapshot at the byte range that its file info names, and checks the bytes
+        // against the checksum of the file. So the copy that the second attempt made must hold every file at that range.
+        assertVerifyIntegrityPasses(repoName, indexName, "snap");
         restore(repoName, "snap", indexName, "restored");
         assertHitCount(prepareSearch("restored"), docCount);
     }
@@ -1302,6 +1319,31 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
             assertThat(blobs.stream().filter(name -> name.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX)).toList(), empty());
             assertThat(copiedBlobs(repoName, indexName, shard), equalTo(referencedCopies));
         }
+    }
+
+    /**
+     * Checks that the repository holds exactly the copied blobs that the current shard generations of the index refer to. So an attempt
+     * (one run of a shard snapshot on one node) that failed or paused has left no copy behind, and no copy that a shard generation needs
+     * is missing. The method lists the files on disk, not through {@link BlobStoreRepository}, which is the code under test. So the
+     * repository must store its blobs as files, like an {@code fs} repository or the mock repository. The listing covers the whole
+     * repository, so the repository must hold no other index.
+     * <p>
+     * The method uses only the shard generation that the repository data names. A shard snapshot writes its shard generation, the
+     * {@code index-<uuid>} blob, before it copies anything, so the generation already names the copies that the snapshot plans to make.
+     * An attempt that paused deletes its copies, but its shard generation stays in the folder, and the repository data does not name it.
+     * That shard generation names a copy that is gone, so the method ignores it.
+     */
+    private void assertCopiedBlobsMatchShardGenerations(String repoName, String indexName, Path location) throws IOException {
+        final BlobStoreRepository repository = repository(repoName);
+        final RepositoryData repositoryData = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository);
+        final IndexId indexId = repositoryData.resolveIndexId(indexName);
+        final Set<String> referencedCopies = new HashSet<>();
+        for (int shard = 0; shard < getNumShards(indexName).numPrimaries; shard++) {
+            final ShardGeneration shardGeneration = repositoryData.shardGenerations().getShardGen(indexId, shard);
+            referencedCopies.addAll(repository.getBlobStoreIndexShardSnapshots(indexId, shard, shardGeneration).copiedBlobNames());
+        }
+        assertThat(referencedCopies, not(empty()));
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(referencedCopies));
     }
 
     /**
