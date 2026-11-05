@@ -117,6 +117,18 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
     private static final ByteSizeValue MULTIPART_UPLOAD_BUFFER_SIZE = ByteSizeValue.ofMb(5);
     private static final String COPY_ERROR_MESSAGE = "We encountered an internal error. Please try again.";
 
+    /**
+     * Where an error response puts its XML declaration, the {@code <?xml ... ?>} line, compared with the keep-alive whitespace.
+     */
+    private enum Declaration {
+        /** No declaration. */
+        NONE,
+        /** The declaration first and the whitespace after it. This is the order that S3 sends during a long copy. */
+        BEFORE_WHITESPACE,
+        /** The whitespace first. A declaration that is not at the start makes the response invalid XML. */
+        AFTER_WHITESPACE
+    }
+
     static {
         final var mainStorePurposeNames = Set.of("ClusterState", "Indices", "Translog");
         final var obsPurposeNames = Set.of("SnapshotData", "SnapshotMetadata", "RepositoryAnalysis", "Resharding");
@@ -629,7 +641,7 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
      * shard snapshot never reaches the check.
      */
     public void testCopyThatAnswers200WithAnErrorBodyFailsTheShardSnapshot() throws Exception {
-        final String reason = snapshotWhileCopiesAnswer200WithAnError("", true);
+        final String reason = snapshotWhileCopiesAnswer200WithAnError("", Declaration.BEFORE_WHITESPACE);
         // copyBlob fails with "Unable to copy object", and wraps the exception that the S3 client threw
         assertThat(reason, containsString("Unable to copy object"));
         // the exception of the S3 client has the message of the error document
@@ -639,17 +651,18 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
     }
 
     /**
-     * Same as the test above, but the response starts with whitespace, which S3 sends during a long copy so that the connection does not
-     * time out. The test picks at random whether the error document starts with an XML declaration, the {@code <?xml ... ?>} line. With a
-     * declaration, the whitespace comes before the declaration, so the S3 client cannot parse the body and throws, because an XML
-     * declaration has to be the first thing in a document. Without a declaration, the client skips the whitespace, reads the error
-     * document and throws the error, as in the test above. In both cases {@code S3BlobContainer.copyBlob} fails.
+     * Same as the test above, but the response also holds whitespace, which S3 sends during a long copy so that the connection does not
+     * time out. The test picks at random where the XML declaration, the {@code <?xml ... ?>} line, goes. S3 sends the declaration first
+     * and the whitespace after it. Then the S3 client skips the whitespace, reads the error document and throws the error, as in the test
+     * above. It does the same when there is no declaration. With the whitespace before the declaration, the body is not valid XML,
+     * because a declaration has to be the first thing in a document. Then the client cannot parse the body and throws. In every case
+     * {@code S3BlobContainer.copyBlob} fails.
      */
     public void testCopyThatAnswers200WithKeepAliveWhitespaceThenAnErrorBodyFailsTheShardSnapshot() throws Exception {
-        final boolean xmlDeclaration = randomBoolean();
-        final String reason = snapshotWhileCopiesAnswer200WithAnError(randomKeepAliveWhitespace(), xmlDeclaration);
+        final Declaration declaration = randomFrom(Declaration.values());
+        final String reason = snapshotWhileCopiesAnswer200WithAnError(randomKeepAliveWhitespace(), declaration);
         assertThat(reason, containsString("Unable to copy object"));
-        if (xmlDeclaration) {
+        if (declaration == Declaration.AFTER_WHITESPACE) {
             assertThat(reason, containsString("Could not parse XML response"));
         } else {
             assertThat(reason, containsString(COPY_ERROR_MESSAGE));
@@ -671,7 +684,7 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
             copyRequests.incrementAndGet();
             // true for the first request of a copy, so the retry of the copy goes to the fake service
             return failedFirstAttempts.add(targetPath);
-        }, "", true);
+        }, "", Declaration.BEFORE_WHITESPACE);
 
         createSnapshot("backup", "snapshot", List.of(indexName), List.of());
 
@@ -727,35 +740,41 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
      * blob that the request would make. By then S3 has already sent the status 200, so S3 reports the failure as an error document in the
      * body of the response. All other requests go to the fake service as usual.
      * <p>
-     * With a {@code keepAlive} that is not empty, the response first sends that whitespace, as S3 does during a long copy so that the
-     * connection does not time out. The whitespace is sent on its own, before the error document. {@code xmlDeclaration} says whether the
-     * error document starts with an XML declaration, the {@code <?xml ... ?>} line.
+     * With a {@code keepAlive} that is not empty, the response sends that whitespace before the error document, as S3 does during a long
+     * copy so that the connection does not time out. The start of the response is flushed on its own, so it reaches the client first.
+     * {@code declaration} says where the XML declaration, the {@code <?xml ... ?>} line, goes.
      */
     @SuppressForbidden(reason = "this test uses a HttpServer to emulate an S3 endpoint")
-    private void answerCopiesWith200AndAnError(Predicate<String> failsCopy, String keepAlive, boolean xmlDeclaration) {
+    private void answerCopiesWith200AndAnError(Predicate<String> failsCopy, String keepAlive, Declaration declaration) {
         s3HttpHandler.setInterceptor(exchange -> {
             // a copy is a request with an X-amz-copy-source header
             if (exchange.getRequestHeaders().containsKey(S3HttpHandler.COPY_SOURCE_HEADER)
                 && failsCopy.test(exchange.getRequestURI().getPath())) {
                 try (exchange) {
-                    final byte[] error = Strings.format("""
-                        %s<Error>
+                    final String xmlDeclaration = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+                    final String errorDocument = Strings.format("""
+                        <Error>
                           <Code>InternalError</Code>
                           <Message>%s</Message>
                           <RequestId>%s</RequestId>
-                        </Error>""", xmlDeclaration ? "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" : "", COPY_ERROR_MESSAGE, randomUUID())
-                        .getBytes(StandardCharsets.UTF_8);
+                        </Error>""", COPY_ERROR_MESSAGE, randomUUID());
+                    // Without whitespace there is nothing to send early, so the declaration, if any, goes with the error document.
+                    final boolean declarationFirst = declaration == Declaration.BEFORE_WHITESPACE && keepAlive.isEmpty() == false;
+                    final String start = (declarationFirst ? xmlDeclaration : "") + keepAlive;
+                    final String rest = (declaration != Declaration.NONE && declarationFirst == false ? xmlDeclaration : "")
+                        + errorDocument;
                     exchange.getResponseHeaders().add("Content-Type", "application/xml");
-                    if (keepAlive.isEmpty()) {
-                        exchange.sendResponseHeaders(RestStatus.OK.getStatus(), error.length);
+                    final byte[] restBytes = rest.getBytes(StandardCharsets.UTF_8);
+                    if (start.isEmpty()) {
+                        exchange.sendResponseHeaders(RestStatus.OK.getStatus(), restBytes.length);
                     } else {
                         // a length of 0 makes the response chunked, so the length does not have to be known when the response starts
                         exchange.sendResponseHeaders(RestStatus.OK.getStatus(), 0);
-                        exchange.getResponseBody().write(keepAlive.getBytes(StandardCharsets.UTF_8));
-                        // send the whitespace now, so that it reaches the client before the error document does
+                        exchange.getResponseBody().write(start.getBytes(StandardCharsets.UTF_8));
+                        // send the start now, so that it reaches the client before the error document does
                         exchange.getResponseBody().flush();
                     }
-                    exchange.getResponseBody().write(error);
+                    exchange.getResponseBody().write(restBytes);
                 }
                 return true;
             }
@@ -771,10 +790,10 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
      *
      * @return the reason that the shard snapshot failed
      */
-    private String snapshotWhileCopiesAnswer200WithAnError(String keepAlive, boolean xmlDeclaration) throws Exception {
+    private String snapshotWhileCopiesAnswer200WithAnError(String keepAlive, Declaration declaration) throws Exception {
         final String indexName = startNodeAndIndexWithThreeCommitBlobs();
         final var copyRequests = new AtomicInteger();
-        answerCopiesWith200AndAnError(targetPath -> copyRequests.incrementAndGet() > 1, keepAlive, xmlDeclaration);
+        answerCopiesWith200AndAnError(targetPath -> copyRequests.incrementAndGet() > 1, keepAlive, declaration);
 
         // The failed shard snapshot logs how many copies it made, before its cleanup deletes the copied blobs. It made exactly one copy,
         // the first copy, which the fake service lets work.
