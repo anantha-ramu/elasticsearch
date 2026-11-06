@@ -11,6 +11,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.BufferedChecksum;
 import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.IndexInput;
@@ -18,6 +19,7 @@ import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
+import org.elasticsearch.common.io.stream.InputStreamStreamInput;
 import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.core.Assertions;
 import org.elasticsearch.core.IOUtils;
@@ -37,6 +39,8 @@ import org.elasticsearch.repositories.ShardSnapshotResult;
 import org.elasticsearch.repositories.SnapshotIndexCommit;
 import org.elasticsearch.repositories.SnapshotShardContext;
 import org.elasticsearch.snapshots.SnapshotId;
+import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.xpack.stateless.commits.BlobFile;
 import org.elasticsearch.xpack.stateless.commits.BlobLocation;
 import org.elasticsearch.xpack.stateless.commits.StatelessCompoundCommit;
 
@@ -69,6 +73,12 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     @Nullable // when snapshot runs on a different node from the primary
     private final BooleanSupplier isShardRelocated;
     private final boolean serverSideCopyEnabled;
+    // The next two fields are set by the first carried generational file that needs them, see copySource. The repository calls copySource
+    // from the loop over the files of one shard snapshot, on one thread and one file at a time, so the fields need no synchronization.
+    @Nullable
+    private BlobLocation segmentsFile;
+    @Nullable
+    private StatelessCompoundCommit firstCommit;
 
     public StatelessSnapshotShardContext(
         ShardId shardId,
@@ -193,13 +203,36 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         return new BlobStoreFileReader(file, blobContainer, blobLocation, commitRefReleasable, isShardRelocated);
     }
 
+    /**
+     * Returns the commit blob to copy for the file, or {@code null} when server-side copy is off. For a generational file that the
+     * snapshotted commit carries, that is the copy of the file in the commit blob that holds the commit.
+     * <p>
+     * A commit blob is a blob in the object store that holds the files of one or more commits. A generational file is a file that a
+     * segment gets after the segment was first written, such as {@code _0_1.liv}. The first commit of every new commit blob copies the
+     * generational files that are still in use. A commit carries a generational file when the file first appeared in an older commit
+     * blob, so the commit blob of the commit holds a copy of the file too.
+     * <p>
+     * The primary gives the context the first location that the primary learned for each file. For a carried file, that first
+     * location is in an older commit blob. A snapshot copies whole commit blobs, so a file info that points at the older commit blob
+     * keeps the copy of that blob in the repository for as long as a snapshot lists the file info. A generational file moves forward to
+     * its newest copy, so that the repository can delete an older commit blob that only a carried generational file keeps alive. The
+     * new location only takes effect when {@link #isCopiedFileReusable} answers {@code false} for the file. Otherwise, the repository
+     * reuses the file info of an earlier snapshot by name, and the file stays in the older commit blob.
+     * <p>
+     * When the first carried file asks for its copy source, the context sends one GET for the bytes before the {@code segments_N} file
+     * of the commit. Those bytes are the header of the first commit of the commit blob. The header lists the copy of each carried file,
+     * and it is the only header whose position is known without reading others. The context keeps the header for the other files. If
+     * the header has no copy of a file, the file keeps its first location, which is where snapshots took the file from before. The
+     * index node keeps the commit blob at that location while Lucene still has the file. Tests run with assertions, so a missing copy
+     * fails a test. If the read fails, the method throws {@link IndexShardSnapshotFailedException}, which fails the shard snapshot as
+     * the failed read of a footer does.
+     */
     @Override
     public CopySource copySource(String file) {
         if (serverSideCopyEnabled == false) {
             return null;
         }
-        final BlobLocation blobLocation = fileToBlobLocations.get(file);
-        assert blobLocation != null : "Blob location for file [" + file + "] not found in " + fileToBlobLocations;
+        final BlobLocation blobLocation = getLocationToCopy(file);
         // The commit blob's path under the object store's base path, used to find an existing copy. The snapshot repository keeps one
         // folder per index name, so an index that is deleted and created again with the same name shares that folder, and the index UUID
         // keeps the two indices' paths apart.
@@ -223,12 +256,70 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         );
     }
 
+    private BlobLocation getLocationToCopy(String file) {
+        final BlobLocation location = fileToBlobLocations.get(file);
+        assert location != null : "Blob location for file [" + file + "] not found in " + fileToBlobLocations;
+        if (StatelessCompoundCommit.isGenerationalFile(file) == false) {
+            return location;
+        }
+        if (segmentsFile == null) {
+            // The commit writes its segments_N file into its own commit blob, and into no other blob. So the location of that file says
+            // which commit blob holds the commit.
+            segmentsFile = fileToBlobLocations.get(SegmentInfos.getLastCommitSegmentsFileName(fileNames().toArray(String[]::new)));
+        }
+        final BlobFile ownBlob = segmentsFile.blobFile();
+        if (location.blobFile().equals(ownBlob)) {
+            return location;
+        }
+        if (firstCommit == null) {
+            firstCommit = readFirstCommitHeader();
+        }
+        final BlobLocation copy = firstCommit.commitFiles().get(file);
+        if (copy != null && copy.blobFile().equals(ownBlob) && copy.fileLength() == location.fileLength()) {
+            return copy;
+        }
+        // Not expected, see copySource. The file keeps its first location.
+        assert false
+            : "the first commit header of commit blob ["
+                + ownBlob.blobName()
+                + "] has no copy of generational file ["
+                + file
+                + "] in that blob, it lists "
+                + copy;
+        return location;
+    }
+
+    /**
+     * Reads the header of the first commit of the commit blob that holds {@link #segmentsFile}. The first commit starts at byte 0, and the
+     * {@code segments_N} file comes after the whole first header, so the GET asks for the bytes before that file. The method closes the
+     * stream as soon as the header has been read. The read holds the commit, as the read of the footers does, so that the commit blob
+     * stays in the object store. If the primary has moved, the new primary keeps the commit blob. The read blocks, so it runs on a thread
+     * of the snapshot pool.
+     */
+    private StatelessCompoundCommit readFirstCommitHeader() {
+        ThreadPool.assertCurrentThreadPool(ThreadPool.Names.SNAPSHOT);
+        final BlobContainer container = blobContainerFunc.apply(shardId, segmentsFile.primaryTerm());
+        try (
+            var ignored = maybeWithSnapshotIndexCommitRef();
+            var input = new InputStreamStreamInput(
+                container.readBlob(OperationPurpose.SNAPSHOT_METADATA, segmentsFile.blobName(), 0, segmentsFile.offset())
+            )
+        ) {
+            return StatelessCompoundCommit.readFromStoreAtOffset(input, 0, generation -> segmentsFile.compoundFileGeneration());
+        } catch (IOException e) {
+            throw new IndexShardSnapshotFailedException(
+                shardId,
+                "failed to read the first commit header of commit blob [" + segmentsFile.blobName() + "]",
+                e
+            );
+        }
+    }
+
     /**
      * Lets the snapshot reuse the earlier file info of a file, except for a generational file whose copy in the commit blob of the
-     * snapshotted commit is in another commit blob than the commit blob that the earlier file info points at. A generational file is a
-     * file that a segment gets after the segment was first written, such as {@code _0_1.liv}, and {@link SnapshotsCommitService}
-     * explains why the snapshot points the file at that copy. The file gets a new file info, so that the repository can delete the copy
-     * of the old commit blob once no other file needs that copy.
+     * snapshotted commit is in another commit blob than the commit blob that the earlier file info points at, see {@link #copySource}.
+     * The file gets a new file info, so that the repository can delete the copy of the old commit blob once no other file needs that
+     * copy.
      * <p>
      * The method answers {@code true}, so that the snapshot reuses the earlier file info, for a file that is not a generational file,
      * for a generational file whose copy is in the commit blob that the earlier file info points at, and when server-side copy is off,

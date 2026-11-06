@@ -17,6 +17,7 @@ import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.CheckedSupplier;
 import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
@@ -65,6 +66,7 @@ import org.elasticsearch.xpack.stateless.reshard.ReshardIndexRequest;
 import org.elasticsearch.xpack.stateless.reshard.TransportReshardAction;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -610,12 +612,15 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
     }
 
     /**
-     * As {@link #testPrimaryMovesWhileCopying}, with generational files. The snapshot points them at the copy of the third commit blob,
-     * which holds nothing else that is new. The old primary copies that commit blob after the primary has moved, so the new primary has
-     * to keep the commit blob until the snapshot is done.
+     * As {@link #testPrimaryMovesWhileCopying}, with generational files, but the primary moves earlier. The snapshot points the
+     * generational files at the copy of the third commit blob, and it finds that copy in the first header of the commit blob. The test
+     * holds the snapshot at its first read of a commit blob, which is a read of a footer, until the primary has moved. The snapshot then
+     * reads the first header, and copies the commit blobs, after the primary has moved. The new primary has to keep the commit blobs
+     * until the snapshot is done.
      */
-    public void testPrimaryMovesWhileCopyingGenerationalFiles() throws Exception {
-        final Settings settings = copySettings().put(STATELESS_SNAPSHOT_ENABLED_SETTING.getKey(), "enabled")
+    public void testPrimaryMovesBeforeTheFirstHeaderIsRead() throws Exception {
+        final Settings settings = copySettings().put(ObjectStoreService.TYPE_SETTING.getKey(), ObjectStoreService.ObjectStoreType.MOCK)
+            .put(STATELESS_SNAPSHOT_ENABLED_SETTING.getKey(), "enabled")
             .put(RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING.getKey(), true)
             .build();
         final String firstIndexNode = startMasterAndIndexNode(settings);
@@ -625,33 +630,36 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         ensureGreen(indexName);
         final long docCount = makeThreeCommitBlobsWithGenerationalFiles(indexName);
 
-        // block the first copy into the snapshot repository until the primary has moved to another node
-        final String repoName = randomIdentifier();
-        createRepository(repoName, StatelessMockRepositoryPlugin.TYPE);
-        final CountDownLatch copyStarted = new CountDownLatch(1);
-        final CountDownLatch releaseCopy = new CountDownLatch(1);
-        snapshotRepositoryOnNode(repoName, firstIndexNode).setStrategy(new StatelessMockRepositoryStrategy() {
+        final CountDownLatch readStarted = new CountDownLatch(1);
+        final CountDownLatch releaseRead = new CountDownLatch(1);
+        final AtomicBoolean firstHeaderRead = new AtomicBoolean();
+        setNodeRepositoryStrategy(firstIndexNode, new StatelessMockRepositoryStrategy() {
             @Override
-            public void blobContainerCopyBlob(
-                CheckedRunnable<IOException> originalRunnable,
+            public InputStream blobContainerReadBlob(
+                CheckedSupplier<InputStream, IOException> originalSupplier,
                 OperationPurpose purpose,
-                BlobContainer sourceBlobContainer,
-                String sourceBlobName,
                 String blobName,
-                long blobSize
+                long position,
+                long length
             ) throws IOException {
-                if (blobName.startsWith(BlobStoreRepository.COPIED_DATA_BLOB_PREFIX)) {
-                    copyStarted.countDown();
-                    safeAwait(releaseCopy);
+                if (purpose == OperationPurpose.SNAPSHOT_METADATA && BatchedCompoundCommit.startsWithBlobPrefix(blobName)) {
+                    readStarted.countDown();
+                    safeAwait(releaseRead);
+                    // the first header of a commit blob starts at byte 0, and no footer does
+                    if (position == 0) {
+                        firstHeaderRead.set(true);
+                    }
                 }
-                originalRunnable.run();
+                return super.blobContainerReadBlob(originalSupplier, purpose, blobName, position, length);
             }
         });
+        final String repoName = randomIdentifier();
+        createRepository(repoName, "fs");
         final var snapshotFuture = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, repoName, "snap")
             .setIndices(indexName)
             .setWaitForCompletion(true)
             .execute();
-        safeAwait(copyStarted);
+        safeAwait(readStarted);
 
         final String secondIndexNode = startIndexNode(settings);
         final String secondIndexNodeId = internalCluster().clusterService(secondIndexNode).localNode().getId();
@@ -660,10 +668,11 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
             final ShardRouting primary = state.routingTable().index(indexName).shard(0).primaryShard();
             return primary.started() && primary.currentNodeId().equals(secondIndexNodeId);
         });
-        releaseCopy.countDown();
+        releaseRead.countDown();
 
         final SnapshotInfo snapshotInfo = safeGet(snapshotFuture).getSnapshotInfo();
         assertThat(snapshotInfo.state(), equalTo(SnapshotState.SUCCESS));
+        assertTrue("the snapshot did not read the first header of a commit blob", firstHeaderRead.get());
         assertAllDataFilesCopied(repoName, indexName, "snap");
         // the generational files are in the copy of the third commit blob, which is the newest one that the snapshot copied
         final List<FileInfo> files = dataFiles(shardSnapshot(repoName, indexName, "snap", 0));

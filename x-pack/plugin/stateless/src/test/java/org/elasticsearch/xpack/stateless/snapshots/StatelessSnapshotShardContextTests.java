@@ -24,13 +24,16 @@ import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.blobstore.fs.FsBlobContainer;
 import org.elasticsearch.common.blobstore.fs.FsBlobStore;
 import org.elasticsearch.common.blobstore.support.FilterBlobContainer;
+import org.elasticsearch.common.io.stream.InputStreamStreamInput;
 import org.elasticsearch.common.lucene.store.InputStreamIndexInput;
+import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.core.PathUtils;
 import org.elasticsearch.index.Index;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.engine.Engine;
 import org.elasticsearch.index.shard.ShardId;
+import org.elasticsearch.index.snapshots.IndexShardSnapshotFailedException;
 import org.elasticsearch.index.snapshots.IndexShardSnapshotStatus;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
@@ -43,9 +46,14 @@ import org.elasticsearch.repositories.SnapshotShardContext;
 import org.elasticsearch.snapshots.AbortedSnapshotException;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.xpack.stateless.commits.BatchedCompoundCommit;
 import org.elasticsearch.xpack.stateless.commits.BlobFile;
 import org.elasticsearch.xpack.stateless.commits.BlobLocation;
+import org.elasticsearch.xpack.stateless.commits.StatelessCompoundCommit;
 import org.elasticsearch.xpack.stateless.engine.PrimaryTermAndGeneration;
+import org.elasticsearch.xpack.stateless.lucene.StatelessCommitRef;
+import org.elasticsearch.xpack.stateless.test.FakeStatelessNode;
+import org.junit.After;
 
 import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
@@ -53,19 +61,49 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.IntStream;
 
+import static org.elasticsearch.xpack.stateless.commits.StatelessCommitServiceTests.waitUntilBCCIsUploaded;
 import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.Mockito.mock;
 
+/**
+ * Tests of {@link StatelessSnapshotShardContext}.
+ * <p>
+ * Terms used in the tests of the copy source:
+ * <ul>
+ * <li>A commit blob is a blob in the object store that holds the files of one or more commits of a shard.</li>
+ * <li>A commit header is the start of each commit in a commit blob. It lists the files of the commit and, from that, where each file
+ * is stored.</li>
+ * <li>A generational file is a file that a segment gets after the segment was first written, when a document in the segment is updated
+ * or deleted. The shard copies each generational file that is still in use into the first commit of every new commit blob.</li>
+ * <li>A commit carries a generational file when the file first appeared in an older commit blob than the commit's own.</li>
+ * </ul>
+ */
 public class StatelessSnapshotShardContextTests extends ESTestCase {
+
+    // the reads with the purpose SNAPSHOT_METADATA that the object store of a test node has served, see MetadataReadContainer
+    private final Queue<MetadataRead> metadataReads = ConcurrentCollections.newQueue();
+    private volatile MetadataReadOverride metadataReadOverride;
+
+    @After
+    public void resetMetadataReads() {
+        metadataReads.clear();
+        metadataReadOverride = null;
+    }
 
     public void testBlobStoreFileReader() throws IOException {
         final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
@@ -256,6 +294,298 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
     }
 
     /**
+     * Each commit blob starts with copies of the generational files that were in use then. So a commit that carries a generational file
+     * has a copy of the file in its own commit blob, and the header of the commit lists that copy. The copy source of the file is that
+     * copy, both when the commit is the first one in its commit blob and when the commit comes later. A generational file that a commit
+     * wrote into the same commit blob keeps the location where it first appeared, which is already in that commit blob.
+     */
+    public void testCarriedGenerationalFilesAreCopiedFromTheCommitsOwnCommitBlob() throws Exception {
+        try (var node = newNode()) {
+            // The first commit blob has generational files, which the later commit blobs carry. The second commit blob has commits that
+            // come after a commit that wrote generational files into the same commit blob.
+            final var uploadedCommits = uploadCommitBlobs(node, between(2, 3), 3, between(1, 3));
+
+            boolean carriedByFirstCommit = false;
+            boolean carriedByLaterCommit = false;
+            boolean keptByLaterCommit = false;
+            for (UploadedCommit uploaded : uploadedCommits) {
+                final var context = contextOf(node, uploaded.commit(), true);
+                final var header = readCommitHeader(node, uploaded);
+                for (String file : uploaded.commit().getFileNames()) {
+                    // the copy source is where the header of the commit itself lists the file
+                    final BlobLocation listed = header.commitFiles().get(file);
+                    final var copySource = context.copySource(file);
+                    assertThat(copySource.blobName(), equalTo(listed.blobName()));
+                    assertThat(copySource.offset(), equalTo(listed.offset()));
+
+                    if (StatelessCompoundCommit.isGenerationalFile(file)) {
+                        // the location where the commit service saw the file first, and where a snapshot took the file from before
+                        final BlobLocation firstLocation = node.commitService.getBlobLocation(node.shardId, file);
+                        if (firstLocation.equals(listed)) {
+                            keptByLaterCommit |= uploaded.isFirstInBlob() == false
+                                && firstLocation.compoundFileGeneration() == uploaded.blobGeneration();
+                        } else {
+                            assertThat(firstLocation.compoundFileGeneration(), lessThan(uploaded.blobGeneration()));
+                            assertThat(listed.compoundFileGeneration(), equalTo(uploaded.blobGeneration()));
+                            carriedByFirstCommit |= uploaded.isFirstInBlob();
+                            carriedByLaterCommit |= uploaded.isFirstInBlob() == false;
+                        }
+                    }
+                }
+            }
+            assertTrue("no first commit of a commit blob carries a generational file", carriedByFirstCommit);
+            assertTrue("no later commit of a commit blob carries a generational file", carriedByLaterCommit);
+            assertTrue("no later commit keeps a generational file that was written into its commit blob", keptByLaterCommit);
+        }
+    }
+
+    /**
+     * The files of a commit that carries generational files need exactly one GET: the start of its commit blob, up to its
+     * {@code segments_N} file. The start of the commit blob is the header of its first commit, which lists a copy of each carried file.
+     * The context keeps the header for the other files. Assertions are on in a test. They would trip if the read went through the
+     * iterator over all the commits of the commit blob, with the position of {@code segments_N} as its end. That fails when the
+     * snapshotted commit is the first commit of the blob, because that commit extends past the end. The assertions would also trip if
+     * the read checked the padding between two commits with a second GET. A commit that carries no generational file needs no GET, and
+     * with server-side copy off no file has a copy source.
+     */
+    public void testCarriedGenerationalFilesNeedOneReadOfTheStartOfTheCommitBlob() throws Exception {
+        try (var node = newNode()) {
+            final var uploadedCommits = uploadCommitBlobs(node, between(2, 3), 3, between(1, 3));
+
+            boolean readForFirstCommit = false;
+            boolean readForLaterCommit = false;
+            boolean noReadForCommit = false;
+            for (UploadedCommit uploaded : uploadedCommits) {
+                metadataReads.clear();
+                final var context = contextOf(node, uploaded.commit(), true);
+                // the second round shows that the context reads the header once for all the files
+                for (int round = 0; round < 2; round++) {
+                    for (String file : uploaded.commit().getFileNames()) {
+                        context.copySource(file);
+                    }
+                }
+
+                if (carriedGenerationalFiles(node, uploaded).isEmpty()) {
+                    assertThat(metadataReads, empty());
+                    noReadForCommit = true;
+                } else {
+                    final var segmentsFile = node.commitService.getBlobLocation(node.shardId, uploaded.commit().getSegmentsFileName());
+                    final var blobName = BatchedCompoundCommit.blobNameFromGeneration(uploaded.blobGeneration());
+                    assertThat(List.copyOf(metadataReads), equalTo(List.of(new MetadataRead(blobName, 0L, segmentsFile.offset()))));
+                    readForFirstCommit |= uploaded.isFirstInBlob();
+                    readForLaterCommit |= uploaded.isFirstInBlob() == false;
+                }
+            }
+            assertTrue("no first commit of a commit blob needed a read", readForFirstCommit);
+            assertTrue("no later commit of a commit blob needed a read", readForLaterCommit);
+            assertTrue("every commit needed a read", noReadForCommit);
+
+            // with server-side copy off, no file has a copy source, and nothing is read
+            metadataReads.clear();
+            final var copiesOff = contextOf(node, uploadedCommits.getLast().commit(), false);
+            for (String file : uploadedCommits.getLast().commit().getFileNames()) {
+                assertThat(copiesOff.copySource(file), nullValue());
+            }
+            assertThat(metadataReads, empty());
+        }
+    }
+
+    /**
+     * If the read of the first header fails, the copy source fails with {@link IndexShardSnapshotFailedException}. That fails the shard
+     * snapshot, as the failed read of a footer does. The context does not fall back to the first location of the file.
+     */
+    public void testFailedReadOfTheFirstHeaderFailsTheShardSnapshot() throws Exception {
+        try (var node = newNode()) {
+            final var uploaded = uploadCommitBlobs(node, 2, 2).getLast();
+            final String carriedFile = carriedGenerationalFiles(node, uploaded).getFirst();
+            metadataReadOverride = (container, read) -> { throw new IOException("simulated failure of the read"); };
+            final var context = contextOf(node, uploaded.commit(), true);
+
+            final var failure = expectThrows(IndexShardSnapshotFailedException.class, () -> context.copySource(carriedFile));
+
+            assertThat(failure.getMessage(), containsString("failed to read the first commit header of commit blob [stateless_commit_"));
+            assertThat(failure.getCause(), instanceOf(IOException.class));
+        }
+    }
+
+    /**
+     * Every commit blob starts with copies of the generational files that were in use then, so a first header without the copy of a
+     * carried file is not expected. In production, the file keeps its first location. A test runs with assertions, which fail.
+     */
+    public void testFirstHeaderWithoutTheCopyOfACarriedFileFailsAnAssertion() throws Exception {
+        try (var node = newNode()) {
+            final var uploadedCommits = uploadCommitBlobs(node, 2, 2);
+            final String carriedFile = carriedGenerationalFiles(node, uploadedCommits.getLast()).getFirst();
+            // the start of the first commit blob, which has the header of a commit with no generational file
+            final String firstBlobName = BatchedCompoundCommit.blobNameFromGeneration(uploadedCommits.getFirst().blobGeneration());
+            metadataReadOverride = (container, read) -> {
+                final long firstBlobLength = container.listBlobs(OperationPurpose.INDICES).get(firstBlobName).length();
+                return container.readBlob(OperationPurpose.SNAPSHOT_METADATA, firstBlobName, 0L, firstBlobLength);
+            };
+            final var context = contextOf(node, uploadedCommits.getLast().commit(), true);
+
+            final var failure = expectThrows(AssertionError.class, () -> context.copySource(carriedFile));
+
+            assertThat(failure.getMessage(), containsString("has no copy of generational file [" + carriedFile + "]"));
+        }
+    }
+
+    /**
+     * A node with an object store whose reads with the purpose SNAPSHOT_METADATA the test can see and replace.
+     */
+    private FakeStatelessNode newNode() throws IOException {
+        return new FakeStatelessNode(this::newEnvironment, this::newNodeEnvironment, xContentRegistry(), randomIntBetween(1, 100)) {
+            @Override
+            public BlobContainer wrapBlobContainer(BlobPath path, BlobContainer innerContainer) {
+                return new MetadataReadContainer(innerContainer);
+            }
+        };
+    }
+
+    /**
+     * A commit that a test has uploaded, and the generation of its commit blob, which is the generation of the first commit in the blob.
+     */
+    private record UploadedCommit(StatelessCommitRef commit, long blobGeneration) {
+        boolean isFirstInBlob() {
+            return commit.getGeneration() == blobGeneration;
+        }
+    }
+
+    /**
+     * Makes commits with generational files that stay the same in the later commits, see
+     * {@link FakeStatelessNode#generateCommitsWithUnchangedGenerationalFiles}, and uploads them in commit blobs of the given sizes. The
+     * commit blob of each group ends with the last commit of the group.
+     */
+    private static List<UploadedCommit> uploadCommitBlobs(FakeStatelessNode node, int... commitsPerBlob) throws IOException {
+        final var commits = node.generateCommitsWithUnchangedGenerationalFiles(IntStream.of(commitsPerBlob).sum());
+        final var uploadedCommits = new ArrayList<UploadedCommit>();
+        int next = 0;
+        for (int size : commitsPerBlob) {
+            final var commitsOfBlob = commits.subList(next, next + size);
+            next += size;
+            for (StatelessCommitRef commit : commitsOfBlob) {
+                node.commitService.onCommitCreation(commit);
+            }
+            final long lastGeneration = commitsOfBlob.getLast().getGeneration();
+            node.commitService.ensureMaxGenerationToUploadForFlush(node.shardId, lastGeneration);
+            waitUntilBCCIsUploaded(node.commitService, node.shardId, lastGeneration);
+            for (StatelessCommitRef commit : commitsOfBlob) {
+                uploadedCommits.add(new UploadedCommit(commit, commitsOfBlob.getFirst().getGeneration()));
+            }
+        }
+        return uploadedCommits;
+    }
+
+    /**
+     * The context of a snapshot of the commit, with the first location of each file that the commit service of the node has learned,
+     * as the primary gives them to a snapshot.
+     */
+    private static StatelessSnapshotShardContext contextOf(FakeStatelessNode node, StatelessCommitRef commit, boolean serverSideCopyEnabled)
+        throws IOException {
+        final Map<String, BlobLocation> firstLocations = new HashMap<>();
+        for (String file : commit.getFileNames()) {
+            firstLocations.put(file, node.commitService.getBlobLocation(node.shardId, file));
+        }
+        return new StatelessSnapshotShardContext(
+            node.shardId,
+            new SnapshotId(randomIdentifier(), randomUUID()),
+            new IndexId(node.shardId.getIndexName(), randomUUID()),
+            randomIdentifier(),
+            IndexShardSnapshotStatus.newInitializing(ShardGeneration.newGeneration(), randomLongBetween(1, Long.MAX_VALUE)),
+            IndexVersion.current(),
+            randomNonNegativeLong(),
+            null,
+            Map.copyOf(firstLocations),
+            (shardId, primaryTerm) -> node.objectStoreService.getProjectBlobContainer(shardId, primaryTerm),
+            null,
+            serverSideCopyEnabled,
+            new PlainActionFuture<>()
+        );
+    }
+
+    /**
+     * The generational files that the commit carries, which are the generational files that first appeared in an older commit blob.
+     */
+    private static List<String> carriedGenerationalFiles(FakeStatelessNode node, UploadedCommit uploaded) throws IOException {
+        return uploaded.commit()
+            .getFileNames()
+            .stream()
+            .filter(
+                file -> StatelessCompoundCommit.isGenerationalFile(file)
+                    && node.commitService.getBlobLocation(node.shardId, file).compoundFileGeneration() != uploaded.blobGeneration()
+            )
+            .toList();
+    }
+
+    /**
+     * Reads the header that the commit blob has for the commit, from the object store.
+     */
+    private static StatelessCompoundCommit readCommitHeader(FakeStatelessNode node, UploadedCommit uploaded) throws IOException {
+        final var container = node.getShardContainer();
+        final String blobName = BatchedCompoundCommit.blobNameFromGeneration(uploaded.blobGeneration());
+        final var commitBlob = BatchedCompoundCommit.readFromStore(
+            blobName,
+            container.listBlobs(OperationPurpose.INDICES).get(blobName).length(),
+            (name, offset, length) -> new InputStreamStreamInput(container.readBlob(OperationPurpose.INDICES, name, offset, length)),
+            true
+        );
+        return commitBlob.compoundCommits()
+            .stream()
+            .filter(commit -> commit.generation() == uploaded.commit().getGeneration())
+            .findFirst()
+            .orElseThrow();
+    }
+
+    private record MetadataRead(String blobName, long position, long length) {}
+
+    /**
+     * Serves a read with the purpose SNAPSHOT_METADATA instead of the object store.
+     */
+    @FunctionalInterface
+    private interface MetadataReadOverride {
+        InputStream read(BlobContainer container, MetadataRead read) throws IOException;
+    }
+
+    /**
+     * Records the reads with the purpose SNAPSHOT_METADATA in {@link #metadataReads}. These are the reads that a snapshot makes of the
+     * object store to learn what the commits hold. If a test sets {@link #metadataReadOverride}, that serves the read instead.
+     */
+    private final class MetadataReadContainer extends FilterBlobContainer {
+        private final BlobContainer container;
+
+        MetadataReadContainer(BlobContainer container) {
+            super(container);
+            this.container = container;
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new MetadataReadContainer(child);
+        }
+
+        @Override
+        public InputStream readBlob(OperationPurpose purpose, String blobName) throws IOException {
+            if (purpose == OperationPurpose.SNAPSHOT_METADATA) {
+                metadataReads.add(new MetadataRead(blobName, 0L, -1L));
+            }
+            return super.readBlob(purpose, blobName);
+        }
+
+        @Override
+        public InputStream readBlob(OperationPurpose purpose, String blobName, long position, long length) throws IOException {
+            if (purpose == OperationPurpose.SNAPSHOT_METADATA) {
+                final var read = new MetadataRead(blobName, position, length);
+                metadataReads.add(read);
+                final var override = metadataReadOverride;
+                if (override != null) {
+                    return override.read(container, read);
+                }
+            }
+            return super.readBlob(purpose, blobName, position, length);
+        }
+    }
+
+    /**
      * The file info that a snapshot makes for a file when it copies the file from the given commit blob.
      */
     private static FileInfo copiedFileInfo(ShardId shardId, String file, BlobLocation blobLocation) throws IOException {
@@ -270,6 +600,12 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
         BlobLocation blobLocation,
         boolean serverSideCopyEnabled
     ) {
+        // The segments_N file of the commit is in the same commit blob as the file, so the file is not carried, and no header is read.
+        final var segmentsFile = new BlobLocation(
+            blobLocation.blobFile(),
+            blobLocation.offset() + blobLocation.fileLength(),
+            between(1, 100)
+        );
         return new StatelessSnapshotShardContext(
             shardId,
             new SnapshotId(randomIdentifier(), randomUUID()),
@@ -279,7 +615,7 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
             IndexVersion.current(),
             randomNonNegativeLong(),
             null,
-            Map.of(file, blobLocation),
+            Map.of(file, blobLocation, "segments_1", segmentsFile),
             (s, g) -> mock(BlobContainer.class),
             null,
             serverSideCopyEnabled,

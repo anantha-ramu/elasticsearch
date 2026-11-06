@@ -920,15 +920,7 @@ public class StatelessPlugin extends Plugin
 
         final var snapshotsCommitService = setAndGet(
             this.snapshotsCommitServiceRef,
-            new SnapshotsCommitService(
-                clusterService,
-                indicesService,
-                commitService,
-                objectStoreService,
-                services.featureService(),
-                threadPool,
-                meterRegistry
-            )
+            new SnapshotsCommitService(clusterService, indicesService, commitService, threadPool, meterRegistry)
         );
         clusterService.addListener(snapshotsCommitService);
         components.add(snapshotsCommitService);
