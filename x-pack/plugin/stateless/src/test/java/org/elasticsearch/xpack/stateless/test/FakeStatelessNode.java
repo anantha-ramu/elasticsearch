@@ -603,6 +603,52 @@ public class FakeStatelessNode implements Closeable {
         }, indexWriterConfig);
     }
 
+    /**
+     * Generates {@code commitsNumber} commits. Each commit adds a document in a new segment and updates a doc values field of the document
+     * that the previous commit added. The update gives the segment of that document new doc values files and a new field infos file,
+     * which are generational files. No later commit updates that segment again, so its generational files stay the same in every later
+     * commit. No merge runs, so no segment goes away. The first commit has no generational file, and every later commit has new ones.
+     * <p>
+     * Call this method once for a test, because the document ids and the sequence numbers start from zero on every call.
+     */
+    public List<StatelessCommitRef> generateCommitsWithUnchangedGenerationalFiles(int commitsNumber) throws IOException {
+        final var indexWriterConfig = new IndexWriterConfig(new KeywordAnalyzer());
+        indexWriterConfig.setIndexDeletionPolicy(NoDeletionPolicy.INSTANCE);
+        indexWriterConfig.setMergePolicy(NoMergePolicy.INSTANCE);
+        indexWriterConfig.setUseCompoundFile(false);
+        final List<StatelessCommitRef> commits = new ArrayList<>(commitsNumber);
+        IndexCommit previousCommit;
+        try (var indexWriter = new IndexWriter(indexingStore.directory(), indexWriterConfig)) {
+            try (var indexReader = DirectoryReader.open(indexingStore.directory())) {
+                previousCommit = indexReader.getIndexCommit();
+            }
+            for (int i = 0; i < commitsNumber; i++) {
+                indexWriter.addDocument(List.of(new StringField("id", "doc" + i, Field.Store.NO), new NumericDocValuesField("value", 0)));
+                if (i > 0) {
+                    indexWriter.updateNumericDocValue(new Term("id", "doc" + (i - 1)), "value", i);
+                }
+                indexWriter.setLiveCommitData(Map.of(SequenceNumbers.MAX_SEQ_NO, Integer.toString(i)).entrySet());
+                indexWriter.commit();
+                try (var indexReader = DirectoryReader.open(indexingStore.directory())) {
+                    final IndexCommit indexCommit = indexReader.getIndexCommit();
+                    final Set<String> additionalFiles = Lucene.additionalFileNames(previousCommit, indexCommit);
+                    previousCommit = indexCommit;
+                    commits.add(
+                        new StatelessCommitRef(
+                            shardId,
+                            new Engine.IndexCommitRef(indexCommit, () -> {}),
+                            additionalFiles,
+                            primaryTerm,
+                            0,
+                            0
+                        )
+                    );
+                }
+            }
+        }
+        return commits;
+    }
+
     public List<StatelessCommitRef> generateIndexCommits(
         int commitsNumber,
         boolean merge,

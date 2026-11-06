@@ -194,6 +194,99 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
         assertThat(copySource(shardId, commitBlobLocation(primaryTerm + 1, generation)).copyName(), not(equalTo(copyName)));
     }
 
+    /**
+     * A generational file is stored in more than one commit blob, because each new commit blob copies the generational files. The snapshot
+     * points the file at the commit blob of the snapshotted commit. So an earlier file info, which points at a copy of an older commit
+     * blob, can be reused only while the file is in the same commit blob. If the file is at another offset of the same commit blob, the
+     * earlier file info can still be reused.
+     */
+    public void testGenerationalFileIsReusableOnlyInTheSameCommitBlob() throws IOException {
+        final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
+        final String file = randomFrom("_0_1.liv", "_3_2.fnm", "_12_1_Lucene90_0.dvd", "_7_4_Lucene90_0.dvm");
+        final long primaryTerm = randomLongBetween(1, 100);
+        final long generation = randomLongBetween(2, 1000);
+        final var earlierFileInfo = copiedFileInfo(shardId, file, commitBlobLocation(primaryTerm, generation));
+
+        final var sameBlob = new BlobLocation(
+            new BlobFile("stateless_commit_" + generation, new PrimaryTermAndGeneration(primaryTerm, generation)),
+            between(0, 50),
+            between(100, 1000)
+        );
+        assertTrue(contextWithFile(shardId, file, sameBlob, true).isCopiedFileReusable(earlierFileInfo));
+        // a newer commit blob of the same primary term, and a commit blob of a newer primary term
+        assertFalse(
+            contextWithFile(shardId, file, commitBlobLocation(primaryTerm, generation + 1), true).isCopiedFileReusable(earlierFileInfo)
+        );
+        assertFalse(
+            contextWithFile(shardId, file, commitBlobLocation(primaryTerm + 1, generation), true).isCopiedFileReusable(earlierFileInfo)
+        );
+    }
+
+    /**
+     * A file that is not a generational file stays in the commit blob that it was written to, so its earlier file info stays reusable. The
+     * context keeps the reuse that the snapshot did before, whatever commit blob holds the file.
+     */
+    public void testFileThatIsNotGenerationalIsReusableInAnotherCommitBlob() throws IOException {
+        final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
+        final String file = randomFrom("_0.cfs", "_3.fdt", "_12_Lucene90_0.dvd", "_7_Lucene90_0.dvm");
+        final long primaryTerm = randomLongBetween(1, 100);
+        final long generation = randomLongBetween(2, 1000);
+        final var earlierFileInfo = copiedFileInfo(shardId, file, commitBlobLocation(primaryTerm, generation));
+
+        assertTrue(
+            contextWithFile(shardId, file, commitBlobLocation(primaryTerm, generation + 1), true).isCopiedFileReusable(earlierFileInfo)
+        );
+    }
+
+    /**
+     * With server-side copy off, the context offers no copy source. A snapshot that refused to reuse a copied generational file would
+     * then upload the file again, so the context keeps reusing the earlier file info. Turning copies off must not upload files again that
+     * are in the repository as copies.
+     */
+    public void testCopiedGenerationalFileIsReusableWhenCopiesAreOff() throws IOException {
+        final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
+        final String file = randomFrom("_0_1.liv", "_3_2.fnm", "_12_1_Lucene90_0.dvd", "_7_4_Lucene90_0.dvm");
+        final long primaryTerm = randomLongBetween(1, 100);
+        final long generation = randomLongBetween(2, 1000);
+        final var earlierFileInfo = copiedFileInfo(shardId, file, commitBlobLocation(primaryTerm, generation));
+
+        final var context = contextWithFile(shardId, file, commitBlobLocation(primaryTerm, generation + 1), false);
+        assertThat(context.copySource(file), nullValue());
+        assertTrue(context.isCopiedFileReusable(earlierFileInfo));
+    }
+
+    /**
+     * The file info that a snapshot makes for a file when it copies the file from the given commit blob.
+     */
+    private static FileInfo copiedFileInfo(ShardId shardId, String file, BlobLocation blobLocation) throws IOException {
+        final var source = copySource(shardId, blobLocation);
+        final var metadata = new StoreFileMetadata(file, blobLocation.fileLength(), "checksum", Version.LATEST.toString());
+        return new FileInfo("__" + randomUUID(), metadata, "c__" + randomUUID(), source.offset(), source.source());
+    }
+
+    private static StatelessSnapshotShardContext contextWithFile(
+        ShardId shardId,
+        String file,
+        BlobLocation blobLocation,
+        boolean serverSideCopyEnabled
+    ) {
+        return new StatelessSnapshotShardContext(
+            shardId,
+            new SnapshotId(randomIdentifier(), randomUUID()),
+            new IndexId(shardId.getIndexName(), randomUUID()),
+            randomIdentifier(),
+            IndexShardSnapshotStatus.newInitializing(ShardGeneration.newGeneration(), randomLongBetween(1, Long.MAX_VALUE)),
+            IndexVersion.current(),
+            randomNonNegativeLong(),
+            null,
+            Map.of(file, blobLocation),
+            (s, g) -> mock(BlobContainer.class),
+            null,
+            serverSideCopyEnabled,
+            new PlainActionFuture<>()
+        );
+    }
+
     private static BlobLocation commitBlobLocation(long primaryTerm, long generation) {
         return new BlobLocation(
             new BlobFile("stateless_commit_" + generation, new PrimaryTermAndGeneration(primaryTerm, generation)),
