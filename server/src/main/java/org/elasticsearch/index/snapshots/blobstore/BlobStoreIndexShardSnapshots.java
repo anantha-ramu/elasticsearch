@@ -225,8 +225,8 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
                     // the rebuild brings back. Such a delete removes every copy that its new shard generation does not refer to, such as
                     // the copy of a failed or deleted snapshot. The rebuild still reads the snap-<uuid>.dat blob of such a snapshot until
                     // the delete removes that blob.
-                    // Otherwise the copy stays: the snapshot that reuses the copy writes a new index-<uuid> that refers to the copy, so
-                    // a later snapshot delete does not remove the copy.
+                    // If no snapshot delete is removing the picked copy, the copy stays: the snapshot that reuses the copy writes a new
+                    // index-<uuid> that refers to the copy, so a later snapshot delete does not remove the copy.
                     bySource.putIfAbsent(fileInfo.source(), fileInfo.blob());
                 }
             }

@@ -4106,7 +4106,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
      *     <li>If that generation already refers to a copy of the file's commit blob, the file points at that copy, and nothing is copied.
      *     The copy holds the whole commit blob, so it holds this file too.</li>
      *     <li>Otherwise the commit blob is copied once, whole, however many of its files the snapshot needs. {@link #addFile} names each
-     *     copy after the attempt's new shard generation, and says there why.</li>
+     *     copy after the attempt's new shard generation, and its comment explains why.</li>
      * </ul>
      */
     private static final class CopyPlan {
