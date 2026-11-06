@@ -32,11 +32,13 @@ import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.collect.Iterators;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
 import org.elasticsearch.common.regex.Regex;
+import org.elasticsearch.common.util.set.Sets;
 import org.elasticsearch.core.CheckedRunnable;
 import org.elasticsearch.core.FixForMultiProject;
 import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.IndexVersion;
+import org.elasticsearch.index.IndexVersions;
 import org.elasticsearch.index.engine.Engine;
 import org.elasticsearch.index.engine.InternalEngineFactory;
 import org.elasticsearch.index.seqno.RetentionLeaseSyncer;
@@ -53,13 +55,17 @@ import org.elasticsearch.index.store.StoreFileMetadata;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.LocalPrimarySnapshotShardContext;
 import org.elasticsearch.repositories.ShardGeneration;
+import org.elasticsearch.repositories.ShardGenerations;
 import org.elasticsearch.repositories.ShardSnapshotResult;
 import org.elasticsearch.repositories.SnapshotIndexCommit;
 import org.elasticsearch.repositories.SnapshotShardContext;
 import org.elasticsearch.snapshots.PausedSnapshotException;
 import org.elasticsearch.snapshots.Snapshot;
 import org.elasticsearch.snapshots.SnapshotId;
+import org.elasticsearch.snapshots.SnapshotsService;
+import org.elasticsearch.snapshots.SnapshotsServiceUtils;
 import org.elasticsearch.test.MockLog;
+import org.elasticsearch.test.index.IndexVersionUtils;
 import org.elasticsearch.test.junit.annotations.TestLogging;
 
 import java.io.IOException;
@@ -83,6 +89,7 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
@@ -278,6 +285,173 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             assertThat(status.asCopy().getProcessedFileCount(), equalTo(1));
 
             shardAndRepository.restoreAndCheck(second);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    /**
+     * A later snapshot that needs a file from a commit blob that an earlier snapshot copied points the file at that copy, under the name
+     * that the copy already has, which starts with the shard generation of the earlier snapshot. A commit blob that the later snapshot
+     * copies for the first time gets a name that starts with the shard generation of the later snapshot.
+     */
+    public void testReusedCopyKeepsItsNameAndNewCopyGetsTheNewShardGeneration() throws IOException {
+        final var shardAndRepository = new ShardAndRepository();
+        try {
+            shardAndRepository.indexSegments(between(2, 4));
+            final Map<String, SnapshotShardContext.CopySource> sources = new HashMap<>(
+                shardAndRepository.writeCommitBlobs(1, name -> true, 0)
+            );
+            // The first snapshot does not see one data file of the commit blob, like a snapshot of an earlier commit in the same blob.
+            final String hidden = randomFrom(sources.keySet());
+            final ShardGeneration firstGeneration = shardAndRepository.snapshot(
+                shardAndRepository.newSnapshot(),
+                IndexShardSnapshotStatus.newInitializing(null, randomLongBetween(1, Long.MAX_VALUE)),
+                sources::get,
+                name -> name.equals(hidden) == false
+            );
+            final Set<String> firstCopies = copyNames(firstGeneration, sources.values());
+            assertThat(copiedBlobs(shardAndRepository.shardContainer()), equalTo(firstCopies));
+
+            // One more segment adds new data files. They are in a second commit blob, which the second snapshot copies.
+            shardAndRepository.indexSegments(1);
+            final Set<String> known = Set.copyOf(sources.keySet());
+            final Map<String, SnapshotShardContext.CopySource> newSources = shardAndRepository.writeCommitBlobs(
+                1,
+                name -> known.contains(name) == false,
+                0
+            );
+            sources.putAll(newSources);
+            final Snapshot second = shardAndRepository.newSnapshot();
+            final ShardGeneration secondGeneration = shardAndRepository.snapshot(
+                second,
+                IndexShardSnapshotStatus.newInitializing(firstGeneration, randomLongBetween(1, Long.MAX_VALUE)),
+                sources::get,
+                name -> true
+            );
+
+            // The second snapshot made one new copy, and left the copy of the first snapshot as it was.
+            final Set<String> secondCopies = copyNames(secondGeneration, newSources.values());
+            assertThat(secondGeneration, not(equalTo(firstGeneration)));
+            assertThat(copiedBlobs(shardAndRepository.shardContainer()), equalTo(Sets.union(firstCopies, secondCopies)));
+            final String firstCopy = firstCopies.iterator().next();
+            final String secondCopy = secondCopies.iterator().next();
+            final List<FileInfo> files = shardAndRepository.loadShardSnapshot(second).indexFiles();
+            for (FileInfo fileInfo : files) {
+                if (fileInfo.isCopied()) {
+                    assertThat(
+                        fileInfo.toString(),
+                        fileInfo.blob(),
+                        equalTo(newSources.containsKey(fileInfo.physicalName()) ? secondCopy : firstCopy)
+                    );
+                }
+            }
+            // the file that the first snapshot did not see points at the copy of the first snapshot, under the name of that copy
+            assertThat(
+                files.stream().filter(fileInfo -> fileInfo.physicalName().equals(hidden)).findFirst().orElseThrow().blob(),
+                equalTo(firstCopy)
+            );
+
+            shardAndRepository.restoreAndCheck(second);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    /**
+     * Two attempts at a shard snapshot copy the same commit blobs. The second attempt starts from a generation that does not know the
+     * copies of the first attempt, as a snapshot does after an earlier snapshot failed while it was being finalized. Each attempt names
+     * its copies after the shard generation that the attempt wrote as an {@code index-<uuid>} blob, so the two attempts give the same
+     * commit blob two different copy names. The test framework's check of blob types accepts these names.
+     */
+    public void testAttemptsNameTheirCopiesAfterTheirOwnShardGeneration() throws IOException {
+        final var shardAndRepository = new ShardAndRepository();
+        try {
+            shardAndRepository.indexSegments(between(2, 4));
+            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
+                between(1, 3),
+                name -> true,
+                0
+            );
+            final ShardGeneration firstGeneration = shardAndRepository.snapshot(shardAndRepository.newSnapshot(), sources::get);
+            final Set<String> firstCopies = copiedBlobs(shardAndRepository.shardContainer());
+
+            // the second attempt starts as if the shard had no snapshot yet, so it copies every commit blob again
+            final ShardGeneration secondGeneration = shardAndRepository.snapshot(
+                shardAndRepository.newSnapshot(),
+                IndexShardSnapshotStatus.newInitializing(ShardGenerations.NEW_SHARD_GEN, randomLongBetween(1, Long.MAX_VALUE)),
+                sources::get,
+                name -> true
+            );
+            final Set<String> allCopies = copiedBlobs(shardAndRepository.shardContainer());
+
+            assertThat(secondGeneration, not(equalTo(firstGeneration)));
+            assertThat(firstCopies, equalTo(copyNames(firstGeneration, sources.values())));
+            assertThat(Sets.difference(allCopies, firstCopies), equalTo(copyNames(secondGeneration, sources.values())));
+            // each attempt wrote an index-<uuid> blob for the generation that is in the names of its copies
+            final Set<String> blobs = shardAndRepository.shardContainer().listBlobs(OperationPurpose.SNAPSHOT_METADATA).keySet();
+            assertTrue(blobs.contains(BlobStoreRepository.SNAPSHOT_INDEX_PREFIX + firstGeneration.getGenerationUUID()));
+            assertTrue(blobs.contains(BlobStoreRepository.SNAPSHOT_INDEX_PREFIX + secondGeneration.getGenerationUUID()));
+            shardAndRepository.assertCopiesHaveTheShardDataType();
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    /**
+     * A repository in the old format has numeric shard generations. A numeric generation repeats across attempts, so a copy cannot be
+     * named after it. The context offers a copy source for every file, but the snapshot uploads the files and makes no copy.
+     */
+    public void testNumericShardGenerationsUploadInsteadOfCopying() throws IOException {
+        final var shardAndRepository = new ShardAndRepository();
+        try {
+            shardAndRepository.indexSegments(between(1, 3));
+            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
+                between(1, 3),
+                name -> true,
+                0
+            );
+            final IndexVersion oldVersion = IndexVersionUtils.randomVersionBetween(
+                IndexVersions.V_7_0_0,
+                SnapshotsService.OLD_SNAPSHOT_FORMAT
+            );
+            assertFalse(SnapshotsServiceUtils.useShardGenerations(oldVersion));
+            final Snapshot snapshot = shardAndRepository.newSnapshot();
+            final var generation = new AtomicReference<ShardGeneration>();
+            MockLog.assertThatLogger(
+                () -> runUnchecked(
+                    () -> generation.set(
+                        shardAndRepository.snapshot(
+                            snapshot,
+                            IndexShardSnapshotStatus.newInitializing(null, randomLongBetween(1, Long.MAX_VALUE)),
+                            oldVersion,
+                            sources::get,
+                            name -> true
+                        )
+                    )
+                ),
+                BlobStoreRepository.class,
+                new MockLog.UnseenEventExpectation(
+                    "no copy stats",
+                    BlobStoreRepository.class.getCanonicalName(),
+                    Level.INFO,
+                    "*shard snapshot copy stats*"
+                )
+            );
+
+            // the shard generation is a number, and the snapshot wrote the index-N blob for it
+            assertThat(generation.get().getGenerationUUID(), equalTo("0"));
+            final Set<String> blobs = shardAndRepository.shardContainer().listBlobs(OperationPurpose.SNAPSHOT_METADATA).keySet();
+            assertTrue(blobs.contains(BlobStoreRepository.SNAPSHOT_INDEX_PREFIX + "0"));
+            assertThat(copiedBlobs(blobs), empty());
+            assertThat(
+                blobs.stream().filter(name -> name.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX)).toList(),
+                not(empty())
+            );
+            for (FileInfo fileInfo : shardAndRepository.loadShardSnapshot(snapshot).indexFiles()) {
+                assertFalse(fileInfo + " is copied", fileInfo.isCopied());
+            }
+            shardAndRepository.restoreAndCheck(snapshot);
         } finally {
             shardAndRepository.close();
         }
@@ -655,6 +829,16 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         return blobNames.stream().filter(name -> name.startsWith(BlobStoreRepository.COPIED_DATA_BLOB_PREFIX)).collect(Collectors.toSet());
     }
 
+    /**
+     * The names that the copies of the given commit blobs have when an attempt with the given shard generation makes them: {@code c__},
+     * the shard generation, an underscore, and the copy name of the source.
+     */
+    private static Set<String> copyNames(ShardGeneration generation, Collection<SnapshotShardContext.CopySource> sources) {
+        return sources.stream()
+            .map(source -> BlobStoreRepository.COPIED_DATA_BLOB_PREFIX + generation.getGenerationUUID() + "_" + source.copyName())
+            .collect(Collectors.toSet());
+    }
+
     private static byte[] readAll(BlobContainer container, String blobName) throws IOException {
         try (InputStream in = container.readBlob(OperationPurpose.SNAPSHOT_DATA, blobName)) {
             return in.readAllBytes();
@@ -826,6 +1010,22 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         }
 
         /**
+         * Checks that the test framework's check of blob types knows every blob in the shard's folder, and takes each copy for shard data.
+         */
+        void assertCopiesHaveTheShardDataType() throws IOException {
+            final Path repositoryRoot = ((FsBlobStore) repository.blobStore()).path();
+            final Path shardFolder = repositoryRoot.resolve("indices").resolve(indexId.getId()).resolve(Integer.toString(shardId.id()));
+            try (Stream<Path> blobs = Files.list(shardFolder)) {
+                for (Path blob : blobs.toList()) {
+                    final RepositoryFileType type = RepositoryFileType.getRepositoryFileType(repositoryRoot, blob);
+                    if (blob.getFileName().toString().startsWith(BlobStoreRepository.COPIED_DATA_BLOB_PREFIX)) {
+                        assertThat(blob.toString(), type, equalTo(RepositoryFileType.SHARD_DATA));
+                    }
+                }
+            }
+        }
+
+        /**
          * Checks that a shard snapshot that failed left no copy, no uploaded file and no {@code snap-<uuid>.dat} blob in the shard's
          * folder. The {@code index-<uuid>} blob that a shard snapshot writes first can stay, because no generation refers to it.
          */
@@ -845,6 +1045,20 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             Function<String, SnapshotShardContext.CopySource> copySources,
             Predicate<String> visibleFiles
         ) throws IOException {
+            return snapshot(snapshot, status, IndexVersion.current(), copySources, visibleFiles);
+        }
+
+        /**
+         * Takes a shard snapshot into a repository that has the given metadata version, through a context that offers the given copy
+         * sources and shows only the visible files.
+         */
+        ShardGeneration snapshot(
+            Snapshot snapshot,
+            IndexShardSnapshotStatus status,
+            IndexVersion repositoryMetaVersion,
+            Function<String, SnapshotShardContext.CopySource> copySources,
+            Predicate<String> visibleFiles
+        ) throws IOException {
             final PlainActionFuture<ShardSnapshotResult> future = new PlainActionFuture<>();
             try (Engine.IndexCommitRef commitRef = shard.acquireLastIndexCommit(true)) {
                 final var localContext = new LocalPrimarySnapshotShardContext(
@@ -855,7 +1069,7 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                     new SnapshotIndexCommit(commitRef),
                     null,
                     status,
-                    IndexVersion.current(),
+                    repositoryMetaVersion,
                     randomMillisUpToYear9999(),
                     future
                 );

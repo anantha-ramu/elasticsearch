@@ -27,8 +27,10 @@ public enum RepositoryFileType {
     INDEX_METADATA("indices/UUID/meta-SHORTUUID.dat"),
     SHARD_GENERATION("indices/UUID/NUM/index-UUID"),
     SHARD_SNAPSHOT_INFO("indices/UUID/NUM/snap-UUID.dat"),
-    // a blob of its own for one file (__), or a copied blob that holds byte ranges of many files (c__)
-    SHARD_DATA("indices/UUID/NUM/c?__UUID"),
+    // A blob of its own for one file (__). Or a copied blob that holds byte ranges of many files (c__), which is named after the shard
+    // generation of the attempt that made it and after the commit blob that it copies. The name that follows the shard generation is
+    // optional because BlobStoreTestUtil#moveFilesIntoCopiedBlob makes copied blobs without it.
+    SHARD_DATA("indices/UUID/NUM/(__UUID|c__UUID(_[0-9a-zA-Z_-]+)?)"),
     // NB no support for legacy names (yet)
     ;
 

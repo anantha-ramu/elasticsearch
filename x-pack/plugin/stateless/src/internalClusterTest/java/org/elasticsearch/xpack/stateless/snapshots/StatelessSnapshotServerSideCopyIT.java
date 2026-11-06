@@ -17,9 +17,11 @@ import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;
 import org.elasticsearch.cluster.routing.ShardRouting;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.CheckedRunnable;
 import org.elasticsearch.core.TimeValue;
@@ -50,6 +52,7 @@ import org.elasticsearch.xpack.stateless.AbstractStatelessPluginIntegTestCase;
 import org.elasticsearch.xpack.stateless.StatelessMockRepository;
 import org.elasticsearch.xpack.stateless.StatelessMockRepositoryPlugin;
 import org.elasticsearch.xpack.stateless.StatelessMockRepositoryStrategy;
+import org.elasticsearch.xpack.stateless.commits.BatchedCompoundCommit;
 import org.elasticsearch.xpack.stateless.commits.StatelessCommitService;
 import org.elasticsearch.xpack.stateless.objectstore.ObjectStoreService;
 import org.elasticsearch.xpack.stateless.objectstore.gc.ObjectStoreGCTask;
@@ -72,6 +75,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -81,11 +85,13 @@ import static org.elasticsearch.xpack.stateless.reshard.SplitSourceService.RESHA
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING;
+import static org.hamcrest.Matchers.anEmptyMap;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.matchesPattern;
 import static org.hamcrest.Matchers.not;
 
 /**
@@ -224,6 +230,8 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         createSnapshot(repoName, "first", List.of(indexName), List.of());
         final Map<String, FileInfo> firstFiles = byName(dataFiles(shardSnapshot(repoName, indexName, "first", 0)));
         final Set<String> firstCopies = copiedBlobs(repoName, indexName, 0);
+        final ShardGeneration firstGeneration = shardGeneration(repoName, indexName, 0);
+        assertCopiesNamedAfter(firstCopies, firstGeneration);
 
         docCount += indexDocsAndFlush(indexName, 1);
         createSnapshot(repoName, "second", List.of(indexName), List.of());
@@ -242,6 +250,13 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         final Set<String> secondCopies = copiedBlobs(repoName, indexName, 0);
         assertTrue(secondCopies.containsAll(firstCopies));
         assertThat(secondCopies, equalTo(Set.copyOf(copyBySource.values())));
+        // The second snapshot reuses the copies of the first snapshot under their names, which hold the first shard generation. Only the
+        // copies that the second snapshot makes hold the second shard generation.
+        final ShardGeneration secondGeneration = shardGeneration(repoName, indexName, 0);
+        assertThat(secondGeneration, not(equalTo(firstGeneration)));
+        final Set<String> newCopies = difference(secondCopies, firstCopies);
+        assertThat(newCopies, not(empty()));
+        assertCopiesNamedAfter(newCopies, secondGeneration);
 
         assertAcked(indicesAdmin().prepareDelete(indexName));
         restore(repoName, "second", indexName, indexName);
@@ -752,9 +767,10 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
      * again. With a name derived from the commit blob, the second snapshot copies to the same name as the first copy.</li>
      * <li>The delete removes the blobs that it found, among them the second snapshot's copy.</li>
      * </ol>
-     * Copy names are random, so the second snapshot's copy has a different name, and the delete does not remove it. The test takes a base
-     * snapshot first. It keeps the index in the repository data after the first snapshot is deleted, so the second snapshot writes into
-     * the same shard folder that the delete is cleaning.
+     * A copy is named after the shard generation of the attempt that made it, so the second snapshot's copy has a different name from the
+     * first snapshot's copy, and the delete does not remove it. After the delete, the second snapshot restores and passes the verify
+     * integrity API, which reads the contents of its copy. The test takes a base snapshot first. It keeps the index in the repository data
+     * after the first snapshot is deleted, so the second snapshot writes into the same shard folder that the delete is cleaning.
      */
     public void testDeleteThatIsStillRemovingBlobsKeepsTheCopyOfALaterSnapshot() throws Exception {
         // a blocked delete holds a snapshot thread, so leave enough of them for the second snapshot
@@ -777,6 +793,9 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         createSnapshot(repoName, "first", List.of(indexName), List.of());
         final Set<String> firstCopies = difference(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), baseCopies);
         assertThat(firstCopies, not(empty()));
+        final ShardGeneration firstGeneration = shardGeneration(repoName, indexName, 0);
+        final Map<String, String> firstCopyBySource = copyBySource(dataFiles(shardSnapshot(repoName, indexName, "first", 0)), firstCopies);
+        assertThat(firstCopyBySource, not(anEmptyMap()));
 
         // 2. The delete of the first snapshot is blocked just before it removes blobs. By then it has written the new repository data.
         // The master removes the delete from the cluster state without waiting for the blobs, so the test waits for that. A new snapshot
@@ -809,6 +828,17 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
             union(baseCopies, firstCopies)
         );
         assertThat(secondCopies, not(empty()));
+        // The second snapshot copied the same commit blobs as the first snapshot, under new names. The new names hold the shard generation
+        // of the second snapshot.
+        final ShardGeneration secondGeneration = shardGeneration(repoName, indexName, 0);
+        assertThat(secondGeneration, not(equalTo(firstGeneration)));
+        assertCopiesNamedAfter(secondCopies, secondGeneration);
+        final Map<String, String> secondCopyBySource = copyBySource(
+            dataFiles(shardSnapshot(repoName, indexName, "second", 0)),
+            secondCopies
+        );
+        assertThat(secondCopyBySource.keySet(), equalTo(firstCopyBySource.keySet()));
+        firstCopyBySource.forEach((source, firstCopy) -> assertThat(secondCopyBySource.get(source), not(equalTo(firstCopy))));
 
         // 4. The delete removes the blobs that it found, which are the copies of the first snapshot, and none of the second snapshot's.
         releaseDelete.countDown();
@@ -816,6 +846,8 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(union(baseCopies, secondCopies)));
         restore(repoName, "second", indexName, "restored-second");
         assertHitCount(prepareSearch("restored-second"), docCount);
+        // the copy of the second snapshot is complete, so every file of the snapshot has its bytes at the range that its file info names
+        assertVerifyIntegrityPasses(repoName, indexName, "base", "second");
     }
 
     /**
@@ -929,7 +961,9 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
      * <li>the repository holds exactly the copied blobs that the current shard generation refers to, which shows that the first
      * attempt left no copy behind;</li>
      * <li>the verify integrity API, which reads the contents of every blob, finds no problem;</li>
-     * <li>the snapshot can be restored.</li>
+     * <li>the snapshot can be restored;</li>
+     * <li>the copies of the second attempt are named after the shard generation that the repository data names, and the copies of the
+     * first attempt were named after a different shard generation, whose {@code index-<uuid>} blob is still in the shard's folder.</li>
      * </ul>
      */
     public void testShutdownMarkerPausesTheShardSnapshotAfterTheCopy() throws Exception {
@@ -951,7 +985,9 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", location), true);
         final var copyStarted = new CountDownLatch(1);
         final var releaseCopy = new CountDownLatch(1);
-        snapshotRepositoryOnNode(repoName, pausedNode).setStrategy(blockCopies(copyStarted, releaseCopy));
+        // the names of the copies that the first attempt makes
+        final Set<String> pausedCopies = ConcurrentCollections.newConcurrentSet();
+        snapshotRepositoryOnNode(repoName, pausedNode).setStrategy(blockCopies(copyStarted, releaseCopy, pausedCopies));
 
         // The first attempt logs its copy stats when it pauses. The pattern below needs at least one copy made, so the test cannot pass
         // when the first attempt had no copy to delete. A wildcard for the number of copies would also match 0.
@@ -998,6 +1034,21 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         assertVerifyIntegrityPasses(repoName, indexName, "snap");
         restore(repoName, "snap", indexName, "restored");
         assertHitCount(prepareSearch("restored"), docCount);
+
+        // The second attempt ran on the other index node. It named its copies after the shard generation that the repository data names.
+        // The first attempt named its copies after a shard generation of its own. It deleted its copies, but its index-<uuid> blob is still
+        // in the shard's folder.
+        final ShardGeneration secondGeneration = shardGeneration(repoName, indexName, 0);
+        assertCopiesNamedAfter(copiedBlobs(repoName, indexName, 0), secondGeneration);
+        assertThat(pausedCopies, not(empty()));
+        final Set<String> pausedGenerations = pausedCopies.stream()
+            .map(StatelessSnapshotServerSideCopyIT::generationOf)
+            .collect(Collectors.toSet());
+        assertThat(pausedGenerations, hasSize(1));
+        final String pausedGeneration = pausedGenerations.iterator().next();
+        assertThat(pausedGeneration, not(equalTo(secondGeneration.getGenerationUUID())));
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.SNAPSHOT_INDEX_PREFIX + pausedGeneration), hasSize(1));
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX + pausedGeneration), empty());
     }
 
     /**
@@ -1180,10 +1231,14 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
     }
 
     /**
-     * Returns a strategy that holds each copy of a commit blob. When the copy call starts, it counts down {@code copyStarted}. It then
-     * waits for {@code releaseCopy} before it makes the copy.
+     * Returns a strategy that holds each copy of a commit blob. When the copy call starts, it adds the name of the copy to
+     * {@code copyNames} and counts down {@code copyStarted}. It then waits for {@code releaseCopy} before it makes the copy.
      */
-    private static StatelessMockRepositoryStrategy blockCopies(CountDownLatch copyStarted, CountDownLatch releaseCopy) {
+    private static StatelessMockRepositoryStrategy blockCopies(
+        CountDownLatch copyStarted,
+        CountDownLatch releaseCopy,
+        Set<String> copyNames
+    ) {
         return new StatelessMockRepositoryStrategy() {
             @Override
             public void blobContainerCopyBlob(
@@ -1195,6 +1250,7 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
                 long blobSize
             ) throws IOException {
                 if (blobName.startsWith(BlobStoreRepository.COPIED_DATA_BLOB_PREFIX)) {
+                    copyNames.add(blobName);
                     copyStarted.countDown();
                     safeAwait(releaseCopy);
                 }
@@ -1239,6 +1295,52 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
 
     private static Set<String> union(Set<String> first, Set<String> second) {
         return Stream.concat(first.stream(), second.stream()).collect(Collectors.toSet());
+    }
+
+    /**
+     * The shard generation that the repository data names for the shard, which is the generation of the last shard snapshot that finished.
+     */
+    private static ShardGeneration shardGeneration(String repoName, String indexName, int shard) {
+        final RepositoryData repositoryData = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository(repoName));
+        return repositoryData.shardGenerations().getShardGen(repositoryData.resolveIndexId(indexName), shard);
+    }
+
+    /**
+     * Checks that every copied blob is named after the given shard generation, the primary term and the commit blob that it copies, as in
+     * {@code c__<shard generation>_<primary term>_stateless_commit_<generation of the commit>}.
+     */
+    private static void assertCopiesNamedAfter(Collection<String> copies, ShardGeneration shardGeneration) {
+        final String pattern = Pattern.quote(BlobStoreRepository.COPIED_DATA_BLOB_PREFIX + shardGeneration.getGenerationUUID() + "_")
+            + "\\d+_"
+            + Pattern.quote(BatchedCompoundCommit.PREFIX)
+            + "\\d+";
+        assertThat(copies, not(empty()));
+        for (String copy : copies) {
+            assertThat(copy, matchesPattern(pattern));
+        }
+    }
+
+    /**
+     * The shard generation in the name of a copied blob, which is the {@link UUIDs#RANDOM_BASED_UUID_STRING_LENGTH} characters after
+     * {@code c__}.
+     */
+    private static String generationOf(String copy) {
+        final int start = BlobStoreRepository.COPIED_DATA_BLOB_PREFIX.length();
+        return copy.substring(start, start + UUIDs.RANDOM_BASED_UUID_STRING_LENGTH);
+    }
+
+    /**
+     * The copied blob that each commit blob has in the given files, for the files whose copied blob is one of {@code copies}. A copied
+     * blob holds a whole commit blob, so all files of one commit blob have the same copied blob in a snapshot.
+     */
+    private static Map<String, String> copyBySource(List<FileInfo> files, Set<String> copies) {
+        final Map<String, String> copyBySource = new HashMap<>();
+        for (FileInfo fileInfo : files) {
+            if (fileInfo.isCopied() && copies.contains(fileInfo.blob())) {
+                copyBySource.put(fileInfo.source(), fileInfo.blob());
+            }
+        }
+        return copyBySource;
     }
 
     private static String indexId(String repoName, String indexName) {
@@ -1350,13 +1452,13 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
 
     /**
      * Runs the verify integrity API on the repository, with the contents of every blob checked. Each problem that the API finds is reported
-     * as an anomaly. This method checks that there is no anomaly, that the API really read blob contents, and that it finds the snapshot
-     * restorable.
+     * as an anomaly. This method checks that there is no anomaly, that the API really read blob contents, and that it finds each of the
+     * given snapshots restorable. The repository must hold these snapshots and no other.
      * <p>
      * For a copied file, the API reads the byte range that the file info names in the copied blob. The API then compares the checksum of
      * that range with the checksum in the file info. If the offset or length is wrong, the checksums differ, so the API reports an anomaly.
      */
-    private void assertVerifyIntegrityPasses(String repoName, String indexName, String snapshotName) throws IOException {
+    private void assertVerifyIntegrityPasses(String repoName, String indexName, String... snapshotNames) throws IOException {
         final var request = new Request("POST", "/_snapshot/" + repoName + "/_verify_integrity");
         request.addParameter("verify_blob_contents", null);
         final var response = getRestClient().performRequest(request);
@@ -1377,12 +1479,18 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
                 seenSnapshotNames.add(loggedSnapshotName);
             } else {
                 assertEquals(indexName, responseObjectPath.evaluate("log." + i + ".index.name"));
-                assertEquals(1, (int) responseObjectPath.evaluate("log." + i + ".snapshot_restorability.total_snapshot_count"));
-                assertEquals(1, (int) responseObjectPath.evaluate("log." + i + ".snapshot_restorability.restorable_snapshot_count"));
+                assertEquals(
+                    snapshotNames.length,
+                    (int) responseObjectPath.evaluate("log." + i + ".snapshot_restorability.total_snapshot_count")
+                );
+                assertEquals(
+                    snapshotNames.length,
+                    (int) responseObjectPath.evaluate("log." + i + ".snapshot_restorability.restorable_snapshot_count")
+                );
                 seenIndex = true;
             }
         }
-        assertEquals(Set.of(snapshotName), seenSnapshotNames);
+        assertEquals(Set.of(snapshotNames), seenSnapshotNames);
         assertTrue(seenIndex);
     }
 

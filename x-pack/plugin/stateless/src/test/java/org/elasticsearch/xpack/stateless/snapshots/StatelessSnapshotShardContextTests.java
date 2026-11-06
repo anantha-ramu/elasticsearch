@@ -17,6 +17,7 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.Version;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.PlainActionFuture;
+import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.BlobPath;
 import org.elasticsearch.common.blobstore.OperationPurpose;
@@ -172,6 +173,33 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
         );
         assertThat(generation.findCopiedBlob(oldCopySource.source()), equalTo("c__old"));
         assertThat(generation.findCopiedBlob(newCopySource.source()), nullValue());
+    }
+
+    /**
+     * The repository puts the copy name after the shard generation in the name of a copy, and the sources that one shard snapshot copies
+     * need different copy names. Within a shard, the primary term and the name of a commit blob identify the commit blob, so the copy name
+     * holds both.
+     */
+    public void testCopyNameIdentifiesTheCommitBlobWithinTheShard() throws IOException {
+        final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
+        final long primaryTerm = randomLongBetween(1, 100);
+        final long generation = randomLongBetween(1, 1000);
+        final var copyName = copySource(shardId, commitBlobLocation(primaryTerm, generation)).copyName();
+
+        assertThat(copyName, equalTo(primaryTerm + "_stateless_commit_" + generation));
+        assertTrue(Strings.validFileName(copyName));
+        assertThat(copySource(shardId, commitBlobLocation(primaryTerm, generation)).copyName(), equalTo(copyName));
+        // a commit blob with another generation, or with another primary term, has another copy name
+        assertThat(copySource(shardId, commitBlobLocation(primaryTerm, generation + 1)).copyName(), not(equalTo(copyName)));
+        assertThat(copySource(shardId, commitBlobLocation(primaryTerm + 1, generation)).copyName(), not(equalTo(copyName)));
+    }
+
+    private static BlobLocation commitBlobLocation(long primaryTerm, long generation) {
+        return new BlobLocation(
+            new BlobFile("stateless_commit_" + generation, new PrimaryTermAndGeneration(primaryTerm, generation)),
+            between(0, 50),
+            between(100, 1000)
+        );
     }
 
     private static SnapshotShardContext.CopySource copySource(ShardId shardId, BlobLocation blobLocation) throws IOException {
