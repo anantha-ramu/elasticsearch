@@ -3613,7 +3613,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             final ShardGeneration indexGeneration = writeShardGens
                 ? ShardGeneration.newGeneration()
                 : new ShardGeneration(Long.parseLong(fileListGeneration.getGenerationUUID()) + 1);
-            final CopyPlan copyPlan = new CopyPlan(snapshots, indexGeneration);
+            final CopyPlan copyPlan = new CopyPlan(snapshots, writeShardGens ? indexGeneration : null);
 
             if (context.isSearchableSnapshot()) {
                 indexCommitPointFiles = Collections.emptyList();
@@ -3643,7 +3643,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                         indexIncrementalFileCount++;
                         indexIncrementalSize += md.length();
                         // Only a repository with UUID shard generations copies. Numeric generations repeat across attempts, so a copy
-                        // named after one would repeat too. A repository in the old format uploads the file instead.
+                        // named after a numeric generation would repeat too. A repository in the old format uploads the file instead.
                         final SnapshotShardContext.CopySource copySource = needsWrite && writeShardGens
                             ? context.copySource(fileName)
                             : null;
@@ -3739,7 +3739,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 assert blobsToDelete.stream()
                     .mapToLong(b -> Long.parseLong(b.replaceFirst(SNAPSHOT_INDEX_PREFIX, "")))
                     .max()
-                    .orElse(-1L) < Long.parseLong(indexGeneration.toString())
+                    .orElse(-1L) < newGen
                     : "Tried to delete an index-N blob newer than the current generation ["
                         + indexGeneration
                         + "] when deleting index-N blobs "
@@ -4105,14 +4105,15 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
      * <ul>
      *     <li>If that generation already refers to a copy of the file's commit blob, the file points at that copy, and nothing is copied.
      *     The copy holds the whole commit blob, so it holds this file too.</li>
-     *     <li>Otherwise the commit blob is copied once, whole, however many of its files the snapshot needs. {@link #addFile} chooses the
-     *     name of the copy.</li>
+     *     <li>Otherwise the commit blob is copied once, whole, however many of its files the snapshot needs. {@link #addFile} names each
+     *     copy after the attempt's new shard generation, and says there why.</li>
      * </ul>
      */
     private static final class CopyPlan {
         private final BlobStoreIndexShardSnapshots startingGeneration;
         private final ShardGeneration newGeneration;
         private final Map<String, NewCopy> newCopiesBySource = new LinkedHashMap<>();
+        private final Set<String> newCopyNames = new HashSet<>();
         private final Set<String> reusedCopies = new HashSet<>();
         private int reusedFileCount;
         private long reusedFileSize;
@@ -4123,8 +4124,9 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
 
         /**
          * @param startingGeneration the files of the shard's earlier snapshots
-         * @param newGeneration      the shard generation that this attempt writes as its {@code index-<uuid>} blob. The plan names each new
-         *                           copy after it, so a plan with a numeric generation must never be asked to {@link #addFile}.
+         * @param newGeneration      the shard generation that this attempt writes as its {@code index-<uuid>} blob, or null if the
+         *                           repository uses numeric shard generations. The plan names each new copy after this generation, so a
+         *                           plan without one must never be asked to {@link #addFile}.
          */
         CopyPlan(BlobStoreIndexShardSnapshots startingGeneration, ShardGeneration newGeneration) {
             this.startingGeneration = startingGeneration;
@@ -4149,12 +4151,20 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                     reusedFileSize += metadata.length();
                 } else {
                     // A copy is named after the attempt's new shard generation, which the attempt writes as index-<uuid> before any copy
-                    // starts, so a copy name can only come back if an index-<uuid> comes back. A new copy therefore never has the name of
-                    // a copy that a snapshot delete is about to remove. The delete removes the unreferenced copies that it found in a
-                    // listing of the shard's folder, and the delete can still be removing them when a new snapshot starts.
+                    // starts, so a copy name can only come back if an index-<uuid> comes back. The repository already relies on that never
+                    // happening, for example so that two attempts never write the same index-<uuid> blob. So a new copy never has the name
+                    // of a copy that a snapshot delete is about to remove. The delete removes the unreferenced copies that it found in a
+                    // listing of the shard's folder, and the delete can still be removing them when a new snapshot starts. The copy name
+                    // of the commit blob comes after the generation, so that two copies of one attempt get different names.
+                    assert newGeneration != null : "a repository with numeric shard generations must not copy [" + source + "]";
                     copiedBlob = COPIED_DATA_BLOB_PREFIX + newGeneration.getGenerationUUID() + "_" + copySource.copyName();
-                    assert newCopiesBySource.values().stream().noneMatch(other -> other.blobName().equals(copiedBlob))
-                        : "the copy name of [" + source + "] is not unique, another new copy is already named [" + copiedBlob + "]";
+                    if (newCopyNames.add(copiedBlob) == false) {
+                        throw new IllegalStateException(
+                            "the copy name of [" + source + "] is not unique, another new copy is already named [" + copiedBlob + "]"
+                        );
+                    }
+                    assert Strings.validFileName(copiedBlob)
+                        : "the copy name of [" + source + "] has a character that a file info cannot hold: [" + copiedBlob + "]";
                     newCopy = new NewCopy(copiedBlob, copySource, new ArrayList<>());
                     newCopiesBySource.put(source, newCopy);
                 }

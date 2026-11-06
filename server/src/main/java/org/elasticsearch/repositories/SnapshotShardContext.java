@@ -129,7 +129,8 @@ public abstract class SnapshotShardContext extends DelegatingActionListener<Shar
      *                  path, see {@link BlobStoreIndexShardSnapshot.FileInfo#source()}.
      * @param copyName  the part of the copy's name that comes after the shard generation. It must be unique among the sources that one
      *                  shard snapshot copies, so that two copies of one shard snapshot never get the same name. It may use only characters
-     *                  that are valid in a blob name.
+     *                  that {@link org.elasticsearch.common.Strings#validFileName} accepts, because the repository refuses to read a file
+     *                  info whose copied blob name has any other character.
      * @param container the container that holds the commit blob
      * @param blobName  the name of the commit blob in {@code container}
      * @param offset    the position in that blob where the file starts

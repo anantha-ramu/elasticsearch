@@ -210,7 +210,7 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
             + blobLocation.primaryTerm()
             + "/"
             + blobLocation.blobName();
-        // The primary term and the blob name identify a commit blob within its shard. That is all the copy's name needs, because the
+        // The primary term and the blob name identify a commit blob within its shard. That is all the copy name needs, because the
         // sources of one shard snapshot all belong to the same shard.
         final String copyName = blobLocation.primaryTerm() + "_" + blobLocation.blobName();
         return new CopySource(

@@ -221,8 +221,10 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
                     // snapshot of the shard, and snap-<uuid>.dat is the blob that lists the files of a single snapshot. If index-<uuid>
                     // is missing, the repository rebuilds it from all the snap-<uuid>.dat blobs. Then the copy that a failed snapshot
                     // left behind comes in next to the copy of a later snapshot. Keep the first copy found. The map has no order, so the
-                    // pick is arbitrary. The picked copy can already be queued for deletion, as a __ blob can: a snapshot delete may not
-                    // have removed the snap-<uuid>.dat blob of the snapshot that it deleted, and the rebuild reads that blob too.
+                    // pick is arbitrary. The picked copy may be one that a snapshot delete is still removing, like an uploaded __ blob that
+                    // the rebuild brings back. Such a delete removes every copy that its new shard generation does not refer to, such as
+                    // the copy of a failed or deleted snapshot. The rebuild still reads the snap-<uuid>.dat blob of such a snapshot until
+                    // the delete removes that blob.
                     // Otherwise the copy stays: the snapshot that reuses the copy writes a new index-<uuid> that refers to the copy, so
                     // a later snapshot delete does not remove the copy.
                     bySource.putIfAbsent(fileInfo.source(), fileInfo.blob());

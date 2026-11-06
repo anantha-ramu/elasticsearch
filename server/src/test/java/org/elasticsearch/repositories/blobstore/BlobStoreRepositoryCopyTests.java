@@ -359,10 +359,10 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
     }
 
     /**
-     * Two attempts at a shard snapshot copy the same commit blobs. The second attempt starts from a generation that does not know the
-     * copies of the first attempt, as a snapshot does after an earlier snapshot failed while it was being finalized. Each attempt names
-     * its copies after the shard generation that the attempt wrote as an {@code index-<uuid>} blob, so the two attempts give the same
-     * commit blob two different copy names. The test framework's check of blob types accepts these names.
+     * Two snapshots of the same shard copy the same commit blobs. The second snapshot starts from a generation that does not know the
+     * copies of the first snapshot, as a snapshot does after an earlier snapshot failed while it was being finalized. Each snapshot names
+     * its copies after the shard generation that it wrote as an {@code index-<uuid>} blob, so the two snapshots give the same commit blob
+     * two different copy names. The test framework's check of blob types accepts these names.
      */
     public void testAttemptsNameTheirCopiesAfterTheirOwnShardGeneration() throws IOException {
         final var shardAndRepository = new ShardAndRepository();
