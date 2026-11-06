@@ -3632,6 +3632,13 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                     logger.trace("[{}] [{}] Processing [{}]", shardId, snapshotId, fileName);
                     final StoreFileMetadata md = metadataFromStore.get(fileName);
                     BlobStoreIndexShardSnapshot.FileInfo existingFileInfo = snapshots.findPhysicalIndexFile(md);
+                    // The context may refuse to reuse an earlier copied file info, see SnapshotShardContext#isCopiedFileReusable. The file
+                    // is then handled as a new file below.
+                    if (existingFileInfo != null
+                        && existingFileInfo.isCopied()
+                        && context.isCopiedFileReusable(existingFileInfo) == false) {
+                        existingFileInfo = null;
+                    }
 
                     // We can skip writing blobs where the metadata hash is equal to the blob's contents because we store the hash/contents
                     // directly in the shard level metadata in this case
