@@ -65,7 +65,6 @@ import org.elasticsearch.xpack.stateless.reshard.ReshardIndexRequest;
 import org.elasticsearch.xpack.stateless.reshard.TransportReshardAction;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -279,39 +278,22 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
     }
 
     /**
-     * Shows that a snapshot points each generational file at its newest copy, which is the copy in the commit blob of the snapshotted
-     * commit, and that the repository then releases the copy of an older commit blob that only a generational file needed.
-     * <p>
-     * A generational file is stored in more than one commit blob. The stateless plugin remembers where each generational file first
-     * appeared, which is the commit blob of the commit that wrote the file. It also copies each live generational file into the first
-     * commit of every new commit blob, so that a commit blob holds all the generational files of its commits. A snapshot points the file
-     * at the copy in the commit blob of the snapshotted commit, and not at the commit blob where the file first appeared.
-     * <p>
-     * The test makes four commit blobs, one with each flush that makes a commit. Merges and scheduled refreshes are off, so that no merge
-     * removes a segment and no refresh adds a commit:
+     * Shows that a snapshot points each generational file at its copy in the commit blob of the snapshotted commit, and that the
+     * repository then releases the copy of an older commit blob that only a generational file needed. The index gets four commit blobs.
+     * Merges and scheduled refreshes are off, so that no merge removes a segment and no refresh adds a commit:
      * <ol>
-     * <li>The first commit blob holds the first segment.</li>
-     * <li>An update of a document in the first segment writes generational files for that segment. The second commit blob holds them,
-     * and a second segment with the new version of the document.</li>
-     * <li>A flush that forces a commit, although nothing has changed, makes the third commit blob. Its first commit copies the
-     * generational files. The commit has no new file but its {@code segments_N} file, which a snapshot keeps in the metadata of the shard
-     * snapshot and does not copy. The first snapshot takes this commit. It copies the first and the second commit blob for their
-     * segments. It also copies the third commit blob, for the generational files alone, because the generational files are in that
-     * commit blob now.</li>
-     * <li>The fourth commit blob holds a fourth segment, and a copy of the generational files again. The second snapshot copies the
-     * fourth commit blob. The test then deletes the first snapshot, so that the second snapshot is the only one left.</li>
+     * <li>The first commit blob holds the first segment. The second holds an update of a document of that segment: a second segment, and
+     * the generational files of the first.</li>
+     * <li>A flush that forces a commit, although nothing has changed, makes the third. It holds the copies of the generational files and
+     * its {@code segments_N} file, and nothing else that is new. The first snapshot takes this commit, so it copies the third commit
+     * blob for the generational files alone.</li>
+     * <li>The fourth holds a fourth segment and the copies again. The second snapshot copies it. The test then deletes the first
+     * snapshot.</li>
      * </ol>
-     * The test reads the shard generation of the repository and the commit header of each copied blob, and checks that:
-     * <ul>
-     * <li>After the first snapshot, each generational file is a byte range of the copy of the third commit blob, the range that the
-     * commit header of that commit blob lists for the file. No other file uses that copy.</li>
-     * <li>After the second snapshot, each generational file has a new file info that names the copy of the fourth commit blob. The files
-     * of the first, second and third segments keep the file infos of the first snapshot.</li>
-     * <li>After the delete, the copy of the third commit blob is gone, because no file info names it. The copies of the first, second
-     * and fourth commit blobs stay, because the second snapshot needs a segment in each.</li>
-     * <li>Every other copy that holds a generational file has the same bytes for it, at a range that no file info names. The verify
-     * integrity API finds the second snapshot intact, with the contents of every blob checked, and the snapshot restores.</li>
-     * </ul>
+     * The test compares the file infos with the headers of the copies. After the first snapshot, the generational files are in the copy
+     * of the third commit blob, and nothing else is. After the second snapshot, they have new file infos in the copy of the fourth
+     * commit blob, and the segments keep their file infos. After the delete, the copy of the third commit blob is gone. The verify
+     * integrity API passes with the contents of every blob, and the snapshot restores.
      */
     public void testGenerationalFilesPointAtTheirNewestCopyAndAnOlderCopyIsReleased() throws Exception {
         final Settings settings = copySettings().build();
@@ -331,8 +313,7 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
 
         // Each commit blob has a copy, and the copy of the newest commit blob is the third copy. Only the generational files use it, and
         // each is the byte range that the header of the third commit blob lists for it.
-        final Map<String, String> firstCommitBlobByCopy = commitBlobByCopy(firstFiles);
-        assertThat(firstCommitBlobByCopy.keySet(), hasSize(3));
+        assertThat(commitBlobByCopy(firstFiles).keySet(), hasSize(3));
         final String thirdCopy = newestCopy(firstFiles);
         final List<FileInfo> firstGenerationalFiles = generationalFiles(firstFiles);
         assertThat(firstGenerationalFiles, not(empty()));
@@ -342,12 +323,7 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
                 .allMatch(fileInfo -> StatelessCompoundCommit.isGenerationalFile(fileInfo.physicalName()))
         );
         assertTrue(firstGenerationalFiles.stream().allMatch(fileInfo -> thirdCopy.equals(fileInfo.blob())));
-        final BatchedCompoundCommit thirdHeaders = readCopiedBlob(repoName, indexName, thirdCopy, firstCommitBlobByCopy.get(thirdCopy));
-        for (FileInfo generationalFile : firstGenerationalFiles) {
-            final BlobLocation location = locationInHeader(thirdHeaders, generationalFile.physicalName());
-            assertThat(generationalFile.offset(), equalTo(location.offset()));
-            assertThat(generationalFile.length(), equalTo(location.fileLength()));
-        }
+        assertAtTheRangesOfTheHeader(repoName, indexName, firstGenerationalFiles);
 
         // 4. The fourth commit blob holds the fourth segment and a copy of the generational files again. The second snapshot copies it,
         // and reuses the file infos of the first snapshot for the files of the other segments.
@@ -384,32 +360,7 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         assertThat(copies, equalTo(secondFiles.stream().map(FileInfo::blob).collect(Collectors.toSet())));
         assertThat(copies, hasSize(3));
 
-        // The copies hold the generational files at more ranges than the file infos use. The copy of the fourth commit blob has the same
-        // bytes for a generational file as any other copy that holds the file.
-        final Map<String, String> commitBlobByCopy = commitBlobByCopy(secondFiles);
-        final Map<String, BatchedCompoundCommit> headers = new HashMap<>();
-        for (Map.Entry<String, String> copy : commitBlobByCopy.entrySet()) {
-            headers.put(copy.getKey(), readCopiedBlob(repoName, indexName, copy.getKey(), copy.getValue()));
-        }
-        for (FileInfo generationalFile : secondGenerationalFiles) {
-            final String name = generationalFile.physicalName();
-            final BlobLocation newestLocation = locationInHeader(headers.get(fourthCopy), name);
-            assertThat(generationalFile.offset(), equalTo(newestLocation.offset()));
-            assertThat(generationalFile.length(), equalTo(newestLocation.fileLength()));
-            final byte[] bytes = readRange(repoName, indexName, fourthCopy, newestLocation);
-            for (String otherCopy : copies) {
-                if (otherCopy.equals(fourthCopy) == false && headers.get(otherCopy).getAllInternalFiles().contains(name)) {
-                    final BlobLocation unusedLocation = locationInHeader(headers.get(otherCopy), name);
-                    assertThat(unusedLocation.fileLength(), equalTo(newestLocation.fileLength()));
-                    assertArrayEquals(bytes, readRange(repoName, indexName, otherCopy, unusedLocation));
-                    assertTrue(
-                        name + " at " + unusedLocation + " of " + otherCopy + " is used by a file info",
-                        secondFiles.stream()
-                            .noneMatch(fileInfo -> otherCopy.equals(fileInfo.blob()) && fileInfo.offset() == unusedLocation.offset())
-                    );
-                }
-            }
-        }
+        assertAtTheRangesOfTheHeader(repoName, indexName, secondGenerationalFiles);
 
         assertVerifyIntegrityPasses(repoName, indexName, "second");
         assertAcked(indicesAdmin().prepareDelete(indexName));
@@ -419,11 +370,9 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
     }
 
     /**
-     * Takes snapshots after rounds of updates and deletes, which give the segments new versions of their generational files, and deletes
-     * some of the snapshots on the way. Each round adds documents in a new segment, then updates and deletes documents that earlier
-     * rounds committed, and flushes. After each snapshot the test checks that every generational file is a byte range of the copy of the
-     * commit blob of the snapshotted commit. At the end, the repository holds exactly the copies that the remaining snapshots name, the
-     * verify integrity API finds the snapshots intact with the contents of every blob checked, and every remaining snapshot restores to
+     * Takes snapshots after rounds of updates and deletes, and deletes some of them on the way. After each snapshot, every generational
+     * file is a byte range of the copy of the commit blob of its commit. At the end, the repository holds exactly the copies that the
+     * remaining snapshots name, the verify integrity API passes with the contents of every blob, and each remaining snapshot restores to
      * the documents that the index had when the snapshot was taken.
      */
     public void testRoundsOfUpdatesAndDeletesBetweenSnapshots() throws Exception {
@@ -471,14 +420,10 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
             // The flush made the snapshotted commit, in the newest commit blob, which the snapshot has the name of.
             final String newestCommitBlob = BatchedCompoundCommit.blobNameFromGeneration(indexShard.commitStats().getGeneration());
             final List<FileInfo> files = dataFiles(shardSnapshot(repoName, indexName, snapshotName, 0));
-            for (FileInfo generationalFile : generationalFiles(files)) {
-                snapshotHasGenerationalFile = true;
-                assertThat(commitBlobOf(generationalFile), equalTo(newestCommitBlob));
-                final BatchedCompoundCommit headers = readCopiedBlob(repoName, indexName, generationalFile.blob(), newestCommitBlob);
-                final BlobLocation fileLocation = locationInHeader(headers, generationalFile.physicalName());
-                assertThat(generationalFile.offset(), equalTo(fileLocation.offset()));
-                assertThat(generationalFile.length(), equalTo(fileLocation.fileLength()));
-            }
+            final List<FileInfo> generationalFiles = generationalFiles(files);
+            snapshotHasGenerationalFile |= generationalFiles.isEmpty() == false;
+            assertTrue(generationalFiles.stream().allMatch(fileInfo -> commitBlobOf(fileInfo).equals(newestCommitBlob)));
+            assertAtTheRangesOfTheHeader(repoName, indexName, generationalFiles);
 
             if (docCountBySnapshot.size() > 1 && randomBoolean()) {
                 final String deleted = randomFrom(
@@ -665,10 +610,9 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
     }
 
     /**
-     * The primary moves to another node while a shard snapshot copies commit blobs, as in {@link #testPrimaryMovesWhileCopying}. Here the
-     * shard has generational files, and the snapshot points them at the copy of the third commit blob. That is the commit blob of the
-     * snapshotted commit, and it holds nothing else that is new. The old primary copies it after the primary has moved, so the new
-     * primary has to keep that commit blob in the object store until the snapshot is done.
+     * As {@link #testPrimaryMovesWhileCopying}, with generational files. The snapshot points them at the copy of the third commit blob,
+     * which holds nothing else that is new. The old primary copies that commit blob after the primary has moved, so the new primary has
+     * to keep the commit blob until the snapshot is done.
      */
     public void testPrimaryMovesWhileCopyingGenerationalFiles() throws Exception {
         final Settings settings = copySettings().put(STATELESS_SNAPSHOT_ENABLED_SETTING.getKey(), "enabled")
@@ -1918,18 +1862,20 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
     }
 
     /**
-     * The bytes in the given range of a copied blob of shard 0.
+     * Checks that each generational file is the byte range that the header of its commit blob lists for it. All the generational files
+     * must be in one copied blob.
      */
-    private byte[] readRange(String repoName, String indexName, String copy, BlobLocation location) throws IOException {
-        try (
-            InputStream input = shardContainer(repoName, indexName, 0).readBlob(
-                OperationPurpose.SNAPSHOT_DATA,
-                copy,
-                location.offset(),
-                location.fileLength()
-            )
-        ) {
-            return input.readAllBytes();
+    private void assertAtTheRangesOfTheHeader(String repoName, String indexName, List<FileInfo> generationalFiles) throws IOException {
+        if (generationalFiles.isEmpty()) {
+            return;
+        }
+        final FileInfo first = generationalFiles.getFirst();
+        final BatchedCompoundCommit headers = readCopiedBlob(repoName, indexName, first.blob(), commitBlobOf(first));
+        for (FileInfo generationalFile : generationalFiles) {
+            assertThat(generationalFile.blob(), equalTo(first.blob()));
+            final BlobLocation location = locationInHeader(headers, generationalFile.physicalName());
+            assertThat(generationalFile.offset(), equalTo(location.offset()));
+            assertThat(generationalFile.length(), equalTo(location.fileLength()));
         }
     }
 

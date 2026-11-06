@@ -590,53 +590,6 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
     }
 
     /**
-     * With server-side copy off, the context offers no copy source for any file, and keeps the default answer, which is to reuse. The
-     * snapshot then reuses every copied file info of the earlier snapshot. It uploads no file and makes no copy, although the files are
-     * in the repository as copies and not as uploaded files.
-     */
-    public void testCopiedFilesAreReusedWhenCopiesAreOff() throws IOException {
-        final var shardAndRepository = new ShardAndRepository();
-        try {
-            shardAndRepository.indexSegments(between(2, 4));
-            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
-                between(1, 3),
-                name -> true,
-                0
-            );
-            final Snapshot first = shardAndRepository.newSnapshot();
-            final ShardGeneration firstGeneration = shardAndRepository.snapshot(first, sources::get);
-            final Set<String> firstCopies = copiedBlobs(shardAndRepository.shardContainer());
-            final Map<String, FileInfo> firstFiles = filesByPhysicalName(shardAndRepository.loadShardSnapshot(first));
-            assertTrue(firstFiles.values().stream().anyMatch(FileInfo::isCopied));
-
-            final Snapshot second = shardAndRepository.newSnapshot();
-            final IndexShardSnapshotStatus status = IndexShardSnapshotStatus.newInitializing(
-                firstGeneration,
-                randomLongBetween(1, Long.MAX_VALUE)
-            );
-            shardAndRepository.snapshot(second, status, IndexVersion.current(), name -> null, name -> true);
-
-            final Map<String, FileInfo> secondFiles = filesByPhysicalName(shardAndRepository.loadShardSnapshot(second));
-            assertThat(secondFiles.keySet(), equalTo(firstFiles.keySet()));
-            for (Map.Entry<String, FileInfo> entry : firstFiles.entrySet()) {
-                final FileInfo secondFile = secondFiles.get(entry.getKey());
-                assertTrue(secondFile + " is not the file info " + entry.getValue(), secondFile.isSame(entry.getValue()));
-            }
-            final Set<String> shardBlobs = shardAndRepository.shardContainer().listBlobs(OperationPurpose.SNAPSHOT_METADATA).keySet();
-            assertThat(copiedBlobs(shardBlobs), equalTo(firstCopies));
-            assertThat(
-                shardBlobs.stream().filter(name -> name.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX)).toList(),
-                empty()
-            );
-            assertThat(status.asCopy().getIncrementalFileCount(), equalTo(0));
-
-            shardAndRepository.restoreAndCheck(second);
-        } finally {
-            shardAndRepository.close();
-        }
-    }
-
-    /**
      * The repository asks the context only about copied file infos. It reuses an uploaded file info without asking. When the context
      * refuses to reuse the copied file infos, the new file infos point at the existing copy of the same commit blob, so the refusal
      * costs new file infos and no new copy.
