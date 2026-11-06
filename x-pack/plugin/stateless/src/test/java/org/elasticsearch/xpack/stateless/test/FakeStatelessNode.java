@@ -754,6 +754,7 @@ public class FakeStatelessNode implements Closeable {
             clusterService,
             indicesService,
             commitService,
+            objectStoreService,
             threadPool,
             meterRegistry != null ? meterRegistry : telemetryProvider.getMeterRegistry()
         );

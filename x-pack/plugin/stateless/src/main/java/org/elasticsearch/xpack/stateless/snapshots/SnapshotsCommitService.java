@@ -7,11 +7,15 @@
 
 package org.elasticsearch.xpack.stateless.snapshots;
 
+import org.apache.lucene.index.IndexCommit;
 import org.elasticsearch.cluster.ClusterChangedEvent;
 import org.elasticsearch.cluster.ClusterStateListener;
 import org.elasticsearch.cluster.SnapshotsInProgress;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.blobstore.BlobContainer;
+import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.collect.Iterators;
+import org.elasticsearch.common.io.stream.InputStreamStreamInput;
 import org.elasticsearch.common.time.TimeProvider;
 import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasable;
@@ -30,12 +34,17 @@ import org.elasticsearch.telemetry.metric.LongCounter;
 import org.elasticsearch.telemetry.metric.LongHistogram;
 import org.elasticsearch.telemetry.metric.MeterRegistry;
 import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.xpack.stateless.commits.BlobFile;
 import org.elasticsearch.xpack.stateless.commits.BlobLocation;
 import org.elasticsearch.xpack.stateless.commits.StatelessCommitService;
 import org.elasticsearch.xpack.stateless.commits.StatelessCommitService.RecoveredCommitsReleasable;
+import org.elasticsearch.xpack.stateless.commits.StatelessCompoundCommit;
+import org.elasticsearch.xpack.stateless.objectstore.ObjectStoreService;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -68,6 +77,7 @@ public class SnapshotsCommitService implements ClusterStateListener {
     private final ClusterService clusterService;
     private final IndicesService indicesService;
     private final StatelessCommitService commitService;
+    private final ObjectStoreService objectStoreService;
     private final TimeProvider timeProvider;
     private final LongCounter shardRelocationDuringSnapshotCounter;
     private final LongHistogram recoveryRetainedCommitsHistogram;
@@ -89,12 +99,14 @@ public class SnapshotsCommitService implements ClusterStateListener {
         ClusterService clusterService,
         IndicesService indicesService,
         StatelessCommitService commitService,
+        ObjectStoreService objectStoreService,
         TimeProvider timeProvider,
         MeterRegistry meterRegistry
     ) {
         this.clusterService = clusterService;
         this.indicesService = indicesService;
         this.commitService = commitService;
+        this.objectStoreService = objectStoreService;
         this.timeProvider = timeProvider;
         this.shardRelocationDuringSnapshotCounter = meterRegistry.registerLongCounter(
             SHARD_RELOCATED_TOTAL,
@@ -157,7 +169,7 @@ public class SnapshotsCommitService implements ClusterStateListener {
                 : "unexpected noop releasable for non-relocated shard " + shardId;
             final var indexCommit = snapshotIndexCommit.indexCommit();
             maybeEnsureNotAborted(snapshotStatus);
-            final Map<String, BlobLocation> blobLocations = indexCommit.getFileNames()
+            final Map<String, BlobLocation> firstLocations = indexCommit.getFileNames()
                 .stream()
                 .collect(
                     Collectors.toUnmodifiableMap(
@@ -165,6 +177,7 @@ public class SnapshotsCommitService implements ClusterStateListener {
                         fileName -> Objects.requireNonNull(commitService.getBlobLocation(shardId, fileName))
                     )
                 );
+            final Map<String, BlobLocation> blobLocations = withGenerationalFilesInOwnCommitBlob(shardId, indexCommit, firstLocations);
             if (supportsRelocationDuringSnapshot) {
                 registerReleaseForSnapshot(shardId, snapshot, snapshotIndexCommit);
             }
@@ -177,6 +190,112 @@ public class SnapshotsCommitService implements ClusterStateListener {
         } catch (Exception e) {
             closeSnapshotIndexCommit(snapshotIndexCommit, shardId, snapshot);
             throw e;
+        }
+    }
+
+    /**
+     * Re-points each generational file of the snapshotted commit that was first written in an older commit blob at its copy in the commit
+     * blob that holds the commit.
+     * <p>
+     * A commit blob is a blob in the object store that holds the files of one or more commits. Each commit starts with a header that
+     * lists the files of the commit. From the header, a reader can work out where each file is stored: the blob, the offset and the
+     * length. A generational file is a file that a segment gets after the segment was first written, when a document in the segment is
+     * updated or deleted, such as {@code _0_1.liv}. The shard copies each generational file that is still in use into the first commit
+     * of every new commit blob. So the commit blob that holds a commit has a copy of every generational file of the commit. A commit
+     * carries a generational file when the file first appeared in an older commit blob.
+     * <p>
+     * {@link StatelessCommitService#getBlobLocation} returns the first location that the commit service learned for a file. For a
+     * generational file that is the oldest copy that this primary knows: in the commit blob where the file first appeared, or after a
+     * recovery in the commit blob of the recovered commit. A snapshot copies whole commit blobs. So a file info that points at the old
+     * copy keeps the copy of the old commit blob in the repository for as long as any snapshot lists the file info, even when the
+     * snapshot needs no other file from that commit blob. A later snapshot gets a new file info that points at the copy in its own,
+     * newer commit blob. A snapshot delete can then remove the copy of the older commit blob once no remaining snapshot needs another
+     * file in it.
+     * <p>
+     * The method handles these cases:
+     * <ul>
+     * <li>The commit carries no generational file: the method returns the locations as they are, and reads nothing.</li>
+     * <li>The commit carries generational files: the method sends one GET for the start of the commit blob that holds the commit. The
+     * start of a commit blob is the header of its first commit. That header lists a copy of every generational file that was in use
+     * when the commit blob was started, and a generational file that the commit carries was in use then. The method takes the location
+     * of each carried file from that header. A generational file that a commit wrote into the same commit blob keeps its location,
+     * because its first location is in that commit blob already. The method reads the first header, and not the header of the commit
+     * itself, because the first header starts at byte 0 of the blob. The header of a later commit starts after the commits before it,
+     * and finding it would take one more GET for each of them.</li>
+     * <li>The header has no copy of a carried file in that commit blob, or the copy has another length, or the read fails: the method
+     * throws {@link IndexShardSnapshotFailedException}, and the shard snapshot fails. The method does not fall back to the first
+     * location. A header without the copy means that the commit blobs are not laid out as this code relies on, so the snapshot fails
+     * instead of guessing.</li>
+     * </ul>
+     * The caller must hold the commit while it calls this method, so that the commit blob stays in the object store. The method cannot
+     * know whether the snapshot will copy a commit blob. So the method also reads the header when the repository reuses the file list
+     * of an earlier snapshot of an unchanged shard, and when server-side copy is off. In both cases the read is not needed.
+     */
+    private Map<String, BlobLocation> withGenerationalFilesInOwnCommitBlob(
+        ShardId shardId,
+        IndexCommit indexCommit,
+        Map<String, BlobLocation> firstLocations
+    ) {
+        if (firstLocations.keySet().stream().noneMatch(StatelessCompoundCommit::isGenerationalFile)) {
+            return firstLocations;
+        }
+        // The commit writes its segments_N file into its own commit blob, and into no other blob. So the location of that file says
+        // which commit blob holds the commit.
+        final BlobLocation segmentsFile = firstLocations.get(indexCommit.getSegmentsFileName());
+        final BlobFile ownBlob = segmentsFile.blobFile();
+        final List<String> carriedFiles = firstLocations.entrySet()
+            .stream()
+            .filter(
+                entry -> StatelessCompoundCommit.isGenerationalFile(entry.getKey()) && entry.getValue().blobFile().equals(ownBlob) == false
+            )
+            .map(Map.Entry::getKey)
+            .toList();
+        if (carriedFiles.isEmpty()) {
+            return firstLocations;
+        }
+        final StatelessCompoundCommit firstCommit = readFirstCommitHeader(shardId, segmentsFile);
+        final Map<String, BlobLocation> locations = new HashMap<>(firstLocations);
+        for (String file : carriedFiles) {
+            final BlobLocation copy = firstCommit.commitFiles().get(file);
+            if (copy == null || copy.blobFile().equals(ownBlob) == false || copy.fileLength() != firstLocations.get(file).fileLength()) {
+                throw new IndexShardSnapshotFailedException(
+                    shardId,
+                    "the first commit header of commit blob ["
+                        + ownBlob.blobName()
+                        + "] has no copy of generational file ["
+                        + file
+                        + "] of length ["
+                        + firstLocations.get(file).fileLength()
+                        + "] in that blob, but lists "
+                        + copy
+                );
+            }
+            locations.put(file, copy);
+        }
+        return Map.copyOf(locations);
+    }
+
+    /**
+     * Reads the header of the first commit of the commit blob that holds the {@code segments_N} file at the given location, with one
+     * GET. {@code segments_N} is the Lucene file that lists the segments of one commit, and a commit stores it in its own commit blob.
+     * The first commit starts at byte 0 of the blob. The {@code segments_N} file of the first commit, or of a later commit, comes after
+     * the whole first header. So the GET asks for the bytes before the {@code segments_N} file. The method closes the stream as soon as
+     * it has the header, and does not read the remaining bytes of the GET.
+     */
+    private StatelessCompoundCommit readFirstCommitHeader(ShardId shardId, BlobLocation segmentsFile) {
+        final BlobContainer container = objectStoreService.getProjectBlobContainer(shardId, segmentsFile.primaryTerm());
+        try (
+            var input = new InputStreamStreamInput(
+                container.readBlob(OperationPurpose.SNAPSHOT_METADATA, segmentsFile.blobName(), 0, segmentsFile.offset())
+            )
+        ) {
+            return StatelessCompoundCommit.readFromStoreAtOffset(input, 0, generation -> segmentsFile.compoundFileGeneration());
+        } catch (IOException e) {
+            throw new IndexShardSnapshotFailedException(
+                shardId,
+                "failed to read the first commit header of commit blob [" + segmentsFile.blobName() + "]",
+                e
+            );
         }
     }
 

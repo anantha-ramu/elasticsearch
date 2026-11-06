@@ -937,6 +937,7 @@ public class StatelessSnapshotResiliencyTests extends SnapshotResiliencyTests {
                 clusterService,
                 services.indicesService(),
                 statelessCommitService,
+                objectStoreService,
                 threadPool,
                 MeterRegistry.NOOP
             );

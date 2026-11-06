@@ -894,6 +894,7 @@ public class SnapshotsCommitServiceTests extends ESTestCase {
                     clusterService,
                     indicesService,
                     commitService,
+                    objectStoreService,
                     timeProvider,
                     meterRegistry != null ? meterRegistry : telemetryProvider.getMeterRegistry()
                 );
