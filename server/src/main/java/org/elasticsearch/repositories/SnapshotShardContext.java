@@ -125,21 +125,17 @@ public abstract class SnapshotShardContext extends DelegatingActionListener<Shar
     /**
      * Says whether the snapshot may reuse {@code existingFileInfo}. A file info is the entry in the shard's snapshot metadata that says
      * where one file is stored. An earlier snapshot of the shard made {@code existingFileInfo} when it stored the same file as a byte
-     * range of a copied commit blob. The repository calls this method only for a copied file info that it found by the name, length and
-     * checksum of the file.
+     * range of a copied commit blob, see {@link #copySource}. The repository calls this method only for such a file info that it found
+     * by the name, length and checksum of the file.
      * <p>
-     * The default answer is {@code true}. Then the snapshot points the file at the earlier file info, and makes no new file info and no
-     * copy for the file. On {@code false}, the repository handles the file as if no earlier snapshot had stored it. The repository asks
-     * {@link #copySource} for the commit blob that holds the file now, and makes a new file info that points at a copy of that commit
-     * blob. If an earlier snapshot already made a copy of that commit blob, the new file info points at that copy, and the repository
-     * makes no new copy.
-     * <p>
-     * A context should answer {@code false} when the file is now in a different commit blob than the one that the earlier snapshot
-     * copied, and the earlier file info would keep the copy of the old commit blob alive. The repository can then delete that copy once
-     * no other file needs it. A context must answer {@code true} when {@link #copySource} returns {@code null}, because the repository
-     * would then upload the file again, although the repository already holds a copy of the file.
+     * The default is {@code true}. On {@code false}, the repository handles the file as new. The repository asks {@link #copySource} for
+     * the commit blob that holds the file now, and makes a new file info that points at a copy of that commit blob. If an earlier
+     * snapshot already made such a copy, the new file info points at that copy. A context answers {@code false} when the file is in
+     * another commit blob now than the commit blob that the earlier file info points at, so that the repository can delete the copy of
+     * the old commit blob once no other file needs that copy. A context must answer {@code true} when {@link #copySource} returns
+     * {@code null}, because the repository would then upload the file again, although the repository already holds a copy.
      *
-     * @param existingFileInfo a file info of an earlier snapshot of the shard that is stored as a byte range of a copied commit blob, see
+     * @param existingFileInfo a file info of an earlier snapshot that is stored as a byte range of a copied commit blob, see
      *                         {@link BlobStoreIndexShardSnapshot.FileInfo#isCopied()}
      */
     public boolean isCopiedFileReusable(BlobStoreIndexShardSnapshot.FileInfo existingFileInfo) {

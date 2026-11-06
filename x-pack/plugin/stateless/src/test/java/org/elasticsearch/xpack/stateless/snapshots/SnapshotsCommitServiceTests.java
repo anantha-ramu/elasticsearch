@@ -30,6 +30,7 @@ import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.CollectionUtils;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 import org.elasticsearch.core.Releasables;
+import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.index.IndexService;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.engine.Engine;
@@ -44,6 +45,7 @@ import org.elasticsearch.repositories.ShardGeneration;
 import org.elasticsearch.repositories.ShardSnapshotResult;
 import org.elasticsearch.repositories.SnapshotIndexCommit;
 import org.elasticsearch.snapshots.Snapshot;
+import org.elasticsearch.snapshots.SnapshotCopiedBlobFeatures;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.telemetry.InstrumentType;
 import org.elasticsearch.telemetry.RecordingMeterRegistry;
@@ -93,6 +95,7 @@ import static org.elasticsearch.xpack.stateless.commits.StatelessCommitServiceTe
 import static org.elasticsearch.xpack.stateless.snapshots.SnapshotsCommitService.RECOVERY_RETAINED_COMMITS_HISTOGRAM;
 import static org.elasticsearch.xpack.stateless.snapshots.SnapshotsCommitService.RECOVERY_RETAINED_DURATION_HISTOGRAM;
 import static org.elasticsearch.xpack.stateless.snapshots.SnapshotsCommitService.SHARD_RELOCATED_TOTAL;
+import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
@@ -135,6 +138,12 @@ public class SnapshotsCommitServiceTests extends ESTestCase {
     @After
     public void terminateThreadPool() throws Exception {
         ThreadPool.terminate(threadPool, 30, TimeUnit.SECONDS);
+    }
+
+    @After
+    public void resetMetadataReads() {
+        metadataReads.clear();
+        metadataReadOverride = null;
     }
 
     public void testLocalSnapshotRetainsCommits() throws Exception {
@@ -605,6 +614,7 @@ public class SnapshotsCommitServiceTests extends ESTestCase {
     public void testCarriedGenerationalFilesPointAtTheCopyInTheCommitsOwnCommitBlob() throws Exception {
         try (var fixture = createTestFixture()) {
             final var testHarness = fixture.node;
+            setServerSideCopy(testHarness, true, true);
             // The first commit blob has generational files, which the later commit blobs carry. The second commit blob has commits that
             // come after a commit that wrote generational files into the same commit blob.
             final var uploadedCommits = uploadCommitBlobs(testHarness, between(2, 3), 3, between(1, 3));
@@ -652,23 +662,17 @@ public class SnapshotsCommitServiceTests extends ESTestCase {
     public void testCarriedGenerationalFilesNeedOneReadOfTheStartOfTheCommitBlob() throws Exception {
         try (var fixture = createTestFixture()) {
             final var testHarness = fixture.node;
+            setServerSideCopy(testHarness, true, true);
             final var uploadedCommits = uploadCommitBlobs(testHarness, between(2, 3), 3, between(1, 3));
 
             boolean readForFirstCommit = false;
             boolean readForLaterCommit = false;
             boolean noReadForCommit = false;
             for (UploadedCommit uploaded : uploadedCommits) {
-                boolean carriesGenerationalFile = false;
-                for (String file : uploaded.commit().getFileNames()) {
-                    final var firstLocation = testHarness.commitService.getBlobLocation(testHarness.shardId, file);
-                    carriesGenerationalFile |= StatelessCompoundCommit.isGenerationalFile(file)
-                        && firstLocation.compoundFileGeneration() != uploaded.blobGeneration();
-                }
-
                 metadataReads.clear();
                 acquireCommitForSnapshot(testHarness, uploaded.commit(), new AtomicBoolean());
 
-                if (carriesGenerationalFile) {
+                if (carriesGenerationalFile(testHarness, uploaded)) {
                     final var segmentsFile = testHarness.commitService.getBlobLocation(
                         testHarness.shardId,
                         uploaded.commit().getSegmentsFileName()
@@ -689,41 +693,72 @@ public class SnapshotsCommitServiceTests extends ESTestCase {
     }
 
     /**
-     * The shard snapshot fails, and the commit is released, when the commit blob cannot give the location of a carried generational file:
-     * the read fails, or the first header has no copy of the file in the commit's own commit blob. The snapshot does not fall back to the
-     * first location of the file.
+     * Without server-side copy, a snapshot uploads its files, and every commit blob that holds a file has the same bytes for it. So the
+     * snapshot keeps the first locations and sends no GET. Server-side copy is not active when the setting is off, and when a node of
+     * the cluster lacks the feature for copied files.
      */
-    public void testHeaderThatCannotGiveTheLocationOfACarriedFileFailsTheShardSnapshot() throws Exception {
+    public void testNoReadWhenServerSideCopyIsNotActive() throws Exception {
         try (var fixture = createTestFixture()) {
             final var testHarness = fixture.node;
+            final boolean settingOn = randomBoolean();
+            setServerSideCopy(testHarness, settingOn, settingOn == false && randomBoolean());
+            final var uploaded = uploadCommitBlobs(testHarness, 2, 2).getLast();
+            assertTrue("the commit does not carry a generational file", carriesGenerationalFile(testHarness, uploaded));
+
+            final var snapshotLocations = acquireCommitForSnapshot(testHarness, uploaded.commit(), new AtomicBoolean()).blobLocations();
+
+            for (var entry : snapshotLocations.entrySet()) {
+                assertThat(entry.getValue(), equalTo(testHarness.commitService.getBlobLocation(testHarness.shardId, entry.getKey())));
+            }
+            assertThat(metadataReads, empty());
+        }
+    }
+
+    /**
+     * The shard snapshot fails, and the commit is released, when the read of the first header fails.
+     */
+    public void testFailedReadOfTheFirstHeaderFailsTheShardSnapshot() throws Exception {
+        try (var fixture = createTestFixture()) {
+            final var testHarness = fixture.node;
+            setServerSideCopy(testHarness, true, true);
             final var uploadedCommits = uploadCommitBlobs(testHarness, 2, 2);
-            final boolean readFails = randomBoolean();
-            final String firstBlobName = BatchedCompoundCommit.blobNameFromGeneration(uploadedCommits.getFirst().blobGeneration());
-            metadataReadOverride = (container, read) -> {
-                if (readFails) {
-                    throw new IOException("simulated failure of the read");
-                }
-                // The start of the first commit blob has the header of a commit with no generational file.
-                final long firstBlobLength = container.listBlobs(OperationPurpose.INDICES).get(firstBlobName).length();
-                return container.readBlob(OperationPurpose.SNAPSHOT_METADATA, firstBlobName, 0L, firstBlobLength);
-            };
+            metadataReadOverride = (container, read) -> { throw new IOException("simulated failure of the read"); };
 
             final var commitRefReleased = new AtomicBoolean();
             final var failure = expectThrows(
                 IndexShardSnapshotFailedException.class,
                 () -> acquireCommitForSnapshot(testHarness, uploadedCommits.getLast().commit(), commitRefReleased)
             );
-            if (readFails) {
-                assertThat(
-                    failure.getMessage(),
-                    containsString("failed to read the first commit header of commit blob [stateless_commit_")
-                );
-                assertThat(failure.getCause(), instanceOf(IOException.class));
-            } else {
-                assertThat(failure.getMessage(), containsString("has no copy of generational file ["));
-            }
+
+            assertThat(failure.getMessage(), containsString("failed to read the first commit header of commit blob [stateless_commit_"));
+            assertThat(failure.getCause(), instanceOf(IOException.class));
             assertTrue(commitRefReleased.get());
             assertFalse(testHarness.snapshotsCommitService.hasTrackingForShard(testHarness.shardId));
+        }
+    }
+
+    /**
+     * Every commit blob starts with copies of the generational files that were in use then, so a first header without the copy of a
+     * carried file is not expected. In production, the file keeps its first location. A test runs with assertions, which fail.
+     */
+    public void testFirstHeaderWithoutTheCopyOfACarriedFileFailsAnAssertion() throws Exception {
+        try (var fixture = createTestFixture()) {
+            final var testHarness = fixture.node;
+            setServerSideCopy(testHarness, true, true);
+            final var uploadedCommits = uploadCommitBlobs(testHarness, 2, 2);
+            // the start of the first commit blob, which has the header of a commit with no generational file
+            final String firstBlobName = BatchedCompoundCommit.blobNameFromGeneration(uploadedCommits.getFirst().blobGeneration());
+            metadataReadOverride = (container, read) -> {
+                final long firstBlobLength = container.listBlobs(OperationPurpose.INDICES).get(firstBlobName).length();
+                return container.readBlob(OperationPurpose.SNAPSHOT_METADATA, firstBlobName, 0L, firstBlobLength);
+            };
+
+            final var failure = expectThrows(
+                AssertionError.class,
+                () -> acquireCommitForSnapshot(testHarness, uploadedCommits.getLast().commit(), new AtomicBoolean())
+            );
+
+            assertThat(failure.getMessage(), containsString("has no copy of generational file ["));
         }
     }
 
@@ -982,6 +1017,33 @@ public class SnapshotsCommitServiceTests extends ESTestCase {
     }
 
     /**
+     * Sets the server-side copy setting, and gives the local node the cluster feature for copied files or not.
+     */
+    private static void setServerSideCopy(FakeStatelessNode testHarness, boolean settingOn, boolean featureOnNode) {
+        testHarness.clusterSettings.applySettings(Settings.builder().put(SERVER_SIDE_COPY_ENABLED_SETTING.getKey(), settingOn).build());
+        final var state = testHarness.clusterService.state();
+        final Set<String> features = featureOnNode ? Set.of(SnapshotCopiedBlobFeatures.COPIED_BLOB_RANGES.id()) : Set.of();
+        ClusterServiceUtils.setState(
+            testHarness.clusterService,
+            ClusterState.builder(state).nodeFeatures(Map.of(state.nodes().getLocalNodeId(), features))
+        );
+    }
+
+    /**
+     * Whether the commit carries a generational file, which is a generational file that first appeared in an older commit blob.
+     */
+    private static boolean carriesGenerationalFile(FakeStatelessNode testHarness, UploadedCommit uploaded) throws IOException {
+        for (String file : uploaded.commit().getFileNames()) {
+            if (StatelessCompoundCommit.isGenerationalFile(file)
+                && testHarness.commitService.getBlobLocation(testHarness.shardId, file).compoundFileGeneration() != uploaded
+                    .blobGeneration()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Makes commits with generational files that stay the same in the later commits, see
      * {@link FakeStatelessNode#generateCommitsWithUnchangedGenerationalFiles}, and uploads them in commit blobs of the given sizes. The
      * commit blob of each group ends with the last commit of the group.
@@ -1179,6 +1241,7 @@ public class SnapshotsCommitServiceTests extends ESTestCase {
                     indicesService,
                     commitService,
                     objectStoreService,
+                    new FeatureService(List.of(new SnapshotCopiedBlobFeatures())),
                     timeProvider,
                     meterRegistry != null ? meterRegistry : telemetryProvider.getMeterRegistry()
                 );

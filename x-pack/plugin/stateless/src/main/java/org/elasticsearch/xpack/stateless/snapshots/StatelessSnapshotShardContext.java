@@ -224,33 +224,22 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     }
 
     /**
-     * Lets the snapshot reuse the earlier file info of a file, except for a generational file that has a newer copy now.
+     * Lets the snapshot reuse the earlier file info of a file, except for a generational file whose copy in the commit blob of the
+     * snapshotted commit is in another commit blob than the commit blob that the earlier file info points at. A generational file is a
+     * file that a segment gets after the segment was first written, such as {@code _0_1.liv}, and {@link SnapshotsCommitService}
+     * explains why the snapshot points the file at that copy. The file gets a new file info, so that the repository can delete the copy
+     * of the old commit blob once no other file needs that copy.
      * <p>
-     * A generational file is a file that a segment gets after the segment was first written, when a document in the segment is updated
-     * or deleted. Its name has a generation number after the segment name, such as {@code _0_1.liv}. A commit blob is a blob in the
-     * object store that holds the files of one or more commits. The shard copies each generational file that is still in use into the
-     * first commit of every new commit blob. {@link SnapshotsCommitService} points the file at the copy in the commit blob that holds the
-     * snapshotted commit. If the shard has changed since the earlier snapshot, that commit blob is newer than the one that the earlier
-     * file info points at. If the snapshot reused the earlier file info, the repository would keep the copy of the older commit blob for
-     * as long as any snapshot lists that file info, even if none of the other files of that snapshot are in that commit blob. So a
-     * generational file whose current copy is in a newer commit blob gets a new file info that points at a copy of the newer commit blob.
-     * Then a snapshot delete can remove the copy of the older commit blob.
+     * The method answers {@code true}, so that the snapshot reuses the earlier file info, for a file that is not a generational file,
+     * for a generational file whose copy is in the commit blob that the earlier file info points at, and when server-side copy is off,
+     * which is when {@link #copySource} returns {@code null}.
      * <p>
-     * The method answers {@code true}, so that the snapshot reuses the earlier file info, in these cases:
-     * <ul>
-     * <li>The file is not a generational file. Such a file stays in one commit blob.</li>
-     * <li>The earlier file info points at a copy of the commit blob that holds the file now.</li>
-     * <li>Server-side copy is off, so {@link #copySource} returns {@code null}. If server-side copy is turned off, the snapshot must
-     * not upload files that the repository already holds as copies.</li>
-     * </ul>
      * Known limits:
      * <ul>
-     * <li>The shard's file list in the repository, the {@code index-<uuid>} blob, can hold several file infos for one generational file,
-     * one for each commit blob that a snapshot pointed the file at. The repository finds one of them, and which one is not defined. If
-     * the repository finds a file info that points at an older commit blob while another file info already points at a copy of the
-     * current commit blob, the snapshot adds a second file info for that same copy. That costs a little metadata.</li>
-     * <li>The statistics of the shard snapshot count a file with a new file info as a new file, also when the new file info points at a
-     * copy that the repository holds already. So the incremental file count and size can be higher than what the snapshot stores.</li>
+     * <li>The repository finds one of the file infos of a generational file in the shard's file list, and which one is not defined. If
+     * the repository finds a file info for an older commit blob while another already points at the current copy, the snapshot adds a
+     * second file info for that copy.</li>
+     * <li>The statistics of the shard snapshot count the file as new, also when its copy exists already.</li>
      * </ul>
      */
     @Override

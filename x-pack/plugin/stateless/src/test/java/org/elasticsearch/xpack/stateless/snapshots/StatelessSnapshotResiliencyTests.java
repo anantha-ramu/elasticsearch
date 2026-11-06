@@ -57,6 +57,7 @@ import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.discovery.DiscoveryModule;
 import org.elasticsearch.env.Environment;
+import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.gateway.GatewayService;
 import org.elasticsearch.index.IndexModule;
 import org.elasticsearch.index.IndexService;
@@ -87,6 +88,7 @@ import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.plugins.PluginsService;
 import org.elasticsearch.plugins.internal.DocumentParsingProvider;
 import org.elasticsearch.repositories.SnapshotShardContextFactory;
+import org.elasticsearch.snapshots.SnapshotCopiedBlobFeatures;
 import org.elasticsearch.snapshots.SnapshotResiliencyTestHelper.TestClusterNodes;
 import org.elasticsearch.snapshots.SnapshotResiliencyTestHelper.TestClusterNodes.TransportInterceptorFactory;
 import org.elasticsearch.snapshots.SnapshotResiliencyTests;
@@ -938,6 +940,7 @@ public class StatelessSnapshotResiliencyTests extends SnapshotResiliencyTests {
                 services.indicesService(),
                 statelessCommitService,
                 objectStoreService,
+                new FeatureService(List.of(new SnapshotCopiedBlobFeatures())),
                 threadPool,
                 MeterRegistry.NOOP
             );
