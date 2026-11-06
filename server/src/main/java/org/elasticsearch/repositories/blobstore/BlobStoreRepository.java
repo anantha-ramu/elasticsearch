@@ -3607,7 +3607,13 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             final BlockingQueue<BlobStoreIndexShardSnapshot.FileInfo> filesToSnapshot = new LinkedBlockingQueue<>();
             int filesInShardMetadataCount = 0;
             long filesInShardMetadataSize = 0;
-            final CopyPlan copyPlan = new CopyPlan(snapshots);
+            final boolean writeShardGens = SnapshotsServiceUtils.useShardGenerations(context.getRepositoryMetaVersion());
+            // The shard generation that this attempt writes. The copy plan needs it to name the copies, so it is made here, before the
+            // plan. The attempt uses this same instance for the index blob that it writes below.
+            final ShardGeneration indexGeneration = writeShardGens
+                ? ShardGeneration.newGeneration()
+                : new ShardGeneration(Long.parseLong(fileListGeneration.getGenerationUUID()) + 1);
+            final CopyPlan copyPlan = new CopyPlan(snapshots, indexGeneration);
 
             if (context.isSearchableSnapshot()) {
                 indexCommitPointFiles = Collections.emptyList();
@@ -3636,7 +3642,11 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                     if (existingFileInfo == null) {
                         indexIncrementalFileCount++;
                         indexIncrementalSize += md.length();
-                        final SnapshotShardContext.CopySource copySource = needsWrite ? context.copySource(fileName) : null;
+                        // Only a repository with UUID shard generations copies. Numeric generations repeat across attempts, so a copy
+                        // named after one would repeat too. A repository in the old format uploads the file instead.
+                        final SnapshotShardContext.CopySource copySource = needsWrite && writeShardGens
+                            ? context.copySource(fileName)
+                            : null;
                         if (copySource != null) {
                             // the file becomes a byte range of a copy of the commit blob that holds it, see CopyPlan
                             indexCommitPointFiles.add(copyPlan.addFile(md, copySource));
@@ -3683,8 +3693,6 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             // file kept inline in the metadata.
             snapshotStatus.addProcessedFiles(copyPlan.reusedFileCount(), copyPlan.reusedFileSize());
 
-            final ShardGeneration indexGeneration;
-            final boolean writeShardGens = SnapshotsServiceUtils.useShardGenerations(context.getRepositoryMetaVersion());
             final boolean writeFileInfoWriterUUID = SnapshotsServiceUtils.includeFileInfoWriterUUID(context.getRepositoryMetaVersion());
             // build a new BlobStoreIndexShardSnapshot, that includes this one and all the saved ones
             final BlobStoreIndexShardSnapshots updatedBlobStoreIndexShardSnapshots = snapshots.withAddedSnapshot(
@@ -3695,7 +3703,6 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 // When using shard generations we can safely write the index-${uuid} blob before writing out any of the actual data
                 // for this shard since the uuid named blob will simply not be referenced in case of error and thus we will never
                 // reference a generation that has not had all its files fully upload.
-                indexGeneration = ShardGeneration.newGeneration();
                 try {
                     final Map<String, String> serializationParams = Collections.singletonMap(
                         BlobStoreIndexShardSnapshot.FileInfo.SERIALIZE_WRITER_UUID,
@@ -3726,8 +3733,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 // When not using shard generations we can only write the index-${N} blob after all other work for this shard has
                 // completed.
                 // Also, in case of numeric shard generations the data node has to take care of deleting old shard generations.
-                final long newGen = Long.parseLong(fileListGeneration.getGenerationUUID()) + 1;
-                indexGeneration = new ShardGeneration(newGen);
+                final long newGen = Long.parseLong(indexGeneration.getGenerationUUID());
                 // Delete all previous index-N blobs
                 final List<String> blobsToDelete = blobs.stream().filter(blob -> blob.startsWith(SNAPSHOT_INDEX_PREFIX)).toList();
                 assert blobsToDelete.stream()
@@ -4093,20 +4099,19 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     }
 
     /**
-     * Decides, for one shard snapshot, how files that live in commit blobs of an object store get into the repository (see
-     * {@link SnapshotShardContext#copySource}). Each such file becomes a byte range of a copy of its commit blob. The snapshot starts from
+     * Decides, for one attempt at a shard snapshot, how files that live in commit blobs of an object store get into the repository (see
+     * {@link SnapshotShardContext#copySource}). Each such file becomes a byte range of a copy of its commit blob. The attempt starts from
      * the shard's current generation, the {@code index-<uuid>} blob that lists the files of the shard's earlier snapshots:
      * <ul>
      *     <li>If that generation already refers to a copy of the file's commit blob, the file points at that copy, and nothing is copied.
      *     The copy holds the whole commit blob, so it holds this file too.</li>
-     *     <li>Otherwise the commit blob is copied once, whole, under a new random name, however many of its files the snapshot needs.</li>
+     *     <li>Otherwise the commit blob is copied once, whole, however many of its files the snapshot needs. {@link #addFile} chooses the
+     *     name of the copy.</li>
      * </ul>
-     * New copies never get a name derived from the commit blob. A snapshot delete removes the unreferenced copies it found in a listing of
-     * the shard's folder, and it can still be removing them while a new snapshot starts. A new copy with the same name as an old one in
-     * that listing could be removed right after it is made. A random name is never in such a listing.
      */
     private static final class CopyPlan {
         private final BlobStoreIndexShardSnapshots startingGeneration;
+        private final ShardGeneration newGeneration;
         private final Map<String, NewCopy> newCopiesBySource = new LinkedHashMap<>();
         private final Set<String> reusedCopies = new HashSet<>();
         private int reusedFileCount;
@@ -4116,8 +4121,14 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
         private int filesReusedByNameCopied;
         private long bytesReusedByNameCopied;
 
-        CopyPlan(BlobStoreIndexShardSnapshots startingGeneration) {
+        /**
+         * @param startingGeneration the files of the shard's earlier snapshots
+         * @param newGeneration      the shard generation that this attempt writes as its {@code index-<uuid>} blob. The plan names each new
+         *                           copy after it, so a plan with a numeric generation must never be asked to {@link #addFile}.
+         */
+        CopyPlan(BlobStoreIndexShardSnapshots startingGeneration, ShardGeneration newGeneration) {
             this.startingGeneration = startingGeneration;
+            this.newGeneration = newGeneration;
         }
 
         /**
@@ -4137,7 +4148,13 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                     reusedFileCount += 1;
                     reusedFileSize += metadata.length();
                 } else {
-                    copiedBlob = COPIED_DATA_BLOB_PREFIX + UUIDs.randomBase64UUID();
+                    // A copy is named after the attempt's new shard generation, which the attempt writes as index-<uuid> before any copy
+                    // starts, so a copy name can only come back if an index-<uuid> comes back. A new copy therefore never has the name of
+                    // a copy that a snapshot delete is about to remove. The delete removes the unreferenced copies that it found in a
+                    // listing of the shard's folder, and the delete can still be removing them when a new snapshot starts.
+                    copiedBlob = COPIED_DATA_BLOB_PREFIX + newGeneration.getGenerationUUID() + "_" + copySource.copyName();
+                    assert newCopiesBySource.values().stream().noneMatch(other -> other.blobName().equals(copiedBlob))
+                        : "the copy name of [" + source + "] is not unique, another new copy is already named [" + copiedBlob + "]";
                     newCopy = new NewCopy(copiedBlob, copySource, new ArrayList<>());
                     newCopiesBySource.put(source, newCopy);
                 }

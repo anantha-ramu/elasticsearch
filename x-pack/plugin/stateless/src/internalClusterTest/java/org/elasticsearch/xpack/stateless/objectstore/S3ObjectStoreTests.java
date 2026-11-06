@@ -635,10 +635,10 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
      * the client gives up and throws, and {@code S3BlobContainer.copyBlob} fails.
      * <p>
      * Before a shard snapshot writes its shard snapshot blob, {@code snap-<uuid>.dat}, it checks the copies that it made. Each copy is a
-     * copied blob in the repository, named {@code c__<uuid>}, and it is a copy of a commit blob from the object store. A commit blob
-     * holds the files of a commit. The check is that each copied blob exists and has the length of its commit blob. A failed check has
-     * "but expected" in its message. The check runs only after every copy call has returned normally. Here a copy call throws, so the
-     * shard snapshot never reaches the check.
+     * copied blob in the repository, named {@code c__<shard generation>_<primary term>_<commit blob>}, and it is a copy of a commit blob
+     * from the object store. A commit blob holds the files of a commit. The check is that each copied blob exists and has the length of its
+     * commit blob. A failed check has "but expected" in its message. The check runs only after every copy call has returned normally. Here
+     * a copy call throws, so the shard snapshot never reaches the check.
      */
     public void testCopyThatAnswers200WithAnErrorBodyFailsTheShardSnapshot() throws Exception {
         final String reason = snapshotWhileCopiesAnswer200WithAnError("", Declaration.BEFORE_WHITESPACE);

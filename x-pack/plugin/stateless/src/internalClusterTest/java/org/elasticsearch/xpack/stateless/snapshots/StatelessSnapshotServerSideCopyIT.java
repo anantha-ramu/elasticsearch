@@ -95,7 +95,9 @@ import static org.hamcrest.Matchers.not;
  * Terms used in the tests:
  * <ul>
  * <li>A commit blob is a blob in the object store that holds the files of one or more commits of a shard.</li>
- * <li>A copied blob, {@code c__<uuid>}, is a copy of a whole commit blob that a snapshot makes inside the repository.</li>
+ * <li>A copied blob, {@code c__<shard generation>_<primary term>_<commit blob>}, is a copy of a whole commit blob that a snapshot makes
+ * inside the repository. The name has the shard generation that the shard snapshot writes, then the primary term and the name of the
+ * commit blob that it copies.</li>
  * <li>An uploaded blob, {@code __<uuid>}, holds one file that a snapshot writes to the repository itself.</li>
  * <li>A file info is the repository's record of one file of a shard snapshot. For a copied file it names the copied blob and the byte
  * range of the file in it.</li>

@@ -127,11 +127,14 @@ public abstract class SnapshotShardContext extends DelegatingActionListener<Shar
      *
      * @param source    path of the commit blob, unique across indices and shards. A snapshot reuses an existing copy made from the same
      *                  path, see {@link BlobStoreIndexShardSnapshot.FileInfo#source()}.
+     * @param copyName  the part of the copy's name that comes after the shard generation. It must be unique among the sources that one
+     *                  shard snapshot copies, so that two copies of one shard snapshot never get the same name. It may use only characters
+     *                  that are valid in a blob name.
      * @param container the container that holds the commit blob
      * @param blobName  the name of the commit blob in {@code container}
      * @param offset    the position in that blob where the file starts
      */
-    public record CopySource(String source, BlobContainer container, String blobName, long offset) {}
+    public record CopySource(String source, String copyName, BlobContainer container, String blobName, long offset) {}
 
     public interface FileReader extends Closeable {
 

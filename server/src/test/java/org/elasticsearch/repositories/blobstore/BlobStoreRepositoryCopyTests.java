@@ -391,8 +391,20 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 sources.put(
                     entry.getKey(),
                     entry.getKey().equals(failingFile)
-                        ? new SnapshotShardContext.CopySource(source.source() + "_missing", listingWithMissingBlob, missingBlob, 0)
-                        : new SnapshotShardContext.CopySource(source.source(), listingWithMissingBlob, source.blobName(), source.offset())
+                        ? new SnapshotShardContext.CopySource(
+                            source.source() + "_missing",
+                            "1_" + missingBlob,
+                            listingWithMissingBlob,
+                            missingBlob,
+                            0
+                        )
+                        : new SnapshotShardContext.CopySource(
+                            source.source(),
+                            source.copyName(),
+                            listingWithMissingBlob,
+                            source.blobName(),
+                            source.offset()
+                        )
                 );
             }
             expectThrows(
@@ -755,13 +767,15 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 for (int blob = 0; blob < blobs; blob++) {
                     final String blobName = "stateless_commit_" + (++commitBlobCount);
                     final String source = "indices/" + indexId.getId() + "/" + shardId.id() + "/1/" + blobName;
+                    // like the stateless side: the primary term and the blob name
+                    final String copyName = "1_" + blobName;
                     try (BytesStreamOutput blobBytes = new BytesStreamOutput()) {
                         for (int i = blob; i < dataFiles.size(); i += blobs) {
                             blobBytes.writeBytes(randomByteArrayOfLength(between(0, 512)));
                             final StoreFileMetadata dataFile = dataFiles.get(i);
                             sources.put(
                                 dataFile.name(),
-                                new SnapshotShardContext.CopySource(source, objectStore, blobName, blobBytes.position())
+                                new SnapshotShardContext.CopySource(source, copyName, objectStore, blobName, blobBytes.position())
                             );
                             try (IndexInput input = shard.store().directory().openInput(dataFile.name(), IOContext.READONCE)) {
                                 final byte[] bytes = new byte[Math.toIntExact(input.length())];
