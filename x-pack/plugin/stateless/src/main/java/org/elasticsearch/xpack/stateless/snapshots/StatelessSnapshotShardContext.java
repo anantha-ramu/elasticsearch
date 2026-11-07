@@ -73,8 +73,10 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     @Nullable // when snapshot runs on a different node from the primary
     private final BooleanSupplier isShardRelocated;
     private final boolean serverSideCopyEnabled;
-    // The next two fields are set by the first carried generational file that needs them, see copySource. The repository calls copySource
-    // from the loop over the files of one shard snapshot, on one thread and one file at a time, so the fields need no synchronization.
+    // copySource fills in the next two fields, see its Javadoc. The first generational file sets segmentsFile, the location of the
+    // segments_N file of the snapshotted commit. The first carried generational file sets firstCommit, the header of the first commit of
+    // the commit blob that holds the snapshotted commit. The repository calls copySource from the loop over the files of one shard
+    // snapshot, on one thread and one file at a time, so the fields need no synchronization.
     @Nullable
     private BlobLocation segmentsFile;
     @Nullable
@@ -213,19 +215,24 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
      * blob, so the commit blob of the commit holds a copy of the file too.
      * <p>
      * The primary gives the context the first location that the primary learned for each file. For a carried file, that first
-     * location is in an older commit blob. A snapshot copies whole commit blobs, so a file info that points at the older commit blob
-     * keeps the copy of that blob in the repository for as long as a snapshot lists the file info. A generational file moves forward to
-     * its newest copy, so that the repository can delete an older commit blob that only a carried generational file keeps alive. The
-     * new location only takes effect when {@link #isCopiedFileReusable} answers {@code false} for the file. Otherwise, the repository
-     * reuses the file info of an earlier snapshot by name, and the file stays in the older commit blob.
+     * location is in an older commit blob. A snapshot copies whole commit blobs. A file info is the entry in the shard's snapshot
+     * metadata that says where one file is stored, and a file info that points at the older commit blob keeps the repository's copy of
+     * that blob for as long as a snapshot lists the file info. So a carried generational file moves forward to the newest copy of the
+     * file, which is in the commit blob of the snapshotted commit. Then the repository can delete the copy of an older commit blob once
+     * no other file needs that copy.
      * <p>
-     * When the first carried file asks for its copy source, the context sends one GET for the bytes before the {@code segments_N} file
-     * of the commit. Those bytes are the header of the first commit of the commit blob. The header lists the copy of each carried file,
-     * and it is the only header whose position is known without reading others. The context keeps the header for the other files. If
-     * the header has no copy of a file, the file keeps its first location, which is where snapshots took the file from before. The
-     * index node keeps the commit blob at that location while Lucene still has the file. Tests run with assertions, so a missing copy
-     * fails a test. If the read fails, the method throws {@link IndexShardSnapshotFailedException}, which fails the shard snapshot as
-     * the failed read of a footer does.
+     * The newest copy takes effect only when the repository makes a new file info for the file. That is the case for a file that no
+     * earlier snapshot lists, and for a file for which {@link #isCopiedFileReusable} answers {@code false}. If the repository reuses the
+     * earlier file info by name instead, the file stays in the older commit blob.
+     * <p>
+     * When the first carried file asks for its copy source, the context reads the header of the first commit of the commit blob with
+     * one GET. The header lists the copy of each carried file, and it is the only header whose position is known without reading
+     * others. The header comes before the {@code segments_N} file of the commit, and its length is not known in advance, so the GET
+     * asks for all the bytes before that file. Those bytes can also hold files and later commits, and the context reads only the
+     * header. The context keeps the header for the other files. If the header has no copy of a file, the file keeps its first
+     * location, which is where snapshots took the file from before. The index node keeps the commit blob at that location while Lucene
+     * still has the file. Tests run with assertions, so a missing copy fails a test. If the read fails, the method throws
+     * {@link IndexShardSnapshotFailedException}, which fails the shard snapshot as the failed read of a footer does.
      */
     @Override
     public CopySource copySource(String file) {
@@ -278,14 +285,9 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         if (copy != null && copy.blobFile().equals(ownBlob) && copy.fileLength() == location.fileLength()) {
             return copy;
         }
-        // Not expected, see copySource. The file keeps its first location.
-        assert false
-            : "the first commit header of commit blob ["
-                + ownBlob.blobName()
-                + "] has no copy of generational file ["
-                + file
-                + "] in that blob, it lists "
-                + copy;
+        // Not expected, see copySource: the header lists no copy of the file in the commit blob of the commit, or a copy with another
+        // length. The file keeps its first location.
+        assert false : "commit blob [" + ownBlob.blobName() + "] has no copy of generational file [" + file + "], found " + copy;
         return location;
     }
 
@@ -316,10 +318,9 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     }
 
     /**
-     * Lets the snapshot reuse the earlier file info of a file, except for a generational file whose copy in the commit blob of the
-     * snapshotted commit is in another commit blob than the commit blob that the earlier file info points at, see {@link #copySource}.
-     * The file gets a new file info, so that the repository can delete the copy of the old commit blob once no other file needs that
-     * copy.
+     * Says whether the snapshot may reuse the earlier file info of a file. The answer is {@code false} for a generational file that must
+     * now be copied from another commit blob than the earlier file info points at, see {@link #copySource}. That file then gets a new
+     * file info, so that the repository can delete the copy of the old commit blob once no other file needs that copy.
      * <p>
      * The method answers {@code true}, so that the snapshot reuses the earlier file info, for a file that is not a generational file,
      * for a generational file whose copy is in the commit blob that the earlier file info points at, and when server-side copy is off,
