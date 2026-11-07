@@ -12,6 +12,7 @@ import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.tests.util.TestUtil;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.support.PlainActionFuture;
@@ -102,6 +103,7 @@ import static org.hamcrest.Matchers.notNullValue;
  * files are written into a few commit blobs there, with filler around each file, and a snapshot copies those commit blobs instead of
  * uploading the files.
  */
+@LuceneTestCase.SuppressFileSystems("ExtrasFS") // assertCopiesHaveTheShardDataType rejects the extra files as unknown blob types
 public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
 
     public void testSnapshotCopiesCommitBlobsAndRestores() throws IOException {
