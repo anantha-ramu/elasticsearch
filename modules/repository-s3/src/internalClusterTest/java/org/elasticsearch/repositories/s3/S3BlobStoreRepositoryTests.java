@@ -80,6 +80,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
@@ -99,6 +100,7 @@ import static org.elasticsearch.repositories.blobstore.BlobStoreTestUtil.randomP
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
 import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
@@ -649,6 +651,67 @@ public class S3BlobStoreRepositoryTests extends ESMockAPIBasedRepositoryIntegTes
         blobStore = asInstanceOf(BlobStoreWrapper.class, repository.blobStore());
         delegateBlobStore = asInstanceOf(S3BlobStore.class, blobStore.delegate());
         assertEquals(ByteSizeUnit.MB.toBytes(REPO_MAX_COPY_SIZE_BEFORE_MULTIPART_MB), delegateBlobStore.maxCopySizeBeforeMultipart());
+    }
+
+    /**
+     * A copy of a blob that the caller needs less of than the copy limit, a client setting that this test class sets to 5 MB, is one
+     * CopyObject request, which gives no length and needs none. A copy of a blob that the caller needs more of goes in parts, and each
+     * part copies a byte range of the source. The copy then asks for the length of the source with one HEAD request, and the stats of the
+     * repository count that request like any other. Both copies hold the whole source.
+     */
+    public void testCopyAsksForTheLengthOnlyAboveTheCopyLimit() throws Exception {
+        final String repoName = createRepository(randomRepositoryName(), false);
+        final var repository = (BlobStoreRepository) internalCluster().getAnyMasterNodeInstance(RepositoriesService.class)
+            .repository(ProjectId.DEFAULT, repoName);
+        final var blobStore = repository.blobStore();
+        final var sourceContainer = blobStore.blobContainer(repository.basePath());
+        final var destinationContainer = blobStore.blobContainer(repository.basePath().add("target"));
+        final int limit = Math.toIntExact(ByteSizeUnit.MB.toBytes(MAX_COPY_SIZE_BEFORE_MULTIPART_MB));
+
+        // The caller needs the first bytes of a blob that is longer than the limit, so the copy goes in one request that has no length.
+        // S3 copies the whole blob, and the copy has all of it.
+        final var longerThanLimit = randomBytesReference(between(limit + 1, 2 * limit));
+        sourceContainer.writeBlob(randomPurpose(), "under-the-limit", longerThanLimit, true);
+        final long headRequestsBefore = getHeadObjectOperations(blobStore);
+        final var noLength = destinationContainer.copyBlob(randomPurpose(), sourceContainer, "under-the-limit", "copy-1", limit, null);
+        assertThat(noLength, equalTo(OptionalLong.empty()));
+        assertThat(getHeadObjectOperations(blobStore) - headRequestsBefore, equalTo(0L));
+        assertThat(
+            readBlobFully(destinationContainer, "copy-1", longerThanLimit.length()),
+            equalTo(BytesReference.toBytes(longerThanLimit))
+        );
+
+        // The caller needs more than the limit of the blob, so the copy goes in parts and asks for the length with one HEAD request.
+        final var length = destinationContainer.copyBlob(
+            randomPurpose(),
+            sourceContainer,
+            "under-the-limit",
+            "copy-2",
+            randomLongBetween(limit + 1, longerThanLimit.length()),
+            null
+        );
+        assertThat(length, equalTo(OptionalLong.of(longerThanLimit.length())));
+        assertThat(getHeadObjectOperations(blobStore) - headRequestsBefore, equalTo(1L));
+        assertThat(
+            readBlobFully(destinationContainer, "copy-2", longerThanLimit.length()),
+            equalTo(BytesReference.toBytes(longerThanLimit))
+        );
+
+        // A source that is shorter than the caller needs fails, and the failing copy leaves no blob behind.
+        final long tooMuch = longerThanLimit.length() + randomLongBetween(1, 1_000);
+        final IOException e = expectThrows(
+            IOException.class,
+            () -> destinationContainer.copyBlob(randomPurpose(), sourceContainer, "under-the-limit", "copy-3", tooMuch, null)
+        );
+        assertThat(e.getMessage(), containsString("the source is [" + longerThanLimit.length() + "] bytes long, but the caller needs"));
+        assertFalse(destinationContainer.blobExists(randomPurpose(), "copy-3"));
+        assertThat(getHeadObjectOperations(blobStore) - headRequestsBefore, equalTo(3L));
+        sourceContainer.delete(randomPurpose());
+        destinationContainer.delete(randomPurpose());
+    }
+
+    private static long getHeadObjectOperations(BlobStore blobStore) {
+        return blobStore.stats().get("HeadObject").operations();
     }
 
     private static byte[] getRandomData(BlobContainer container) {

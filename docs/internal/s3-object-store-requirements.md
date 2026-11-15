@@ -131,7 +131,7 @@ This requirement covers the multipart operations needed for regular large blob u
 
 ### **🟢 Server-Side Copy**
 
-**Description:** Must copy objects server-side without client-side download/upload.
+**Description:** Must copy objects server-side without client-side download/upload. For the copies of a snapshot, the answer to a CopyObject request must also carry the ETag of the new blob. An ETag is the identifier that the store gives to the content of a blob. Elasticsearch fails a snapshot copy whose answer has none, because a snapshot does not read the new blob back to check it, and the ETag is then the only sign that the store made the copy. The other copies, which are the copies of a shard split and of the repository analysis, do not need an ETag in the answer.
 
 **Why:** Server-side copy allows efficient duplication of blobs without downloading and re-uploading through the Elasticsearch node. Used in snapshot operations where blobs need to be duplicated between paths. In stateless Elasticsearch, ObjectStoreService uses copyBlob during shard resharding (splitting/merging) to efficiently copy commit files between shard containers without transferring data through the node.
 
@@ -139,9 +139,9 @@ This requirement covers the multipart operations needed for regular large blob u
 
 ### **🟢 Server-Side Multipart Copy (uploadPartCopy)**
 
-**Description:** Large-object copies require copying in parts via uploadPartCopy.
+**Description:** Large-object copies require copying in parts via uploadPartCopy. For the copies of a snapshot, the answer to the request that completes the multipart copy must carry the ETag of the new blob, for the same reason as the answer to a CopyObject request, and the other copies do not need it. A multipart copy needs the exact length of the source blob for the byte range of its last part, so Elasticsearch asks for it with a HeadObject request (see Blob Existence Check) before it starts the multipart upload.
 
-**Why:** Blobs larger than the copy size threshold (controlled by `s3.client.<name>.max_copy_size_before_multipart`, default 5 GiB) cannot be copied in a single copyObject request and must be copied using multipart copy (uploadPartCopy). This is needed for very large data blobs during snapshot operations and during stateless shard resharding when commit files exceed the single-copy size limit.
+**Why:** A single copyObject request cannot copy a blob over 5 GiB, so the copy must go in parts (uploadPartCopy). This is needed for very large data blobs during snapshot operations and during stateless shard resharding when commit files exceed the single-copy size limit. The copy size threshold (`s3.client.<name>.max_copy_size_before_multipart`, default 5 GiB, at most 5 GiB) is the size of a part. Elasticsearch compares it with the end of the part of the blob that the caller needs, which can be shorter than the blob, so a blob longer than the threshold can still go in one copyObject request. If the store refuses that request with a 400 error, Elasticsearch asks for the length of the blob and goes in parts only if the blob is longer than the threshold. That covers a blob over 5 GiB, and a store whose single-copy limit is lower than the threshold. Such a store should set the threshold to its limit.
 
 ---
 

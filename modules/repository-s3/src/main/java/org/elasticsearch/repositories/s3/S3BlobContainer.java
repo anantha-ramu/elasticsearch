@@ -16,8 +16,10 @@ import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
+import software.amazon.awssdk.services.s3.model.CopyObjectResponse;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
@@ -444,21 +446,54 @@ class S3BlobContainer extends AbstractBlobContainer {
     }
 
     /**
-     * Perform server-side copy of a blob from a source container
+     * Perform server-side copy of a blob from a source container. The copy holds the whole source blob. Note that this operation will
+     * overwrite the destination if it already exists.
      * <p>
-     * Server-side copy can be done for any size object, but if the object is larger than 5 GB then
-     * it must be done through a series of part copy operations rather than a single blob copy.
-     * See <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html">CopyObject</a>.
-     * Note that this operation will overwrite the destination if it already exists.
+     * S3 copies a blob in one of two ways:
+     * <ul>
+     * <li>One CopyObject request copies the whole blob. S3 allows this for a blob of up to 5 GB, see
+     * <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html">CopyObject</a>. The request needs no length of the
+     * source and gives none.</li>
+     * <li>A multipart copy copies the blob in parts. Each part copies a byte range of the source with an UploadPartCopy request, and one
+     * more request completes the copy. The last part ends where the source ends, so a multipart copy needs the exact length of the
+     * source. A length that is too small would copy a prefix of the blob, and S3 would not complain.</li>
+     * </ul>
+     * The setting {@code max_copy_size_before_multipart} is the size of the parts. It is at least 5 MB and at most 5 GB. The method
+     * compares the setting with {@code neededEnd}, which is a lower bound for the length of the source and not the length:
+     * <ul>
+     * <li>If {@code neededEnd} is over the setting, the method copies in parts. It asks for the length of the source with one HEAD
+     * request, which returns the properties of a blob, such as its length, and not its content. The request goes to the store of the
+     * source, with its own client, so that the stats of the source store count it. If the source is shorter than {@code neededEnd},
+     * the method fails before it starts the multipart upload. Otherwise the method returns the length from the HEAD request.</li>
+     * <li>Otherwise the method sends one CopyObject request and returns no length. This also happens for a source that is longer than
+     * the setting, because the method does not compare the setting with the length.</li>
+     * </ul>
+     * A CopyObject request can be refused with a 400 error. S3 does that for a source over 5 GB, and the method can send such a request
+     * for a source over 5 GB, because {@code neededEnd} can be within the setting. A store whose limit for one request is lower than
+     * 5 GB does the same for a source over its limit, and the setting for that store should be the limit. The error code differs
+     * between stores, so the method does not look at it. After any 400 error, the method asks for the length of the source with a HEAD
+     * request. If the length is over the setting, the size can be the reason, and the method copies in parts. If that copy fails, the
+     * error of the refused request is attached to its failure, as a suppressed exception. Otherwise the size is not the reason, and the
+     * method fails with the error of the refused request.
+     * <p>
+     * S3 answers a CopyObject request, and the request that completes a multipart copy, with the ETag of the new blob. An ETag is an
+     * identifier that S3 gives to the content of a blob. A copy with the purpose {@link OperationPurpose#SNAPSHOT_DATA} fails if the
+     * answer has no ETag, because a snapshot reads nothing back from the new blob, and the answer is then the only sign that S3 made
+     * it. A copy with another purpose, such as the copies of resharding and of the repository analysis, accepts an answer without an
+     * ETag, as it did before. Resharding retries a failed copy without end, so a store that never sends an ETag would block it.
+     *
      * @param purpose             The purpose of the operation
-     * @param sourceBlobContainer The blob container to copy the blob into
+     * @param sourceBlobContainer The blob container to copy the blob from
      * @param sourceBlobName      The name of the blob to copy from
      * @param blobName            The name of the blob to copy to
-     * @param blobSize            The size of the source blob in bytes (needed because some object stores use different implementations
-     *                            for very large blobs)
+     * @param neededEnd           The offset just after the last byte that the caller needs from the source blob, see
+     *                            {@link BlobContainer#copyBlob(OperationPurpose, BlobContainer, String, String, long, Executor)}. The
+     *                            method also compares {@code neededEnd} with the setting to choose how to copy.
      * @param executor            Executor for concurrent part copies, {@code null} means parts are copied serially
-     * @return an empty length, because this copy does not learn the length of the source blob
-     * @throws IOException        If the operation fails on the server side
+     * @return the exact length of the source blob if the method asked for it with a HEAD request, which is when it copied in parts, and
+     *         empty if it sent only one CopyObject request
+     * @throws IOException        If the operation fails on the server side, or if the method learns that the source is shorter than
+     *                            {@code neededEnd}
      */
     @Override
     public OptionalLong copyBlob(
@@ -466,7 +501,7 @@ class S3BlobContainer extends AbstractBlobContainer {
         final BlobContainer sourceBlobContainer,
         final String sourceBlobName,
         final String blobName,
-        final long blobSize,
+        final long neededEnd,
         @Nullable final Executor executor
     ) throws IOException {
         assert BlobContainer.assertPurposeConsistency(purpose, sourceBlobName);
@@ -478,22 +513,45 @@ class S3BlobContainer extends AbstractBlobContainer {
         final var s3SourceBlobContainer = (S3BlobContainer) sourceBlobContainer;
 
         try {
-            if (blobSize > getMaxCopySizeBeforeMultipart()) {
-                executeMultipartCopy(purpose, s3SourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
-            } else {
-                // metadata is inherited from source, but not canned ACL or storage class
-                final var blobKey = buildKey(blobName);
-                final CopyObjectRequest.Builder copyObjectRequestBuilder = CopyObjectRequest.builder()
-                    .sourceBucket(s3SourceBlobContainer.blobStore.bucket())
-                    .sourceKey(s3SourceBlobContainer.buildKey(sourceBlobName))
-                    .destinationBucket(blobStore.bucket())
-                    .destinationKey(blobKey)
-                    .acl(blobStore.getCannedACL())
-                    .storageClass(blobStore.resolveStorageClass(purpose));
-                S3BlobStore.configureRequestForMetrics(copyObjectRequestBuilder, blobStore, Operation.COPY_OBJECT, purpose);
-                final var copyObjectRequest = copyObjectRequestBuilder.build();
-                try (AmazonS3Reference clientReference = blobStore.clientReference()) {
-                    clientReference.client().copyObject(copyObjectRequest);
+            if (neededEnd > getMaxCopySizeBeforeMultipart()) {
+                final long sourceLength = getSourceLength(purpose, s3SourceBlobContainer, sourceBlobName);
+                return copyInParts(purpose, s3SourceBlobContainer, sourceBlobName, blobName, neededEnd, sourceLength, executor);
+            }
+            try {
+                copyWithCopyObject(purpose, s3SourceBlobContainer, sourceBlobName, blobName);
+                return OptionalLong.empty();
+            } catch (S3Exception e) {
+                if (e.statusCode() != RestStatus.BAD_REQUEST.getStatus()) {
+                    throw e;
+                }
+                // The store refused the request. If the source is longer than the store copies with one request, that is the reason,
+                // and the copy goes in parts. The length tells.
+                final long sourceLength;
+                try {
+                    sourceLength = getSourceLength(purpose, s3SourceBlobContainer, sourceBlobName);
+                } catch (SdkException | IOException lengthFailure) {
+                    // the refusal is the error to report, and the failed HEAD request is a detail of it
+                    e.addSuppressed(lengthFailure);
+                    throw e;
+                }
+                if (sourceLength <= getMaxCopySizeBeforeMultipart()) {
+                    // The source is within the setting, and the setting is at most what S3 copies with one request, so the size is not
+                    // the reason for the refusal.
+                    throw e;
+                }
+                logger.debug(
+                    "the copy of [{}] to [{}] was refused and the source has [{}] bytes, copying in parts: {}",
+                    sourceBlobName,
+                    blobName,
+                    sourceLength,
+                    e.getMessage()
+                );
+                try {
+                    return copyInParts(purpose, s3SourceBlobContainer, sourceBlobName, blobName, neededEnd, sourceLength, executor);
+                } catch (IOException | RuntimeException partsFailure) {
+                    // the refusal is what sent the copy in parts, so it is a detail of the failure of the copy in parts
+                    partsFailure.addSuppressed(e);
+                    throw partsFailure;
                 }
             }
         } catch (final SdkException e) {
@@ -504,7 +562,77 @@ class S3BlobContainer extends AbstractBlobContainer {
             }
             throw new IOException("Unable to copy object [" + blobName + "] from [" + sourceBlobContainer + "][" + sourceBlobName + "]", e);
         }
-        return OptionalLong.empty();
+    }
+
+    /**
+     * Copies the source blob with one CopyObject request. A copy with the purpose {@link OperationPurpose#SNAPSHOT_DATA} fails if S3
+     * answers without the ETag of the new blob.
+     */
+    private void copyWithCopyObject(OperationPurpose purpose, S3BlobContainer sourceContainer, String sourceBlobName, String blobName)
+        throws IOException {
+        // metadata is inherited from source, but not canned ACL or storage class
+        final var blobKey = buildKey(blobName);
+        final CopyObjectRequest.Builder copyObjectRequestBuilder = CopyObjectRequest.builder()
+            .sourceBucket(sourceContainer.blobStore.bucket())
+            .sourceKey(sourceContainer.buildKey(sourceBlobName))
+            .destinationBucket(blobStore.bucket())
+            .destinationKey(blobKey)
+            .acl(blobStore.getCannedACL())
+            .storageClass(blobStore.resolveStorageClass(purpose));
+        S3BlobStore.configureRequestForMetrics(copyObjectRequestBuilder, blobStore, Operation.COPY_OBJECT, purpose);
+        final var copyObjectRequest = copyObjectRequestBuilder.build();
+        final CopyObjectResponse copyObjectResponse;
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            copyObjectResponse = clientReference.client().copyObject(copyObjectRequest);
+        }
+        // The client fails when S3 answers a copy with 200 and an error document in the body. An answer with an empty body passes that
+        // check, and an empty body has no ETag. S3 documents that an answer to a copy that worked carries the ETag of the new blob. Only
+        // a snapshot insists on it, see the Javadoc of copyBlob.
+        if (purpose == OperationPurpose.SNAPSHOT_DATA
+            && (copyObjectResponse.copyObjectResult() == null || Strings.hasText(copyObjectResponse.copyObjectResult().eTag()) == false)) {
+            throw new IOException(
+                "The answer to the copy of [" + sourceBlobName + "] to [" + blobName + "] has no ETag, so the copy is not known to be done"
+            );
+        }
+    }
+
+    /**
+     * Copies the source blob in parts of {@code max_copy_size_before_multipart} bytes. The parts need the exact length of the source,
+     * which the caller got with a HEAD request. The method fails if the source is shorter than {@code neededEnd}, before it starts the
+     * multipart upload.
+     */
+    private OptionalLong copyInParts(
+        OperationPurpose purpose,
+        S3BlobContainer sourceContainer,
+        String sourceBlobName,
+        String blobName,
+        long neededEnd,
+        long sourceLength,
+        @Nullable Executor executor
+    ) throws IOException {
+        BlobContainerUtils.ensureCopySourceLongEnough(sourceBlobName, blobName, sourceLength, neededEnd);
+        executeMultipartCopy(purpose, sourceContainer, sourceBlobName, blobName, sourceLength, executor);
+        return OptionalLong.of(sourceLength);
+    }
+
+    /**
+     * Asks S3 for the length of the source blob of a copy, with a HEAD request that goes through the client and the stats of the store
+     * of the source.
+     */
+    private static long getSourceLength(OperationPurpose purpose, S3BlobContainer sourceContainer, String sourceBlobName)
+        throws IOException {
+        final var sourceStore = sourceContainer.blobStore;
+        final var headObjectRequestBuilder = HeadObjectRequest.builder()
+            .bucket(sourceStore.bucket())
+            .key(sourceContainer.buildKey(sourceBlobName));
+        S3BlobStore.configureRequestForMetrics(headObjectRequestBuilder, sourceStore, Operation.HEAD_OBJECT, purpose);
+        try (AmazonS3Reference clientReference = sourceStore.clientReference()) {
+            final Long length = clientReference.client().headObject(headObjectRequestBuilder.build()).contentLength();
+            if (length == null) {
+                throw new IOException("The answer to the HEAD request for [" + sourceBlobName + "] has no content length");
+            }
+            return length;
+        }
     }
 
     @Override
@@ -744,7 +872,8 @@ class S3BlobContainer extends AbstractBlobContainer {
         final long blobSize,
         final PartOperation partOperation,
         final ConditionalOperation condition,
-        @Nullable final Executor executor
+        @Nullable final Executor executor,
+        @Nullable final String copySourceKey
     ) throws IOException {
 
         ensureMultiPartUploadSize(blobSize);
@@ -786,12 +915,28 @@ class S3BlobContainer extends AbstractBlobContainer {
                 }
             }
             S3BlobStore.configureRequestForMetrics(completeRequestBuilder, s3BlobStore, operation, purpose);
+            final CompleteMultipartUploadResponse completeResponse;
             try (var clientReference = s3BlobStore.clientReference()) {
-                clientReference.client().completeMultipartUpload(completeRequestBuilder.build());
+                completeResponse = clientReference.client().completeMultipartUpload(completeRequestBuilder.build());
+            }
+            // The client fails when S3 answers with 200 and an error document in the body. An answer with an empty body passes that
+            // check, and an empty body has no ETag. S3 documents that the answer to a multipart upload that worked carries the ETag of
+            // the new blob. A snapshot copy reads nothing back from the new blob, so the ETag is the only sign that S3 made the blob.
+            // Other copies do not insist on it, see the Javadoc of copyBlob.
+            if (operation == Operation.COPY_MULTIPART_OBJECT
+                && purpose == OperationPurpose.SNAPSHOT_DATA
+                && Strings.hasText(completeResponse.eTag()) == false) {
+                throw new IOException(
+                    "The answer that completes the multipart copy of [" + blobName + "] has no ETag, so the copy is not known to be done"
+                );
             }
             uploadId = ""; // skip cleanup
         } catch (final SdkException e) {
             if (e instanceof SdkServiceException sse && sse.statusCode() == RestStatus.NOT_FOUND.getStatus()) {
+                if (copySourceKey != null) {
+                    // A copy that finds something missing mostly misses its source, which can go while the parts are copied.
+                    throw new NoSuchFileException("Copy source [" + copySourceKey + "] not found: " + e.getMessage());
+                }
                 throw new NoSuchFileException(blobName, null, e.getMessage());
             }
             assert operation == Operation.COPY_MULTIPART_OBJECT || operation == Operation.PUT_MULTIPART_OBJECT;
@@ -830,6 +975,7 @@ class S3BlobContainer extends AbstractBlobContainer {
                 }
             },
             condition,
+            null,
             null
         );
     }
@@ -838,7 +984,8 @@ class S3BlobContainer extends AbstractBlobContainer {
      * Copies a blob using multipart
      * <p>
      * This is required when the blob size is larger than {@link S3BlobContainer#getMaxCopySizeBeforeMultipart}
-     * It must be called on the destination blob container.
+     * It must be called on the destination blob container. {@code blobSize} must be the exact length of the source blob. The last part
+     * ends at that length, and if the length is too small, S3 copies a prefix of the blob without an error.
      * <p>
      * It uses {@link S3BlobContainer#getMaxCopySizeBeforeMultipart}
      * as the copy part size, because that minimizes the number of requests needed.
@@ -882,7 +1029,8 @@ class S3BlobContainer extends AbstractBlobContainer {
                 }
             },
             ConditionalOperation.NONE,
-            executor
+            executor,
+            sourceContainer.buildKey(sourceBlobName)
         );
     }
 

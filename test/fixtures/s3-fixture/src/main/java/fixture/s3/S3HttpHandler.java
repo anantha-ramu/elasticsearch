@@ -271,6 +271,7 @@ public class S3HttpHandler implements HttpHandler {
                                 new BlobEntry(blobContents, upload.getStorageClass())
                             );
                             if (responseCode == RestStatus.OK) {
+                                // like S3, the answer carries the ETag of the new blob
                                 responseBody = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                                     + "<CompleteMultipartUploadResult>\n"
                                     + "<Bucket>"
@@ -279,6 +280,9 @@ public class S3HttpHandler implements HttpHandler {
                                     + "<Key>"
                                     + request.path()
                                     + "</Key>\n"
+                                    + "<ETag>"
+                                    + getEtagFromContents(blobContents)
+                                    + "</ETag>\n"
                                     + "</CompleteMultipartUploadResult>").getBytes(StandardCharsets.UTF_8);
                             } else {
                                 responseBody = null;
@@ -324,9 +328,12 @@ public class S3HttpHandler implements HttpHandler {
                     } else {
                         blobs.put(request.path(), new BlobEntry(sourceBlobEntry.contents(), getRequestStorageClass(exchange)));
 
+                        // like S3, the answer carries the ETag of the new blob
                         byte[] response = ("""
                             <?xml version="1.0" encoding="UTF-8"?>
-                            <CopyObjectResult></CopyObjectResult>""").getBytes(StandardCharsets.UTF_8);
+                            <CopyObjectResult><ETag>%s</ETag></CopyObjectResult>""".formatted(
+                            getEtagFromContents(sourceBlobEntry.contents())
+                        )).getBytes(StandardCharsets.UTF_8);
                         exchange.getResponseHeaders().add("Content-Type", "application/xml");
                         exchange.sendResponseHeaders(RestStatus.OK.getStatus(), response.length);
                         exchange.getResponseBody().write(response);

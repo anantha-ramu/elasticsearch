@@ -343,13 +343,16 @@ public class S3HttpHandlerTests extends ESTestCase {
             handleRequest(handler, "GET", "/bucket/?uploads&prefix=path/blob")
         );
 
+        // the answer carries the ETag of the new blob, as the answer of S3 does
+        final var completedContents = new BytesArray((part1 + part2).getBytes(StandardCharsets.UTF_8));
         assertEquals(
-            new TestHttpResponse(RestStatus.OK, """
+            new TestHttpResponse(RestStatus.OK, Strings.format("""
                 <?xml version="1.0" encoding="UTF-8"?>
                 <CompleteMultipartUploadResult>
                 <Bucket>bucket</Bucket>
                 <Key>/bucket/path/blob</Key>
-                </CompleteMultipartUploadResult>"""),
+                <ETag>%s</ETag>
+                </CompleteMultipartUploadResult>""", S3HttpHandler.getEtagFromContents(completedContents))),
             handleRequest(handler, "POST", "/bucket/path/blob?uploadId=" + uploadId, Strings.format("""
                 <?xml version="1.0" encoding="UTF-8"?>
                 <CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -386,6 +389,66 @@ public class S3HttpHandlerTests extends ESTestCase {
             <Bucket>bucket</Bucket><KeyMarker /><UploadIdMarker /><NextKeyMarker>--unused--</NextKeyMarker><NextUploadIdMarker />\
             <Delimiter /><Prefix>path/blob</Prefix><MaxUploads>10000</MaxUploads><IsTruncated>false</IsTruncated>\
             </ListMultipartUploadsResult>"""), handleRequest(handler, "GET", "/bucket/?uploads&prefix=path/blob"));
+    }
+
+    /**
+     * Like S3, the answer to a copy request carries the ETag of the new blob. A client can then tell an answer to a copy that worked
+     * from an empty answer.
+     */
+    public void testCopyObjectAnswersWithTheEtagOfTheNewBlob() {
+        final var handler = new S3HttpHandler("bucket", "path", S3ConsistencyModel.randomConsistencyModel());
+        final var contents = randomAlphaOfLength(between(1, 100));
+        assertEquals(RestStatus.OK, handleRequest(handler, "PUT", "/bucket/path/source", contents).status());
+
+        final var copyHeaders = new Headers();
+        copyHeaders.put(S3HttpHandler.COPY_SOURCE_HEADER, List.of("bucket/path/source"));
+        final var copyResponse = handleRequest(handler, "PUT", "/bucket/path/target", new BytesArray(new byte[0]), copyHeaders);
+
+        assertEquals(
+            new TestHttpResponse(RestStatus.OK, Strings.format("""
+                <?xml version="1.0" encoding="UTF-8"?>
+                <CopyObjectResult><ETag>%s</ETag></CopyObjectResult>""", S3HttpHandler.getEtagFromContents(new BytesArray(contents)))),
+            copyResponse
+        );
+    }
+
+    /**
+     * A multipart copy copies a byte range of the source into each part, and the answer to its completion carries the ETag of the new
+     * blob.
+     */
+    public void testMultipartCopyAnswersWithTheEtagOfTheNewBlob() {
+        final var handler = new S3HttpHandler("bucket", "path", S3ConsistencyModel.randomConsistencyModel());
+        final var contents = randomAlphaOfLength(between(2, 100));
+        assertEquals(RestStatus.OK, handleRequest(handler, "PUT", "/bucket/path/source", contents).status());
+
+        final var uploadId = getUploadId(handleRequest(handler, "POST", "/bucket/path/target?uploads").body());
+        final var copyPartHeaders = new Headers();
+        copyPartHeaders.put(S3HttpHandler.COPY_SOURCE_HEADER, List.of("bucket/path/source"));
+        copyPartHeaders.put("x-amz-copy-source-range", List.of("bytes=0-" + (contents.length() - 1)));
+        final var copyPartResponse = handleRequest(
+            handler,
+            "PUT",
+            "/bucket/path/target?uploadId=" + uploadId + "&partNumber=1",
+            new BytesArray(new byte[0]),
+            copyPartHeaders
+        );
+        assertEquals(RestStatus.OK, copyPartResponse.status());
+        final var partEtag = S3HttpHandler.getEtagFromContents(new BytesArray(contents));
+
+        assertEquals(
+            new TestHttpResponse(RestStatus.OK, Strings.format("""
+                <?xml version="1.0" encoding="UTF-8"?>
+                <CompleteMultipartUploadResult>
+                <Bucket>bucket</Bucket>
+                <Key>/bucket/path/target</Key>
+                <ETag>%s</ETag>
+                </CompleteMultipartUploadResult>""", partEtag)),
+            handleRequest(handler, "POST", "/bucket/path/target?uploadId=" + uploadId, Strings.format("""
+                <?xml version="1.0" encoding="UTF-8"?>
+                <CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                   <Part><ETag>%s</ETag><PartNumber>1</PartNumber></Part>
+                </CompleteMultipartUpload>""", partEtag))
+        );
     }
 
     public void testListAndAbortMultipartUpload() {

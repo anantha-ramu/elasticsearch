@@ -9,6 +9,7 @@
 
 package org.elasticsearch.repositories.s3;
 
+import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
 import software.amazon.awssdk.awscore.exception.AwsServiceException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.http.SdkHttpClient;
@@ -24,6 +25,8 @@ import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CopyObjectResponse;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
+import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
+import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
@@ -43,18 +46,22 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.unit.ByteSizeUnit;
 import org.elasticsearch.common.util.MockBigArrays;
 import org.elasticsearch.common.util.MockPageCacheRecycler;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.indices.breaker.NoneCircuitBreakerService;
+import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.test.ESTestCase;
 import org.mockito.ArgumentCaptor;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -63,9 +70,14 @@ import java.util.stream.IntStream;
 
 import static org.elasticsearch.repositories.blobstore.BlobStoreTestUtil.randomPurpose;
 import static org.elasticsearch.repositories.s3.S3BlobContainer.ConditionalOperation;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.sameInstance;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -320,8 +332,11 @@ public class S3BlobStoreContainerTests extends ESTestCase {
         final ArgumentCaptor<CompleteMultipartUploadRequest> completeMultipartUploadRequestCaptor = ArgumentCaptor.forClass(
             CompleteMultipartUploadRequest.class
         );
+        // S3 answers the completion of a multipart copy with the ETag of the new blob, and a copy fails without it
         when(client.completeMultipartUpload(completeMultipartUploadRequestCaptor.capture())).thenReturn(
-            CompleteMultipartUploadResponse.builder().build()
+            doCopy
+                ? CompleteMultipartUploadResponse.builder().eTag(randomAlphaOfLength(20)).build()
+                : CompleteMultipartUploadResponse.builder().build()
         );
 
         final ByteArrayInputStream inputStream = new ByteArrayInputStream(new byte[0]);
@@ -791,9 +806,9 @@ public class S3BlobStoreContainerTests extends ESTestCase {
         final var client = configureMockClient(blobStore);
 
         final ArgumentCaptor<CopyObjectRequest> captor = ArgumentCaptor.forClass(CopyObjectRequest.class);
-        when(client.copyObject(captor.capture())).thenReturn(CopyObjectResponse.builder().build());
+        when(client.copyObject(captor.capture())).thenReturn(copyObjectResponse());
 
-        destinationBlobContainer.copyBlob(
+        final var length = destinationBlobContainer.copyBlob(
             randomPurpose(),
             sourceBlobContainer,
             sourceBlobName,
@@ -801,6 +816,8 @@ public class S3BlobStoreContainerTests extends ESTestCase {
             randomLongBetween(1, 10_000),
             null
         );
+        // one CopyObject request copies the whole blob, and neither the request nor the answer has a length
+        assertThat(length, equalTo(OptionalLong.empty()));
 
         final CopyObjectRequest request = captor.getValue();
         assertEquals(sourceBucketName, request.sourceBucket());
@@ -917,7 +934,7 @@ public class S3BlobStoreContainerTests extends ESTestCase {
             return UploadPartCopyResponse.builder().copyPartResult(b -> b.eTag("test-etag")).build();
         });
         when(client.completeMultipartUpload(any(CompleteMultipartUploadRequest.class))).thenReturn(
-            CompleteMultipartUploadResponse.builder().build()
+            CompleteMultipartUploadResponse.builder().eTag("test-etag").build()
         );
 
         final S3BlobContainer blobContainer = new S3BlobContainer(BlobPath.EMPTY, blobStore);
@@ -938,6 +955,514 @@ public class S3BlobStoreContainerTests extends ESTestCase {
         verify(client, times(1)).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
 
         closeMockClient(blobStore);
+    }
+
+    /**
+     * S3 answers a copy that worked with the ETag of the new blob.
+     */
+    private static CopyObjectResponse copyObjectResponse() {
+        return CopyObjectResponse.builder().copyObjectResult(result -> result.eTag(randomAlphaOfLength(20))).build();
+    }
+
+    /**
+     * The stores and clients that the tests of a copy with a HEAD request use: a destination store with the part size {@code copyPartSize},
+     * and a source store of its own. Each has a client of its own, so a test can tell which of them a request went through. Closing the
+     * stores checks that every client reference that a copy took has been released, also when a test fails.
+     */
+    private record CopyStores(S3BlobStore destination, S3Client destinationClient, S3BlobStore source, S3Client sourceClient)
+        implements
+            AutoCloseable {
+        @Override
+        public void close() {
+            closeMockClient(destination);
+            closeMockClient(source);
+        }
+    }
+
+    private static CopyStores copyStores(long copyPartSize, String destinationBucket, String sourceBucket) {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn(destinationBucket);
+        when(blobStore.maxCopySizeBeforeMultipart()).thenReturn(copyPartSize);
+        when(blobStore.serverSideEncryption()).thenReturn(false);
+        when(blobStore.supportsConditionalWrites()).thenReturn(false);
+        when(blobStore.resolveStorageClass(any(OperationPurpose.class))).thenReturn(randomFrom(StorageClass.values()));
+        final S3BlobStore sourceBlobStore = mock(S3BlobStore.class);
+        when(sourceBlobStore.bucket()).thenReturn(sourceBucket);
+        return new CopyStores(blobStore, configureMockClient(blobStore), sourceBlobStore, configureMockClient(sourceBlobStore));
+    }
+
+    private static void answerMultipartCopy(S3Client client, String eTagOfComplete) {
+        when(client.createMultipartUpload(any(CreateMultipartUploadRequest.class))).thenReturn(
+            CreateMultipartUploadResponse.builder().uploadId(randomAlphaOfLength(25)).build()
+        );
+        when(client.uploadPartCopy(any(UploadPartCopyRequest.class))).thenAnswer(
+            inv -> UploadPartCopyResponse.builder().copyPartResult(b -> b.eTag(randomAlphaOfLength(20))).build()
+        );
+        when(client.completeMultipartUpload(any(CompleteMultipartUploadRequest.class))).thenReturn(
+            eTagOfComplete == null
+                ? CompleteMultipartUploadResponse.builder().build()
+                : CompleteMultipartUploadResponse.builder().eTag(eTagOfComplete).build()
+        );
+    }
+
+    private static HeadObjectResponse headAnswer(long length) {
+        return HeadObjectResponse.builder().contentLength(length).build();
+    }
+
+    private static S3Exception s3Error(RestStatus status, @Nullable String errorCode) {
+        final var builder = S3Exception.builder().statusCode(status.getStatus()).message("simulated " + status);
+        if (errorCode != null) {
+            builder.awsErrorDetails(AwsErrorDetails.builder().errorCode(errorCode).build());
+        }
+        // the builder gives the type AwsServiceException, and the object is an S3Exception, as the client throws it
+        return (S3Exception) builder.build();
+    }
+
+    private IOException copyFails(CopyStores stores, OperationPurpose purpose, long neededEnd) {
+        final var destination = new S3BlobContainer(BlobPath.EMPTY, stores.destination());
+        final var source = new S3BlobContainer(BlobPath.EMPTY, stores.source());
+        return expectThrows(
+            IOException.class,
+            () -> destination.copyBlob(
+                purpose,
+                source,
+                randomAlphaOfLengthBetween(1, 10),
+                randomAlphaOfLengthBetween(1, 10),
+                neededEnd,
+                null
+            )
+        );
+    }
+
+    /**
+     * A copy of a blob that the caller needs more of than the copy limit goes in parts, and each part copies a byte range of the source.
+     * The last range ends where the source ends, so the copy needs the exact length of the source. It asks for it with one HEAD request,
+     * which goes through the client and the stats of the source store, and it copies the whole source, also if the caller needs only the
+     * first bytes of it. The copy returns the length from the HEAD request.
+     */
+    public void testCopyAboveTheLimitAsksTheSourceStoreForItsLengthOnce() throws IOException {
+        final long minPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        final long copyPartSize = randomLongBetween(minPartSize, minPartSize * 2);
+        final int nbParts = randomIntBetween(2, 5);
+        final long sourceLength = randomLongBetween((nbParts - 1) * copyPartSize + 1, nbParts * copyPartSize);
+        // the caller needs at least a part, so the copy goes in parts
+        final long neededEnd = randomLongBetween(copyPartSize + 1, sourceLength);
+        final String sourceBucket = randomAlphaOfLengthBetween(1, 10);
+        final String sourceBlobName = randomAlphaOfLengthBetween(1, 10);
+        final String blobName = randomAlphaOfLengthBetween(1, 10);
+        final OperationPurpose purpose = randomPurpose();
+        try (var stores = copyStores(copyPartSize, randomAlphaOfLengthBetween(1, 10), sourceBucket)) {
+            final var sourcePath = BlobPath.EMPTY.add(randomAlphaOfLengthBetween(1, 10));
+            final ArgumentCaptor<HeadObjectRequest> headCaptor = ArgumentCaptor.forClass(HeadObjectRequest.class);
+            when(stores.sourceClient().headObject(headCaptor.capture())).thenReturn(headAnswer(sourceLength));
+            answerMultipartCopy(stores.destinationClient(), randomAlphaOfLength(20));
+            final ArgumentCaptor<UploadPartCopyRequest> partCaptor = ArgumentCaptor.forClass(UploadPartCopyRequest.class);
+            when(stores.destinationClient().uploadPartCopy(partCaptor.capture())).thenAnswer(
+                inv -> UploadPartCopyResponse.builder().copyPartResult(b -> b.eTag(randomAlphaOfLength(20))).build()
+            );
+
+            final var destination = new S3BlobContainer(BlobPath.EMPTY, stores.destination());
+            final var source = new S3BlobContainer(sourcePath, stores.source());
+            final var length = destination.copyBlob(purpose, source, sourceBlobName, blobName, neededEnd, null);
+
+            assertThat(length, equalTo(OptionalLong.of(sourceLength)));
+            // one HEAD request, for the source blob, through the client of the source store and no other
+            verify(stores.sourceClient(), times(1)).headObject(any(HeadObjectRequest.class));
+            verify(stores.destinationClient(), never()).headObject(any(HeadObjectRequest.class));
+            assertThat(headCaptor.getValue().bucket(), equalTo(sourceBucket));
+            assertThat(headCaptor.getValue().key(), equalTo(sourcePath.buildAsString() + sourceBlobName));
+            // The request is set up for the stats of the source store, as a HEAD request of the purpose of the copy. The destination
+            // store does not set up any HEAD request.
+            verify(stores.source(), times(1)).getMetricPublisher(S3BlobStore.Operation.HEAD_OBJECT, purpose);
+            verify(stores.source(), times(1)).addPurposeQueryParameter(eq(purpose), any());
+            verify(stores.destination(), never()).getMetricPublisher(eq(S3BlobStore.Operation.HEAD_OBJECT), any());
+            // one multipart copy, in parts of the copy limit, and the last part ends at the last byte of the source
+            verify(stores.destinationClient(), never()).copyObject(any(CopyObjectRequest.class));
+            verify(stores.destinationClient(), times(1)).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+            verify(stores.destinationClient(), times(1)).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+            final var ranges = partCaptor.getAllValues().stream().map(UploadPartCopyRequest::copySourceRange).toList();
+            assertThat(ranges, hasSize(nbParts));
+            for (int part = 0; part < nbParts - 1; part++) {
+                assertThat(ranges.get(part), equalTo("bytes=" + (part * copyPartSize) + "-" + ((part + 1) * copyPartSize - 1)));
+            }
+            assertThat(ranges.get(nbParts - 1), equalTo("bytes=" + ((nbParts - 1) * copyPartSize) + "-" + (sourceLength - 1)));
+        }
+    }
+
+    /**
+     * A length from the HEAD request that is below the end that the caller needs cannot be used: the parts would copy a prefix of the
+     * blob, and S3 would not say that the copy is short. The copy fails before it starts the multipart upload.
+     */
+    public void testCopyAboveTheLimitFailsIfTheLengthIsBelowTheNeededEnd() {
+        final long minPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        final long copyPartSize = randomLongBetween(minPartSize, minPartSize * 2);
+        final long neededEnd = randomLongBetween(copyPartSize + 2, copyPartSize * 3);
+        final long sourceLength = randomLongBetween(1, neededEnd - 1);
+        try (var stores = copyStores(copyPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenReturn(headAnswer(sourceLength));
+            answerMultipartCopy(stores.destinationClient(), randomAlphaOfLength(20));
+
+            final IOException e = copyFails(stores, randomPurpose(), neededEnd);
+
+            assertThat(
+                e.getMessage(),
+                containsString("the source is [" + sourceLength + "] bytes long, but the caller needs [" + neededEnd + "]")
+            );
+            verify(stores.sourceClient(), times(1)).headObject(any(HeadObjectRequest.class));
+            verify(stores.destinationClient(), never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+            verify(stores.destinationClient(), never()).uploadPartCopy(any(UploadPartCopyRequest.class));
+            verify(stores.destinationClient(), never()).copyObject(any(CopyObjectRequest.class));
+        }
+    }
+
+    /**
+     * A source that is not in the store fails the HEAD request with 404, which is a {@link NoSuchFileException}, before the multipart
+     * upload starts.
+     */
+    public void testCopyAboveTheLimitOfAMissingSourceFailsWithNoSuchFile() {
+        final long copyPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        try (var stores = copyStores(copyPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenThrow(s3Error(RestStatus.NOT_FOUND, null));
+
+            final var destination = new S3BlobContainer(BlobPath.EMPTY, stores.destination());
+            final var source = new S3BlobContainer(BlobPath.EMPTY, stores.source());
+            expectThrows(
+                NoSuchFileException.class,
+                () -> destination.copyBlob(
+                    randomPurpose(),
+                    source,
+                    randomAlphaOfLengthBetween(1, 10),
+                    randomAlphaOfLengthBetween(1, 10),
+                    copyPartSize + 1,
+                    null
+                )
+            );
+            verify(stores.destinationClient(), never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+        }
+    }
+
+    /**
+     * The HEAD request can fail in other ways than a missing blob. The copy then fails with an {@link IOException} that has the error of
+     * the store as its cause, and the multipart upload does not start.
+     */
+    public void testCopyAboveTheLimitFailsIfTheHeadRequestIsRefused() {
+        final long copyPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        try (var stores = copyStores(copyPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            final S3Exception refusal = randomBoolean()
+                ? s3Error(RestStatus.FORBIDDEN, "AccessDenied")
+                : s3Error(RestStatus.INTERNAL_SERVER_ERROR, "InternalError");
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenThrow(refusal);
+
+            final IOException e = copyFails(stores, randomPurpose(), copyPartSize + 1);
+
+            assertThat(e, not(instanceOf(NoSuchFileException.class)));
+            assertThat(e.getMessage(), containsString("Unable to copy object"));
+            assertThat(e.getCause(), sameInstance(refusal));
+            verify(stores.destinationClient(), never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+        }
+    }
+
+    /**
+     * An answer to the HEAD request without a content length gives no length for the parts, so the copy fails and the multipart upload
+     * does not start.
+     */
+    public void testCopyAboveTheLimitFailsIfTheHeadAnswerHasNoLength() {
+        final long copyPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        try (var stores = copyStores(copyPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenReturn(HeadObjectResponse.builder().build());
+
+            final IOException e = copyFails(stores, randomPurpose(), copyPartSize + 1);
+
+            assertThat(e.getMessage(), containsString("has no content length"));
+            verify(stores.destinationClient(), never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+        }
+    }
+
+    /**
+     * S3 copies a source of up to 5 GB with one CopyObject request, and refuses a larger source with a 400 error, which the AWS
+     * documentation gives the code InvalidRequest. The copy limit cannot be set above 5 GB, but the caller can need less than the limit
+     * of a source that is longer than 5 GB. So the request can be refused for a size that the limit does not show. The copy then asks
+     * for the length with a HEAD request, and goes in parts because the source is longer than the limit. The refusal is only what S3
+     * documents, and the test cannot tell what a real S3 or an S3 compatible store answers, so it uses a mock.
+     */
+    public void testCopyThatS3RefusesAsTooLargeGoesInParts() throws IOException {
+        assertRefusedCopyGoesInParts(s3Error(RestStatus.BAD_REQUEST, "InvalidRequest"));
+    }
+
+    /**
+     * An S3 compatible store whose limit for one request is lower than 5 GB can refuse a copy with a 400 error that has another code,
+     * or none. The copy does not look at the code. If the source is longer than the limit, it goes in parts, as for InvalidRequest.
+     */
+    public void testCopyRefusedWithAnotherCodeGoesInPartsIfTheSourceIsOverTheLimit() throws IOException {
+        assertRefusedCopyGoesInParts(
+            s3Error(RestStatus.BAD_REQUEST, randomFrom("InvalidArgument", "EntityTooLarge", "StoreSpecificCode", null))
+        );
+    }
+
+    private void assertRefusedCopyGoesInParts(S3Exception refusal) throws IOException {
+        final long minPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        final long copyPartSize = randomLongBetween(minPartSize, minPartSize * 2);
+        final long sourceLength = randomLongBetween(copyPartSize + 1, copyPartSize * 3);
+        // the caller needs no more than the limit, so the copy starts with one CopyObject request
+        final long neededEnd = randomLongBetween(1, copyPartSize);
+        try (var stores = copyStores(copyPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            when(stores.destinationClient().copyObject(any(CopyObjectRequest.class))).thenThrow(refusal);
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenReturn(headAnswer(sourceLength));
+            answerMultipartCopy(stores.destinationClient(), randomAlphaOfLength(20));
+
+            final var destination = new S3BlobContainer(BlobPath.EMPTY, stores.destination());
+            final var source = new S3BlobContainer(BlobPath.EMPTY, stores.source());
+            final var length = destination.copyBlob(
+                randomPurpose(),
+                source,
+                randomAlphaOfLengthBetween(1, 10),
+                randomAlphaOfLengthBetween(1, 10),
+                neededEnd,
+                null
+            );
+
+            assertThat(length, equalTo(OptionalLong.of(sourceLength)));
+            verify(stores.destinationClient(), times(1)).copyObject(any(CopyObjectRequest.class));
+            verify(stores.sourceClient(), times(1)).headObject(any(HeadObjectRequest.class));
+            verify(stores.destinationClient(), times(1)).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+            verify(stores.destinationClient(), times(1)).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+            verify(stores.destinationClient(), times((int) ((sourceLength + copyPartSize - 1) / copyPartSize))).uploadPartCopy(
+                any(UploadPartCopyRequest.class)
+            );
+        }
+    }
+
+    /**
+     * A 400 error does not say that the source is too large. If the source is within the copy limit, the size is not the reason, and
+     * the limit is at most what S3 copies with one request. Then the copy fails with the error of the refused request, as an
+     * {@link IOException} that has it as its cause. The source can be shorter than the 5 MB of a part: a multipart copy of it would
+     * fail with an {@link IllegalArgumentException} that hides the real error, and the copy must not start one.
+     */
+    public void testCopyRefusedWithA400ForASourceWithinTheLimitFailsWithTheOriginalError() {
+        final long minPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        final long copyPartSize = randomLongBetween(minPartSize, minPartSize * 2);
+        final long sourceLength = randomBoolean() ? randomLongBetween(1, 300_000) : randomLongBetween(1, copyPartSize);
+        final S3Exception refusal = s3Error(RestStatus.BAD_REQUEST, randomFrom("InvalidRequest", "InvalidArgument", null));
+        try (var stores = copyStores(copyPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            when(stores.destinationClient().copyObject(any(CopyObjectRequest.class))).thenThrow(refusal);
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenReturn(headAnswer(sourceLength));
+
+            final IOException e = copyFails(stores, randomPurpose(), randomLongBetween(1, copyPartSize));
+
+            assertThat(e.getMessage(), containsString("Unable to copy object"));
+            assertThat(e.getCause(), sameInstance(refusal));
+            verify(stores.sourceClient(), times(1)).headObject(any(HeadObjectRequest.class));
+            verify(stores.destinationClient(), never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+        }
+    }
+
+    /**
+     * If the HEAD request that follows a refused copy fails too, the refusal is the error of the copy, and the failed HEAD request is
+     * attached to it.
+     */
+    public void testCopyRefusedWithA400AndAFailedHeadRequestFailsWithTheRefusal() {
+        final long copyPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        final S3Exception refusal = s3Error(RestStatus.BAD_REQUEST, "InvalidRequest");
+        final S3Exception headFailure = s3Error(RestStatus.INTERNAL_SERVER_ERROR, "InternalError");
+        try (var stores = copyStores(copyPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            when(stores.destinationClient().copyObject(any(CopyObjectRequest.class))).thenThrow(refusal);
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenThrow(headFailure);
+
+            final IOException e = copyFails(stores, randomPurpose(), 1L);
+
+            assertThat(e.getCause(), sameInstance(refusal));
+            assertThat(refusal.getSuppressed().length, equalTo(1));
+            assertThat(refusal.getSuppressed()[0], sameInstance(headFailure));
+            verify(stores.destinationClient(), never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+        }
+    }
+
+    /**
+     * The refused CopyObject request is what sends the copy in parts. If the copy in parts fails too, the refusal is attached to that
+     * failure as a suppressed exception, so that a reader of the failure sees why the copy went in parts.
+     */
+    public void testCopyInPartsThatFailsAfterARefusalKeepsTheRefusalAsSuppressed() {
+        final long minPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        final long copyPartSize = randomLongBetween(minPartSize, minPartSize * 2);
+        final long sourceLength = randomLongBetween(copyPartSize + 1, copyPartSize * 3);
+        final S3Exception refusal = s3Error(RestStatus.BAD_REQUEST, randomFrom("InvalidRequest", "InvalidArgument", null));
+        try (var stores = copyStores(copyPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            when(stores.destinationClient().copyObject(any(CopyObjectRequest.class))).thenThrow(refusal);
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenReturn(headAnswer(sourceLength));
+            final OperationPurpose purpose;
+            final String expectedMessage;
+            if (randomBoolean()) {
+                // the store cannot start the multipart upload
+                purpose = randomPurpose();
+                when(stores.destinationClient().createMultipartUpload(any(CreateMultipartUploadRequest.class))).thenThrow(
+                    s3Error(RestStatus.INTERNAL_SERVER_ERROR, "InternalError")
+                );
+                expectedMessage = "using multipart upload";
+            } else {
+                // the answer that completes a snapshot copy has no ETag
+                purpose = OperationPurpose.SNAPSHOT_DATA;
+                answerMultipartCopy(stores.destinationClient(), null);
+                when(stores.destinationClient().abortMultipartUpload(any(AbortMultipartUploadRequest.class))).thenReturn(
+                    AbortMultipartUploadResponse.builder().build()
+                );
+                expectedMessage = "has no ETag";
+            }
+
+            final IOException e = copyFails(stores, purpose, randomLongBetween(1, copyPartSize));
+
+            assertThat(e.getMessage(), containsString(expectedMessage));
+            assertThat(e.getSuppressed().length, equalTo(1));
+            assertThat(e.getSuppressed()[0], sameInstance(refusal));
+        }
+    }
+
+    /**
+     * Only a 400 error starts the length request and the copy in parts. Any other error of a CopyObject request fails the copy, without
+     * a HEAD request and without a multipart upload.
+     */
+    public void testOtherCopyObjectErrorsDoNotGoInParts() {
+        try (
+            var stores = copyStores(
+                S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes(),
+                randomAlphaOfLengthBetween(1, 10),
+                randomAlphaOfLengthBetween(1, 10)
+            )
+        ) {
+            final S3Exception error = randomFrom(
+                s3Error(RestStatus.FORBIDDEN, "AccessDenied"),
+                s3Error(RestStatus.INTERNAL_SERVER_ERROR, "InternalError"),
+                s3Error(RestStatus.SERVICE_UNAVAILABLE, "SlowDown"),
+                s3Error(RestStatus.CONFLICT, null)
+            );
+            when(stores.destinationClient().copyObject(any(CopyObjectRequest.class))).thenThrow(error);
+
+            final IOException e = copyFails(stores, randomPurpose(), 1L);
+
+            assertThat(e.getMessage(), containsString("Unable to copy object"));
+            assertThat(e.getCause(), sameInstance(error));
+            verify(stores.sourceClient(), never()).headObject(any(HeadObjectRequest.class));
+            verify(stores.destinationClient(), never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+        }
+    }
+
+    /**
+     * The client fails a copy that S3 answers with 200 and an error document. An answer to a CopyObject request without an ETag passes
+     * that check, and it does not show that S3 made the copy. A snapshot copy has no other sign, so it fails.
+     */
+    public void testSnapshotCopyObjectAnswerWithoutAnEtagFails() {
+        try (
+            var stores = copyStores(
+                S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes(),
+                randomAlphaOfLengthBetween(1, 10),
+                randomAlphaOfLengthBetween(1, 10)
+            )
+        ) {
+            when(stores.destinationClient().copyObject(any(CopyObjectRequest.class))).thenReturn(copyObjectAnswerWithoutAnEtag());
+
+            final IOException e = copyFails(stores, OperationPurpose.SNAPSHOT_DATA, 1L);
+
+            assertThat(e.getMessage(), containsString("has no ETag"));
+        }
+    }
+
+    /**
+     * Same as above for the answer that completes a multipart copy. A multipart upload that is not a copy needs no ETag in the answer.
+     */
+    public void testSnapshotMultipartCopyCompletedWithoutAnEtagFails() {
+        final long minPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        final long sourceLength = randomLongBetween(minPartSize + 1, minPartSize * 2);
+        try (var stores = copyStores(minPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenReturn(headAnswer(sourceLength));
+            answerMultipartCopy(stores.destinationClient(), randomBoolean() ? null : "");
+            when(stores.destinationClient().abortMultipartUpload(any(AbortMultipartUploadRequest.class))).thenReturn(
+                AbortMultipartUploadResponse.builder().build()
+            );
+
+            final IOException e = copyFails(stores, OperationPurpose.SNAPSHOT_DATA, sourceLength);
+
+            assertThat(e.getMessage(), containsString("has no ETag"));
+            // the multipart upload is aborted: the copy is not known to be done
+            verify(stores.destinationClient(), times(1)).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+        }
+    }
+
+    /**
+     * Only a snapshot copy insists on the ETag. The copies of resharding, which are retried without end, and of the repository analysis
+     * keep accepting an answer without an ETag, as they did before, so a store that never sends one does not block them.
+     */
+    public void testCopyOfAnotherPurposeThanSnapshotDataNeedsNoEtag() throws IOException {
+        final OperationPurpose purpose = randomValueOtherThan(OperationPurpose.SNAPSHOT_DATA, () -> randomFrom(OperationPurpose.values()));
+        final long minPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        try (var stores = copyStores(minPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            final var destination = new S3BlobContainer(BlobPath.EMPTY, stores.destination());
+            final var source = new S3BlobContainer(BlobPath.EMPTY, stores.source());
+
+            // one CopyObject request, answered without an ETag
+            when(stores.destinationClient().copyObject(any(CopyObjectRequest.class))).thenReturn(copyObjectAnswerWithoutAnEtag());
+            assertThat(
+                destination.copyBlob(purpose, source, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10), 1L, null),
+                equalTo(OptionalLong.empty())
+            );
+
+            // a multipart copy, whose completion is answered without an ETag
+            final long sourceLength = randomLongBetween(minPartSize + 1, minPartSize * 2);
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenReturn(headAnswer(sourceLength));
+            answerMultipartCopy(stores.destinationClient(), randomBoolean() ? null : "");
+            assertThat(
+                destination.copyBlob(
+                    purpose,
+                    source,
+                    randomAlphaOfLengthBetween(1, 10),
+                    randomAlphaOfLengthBetween(1, 10),
+                    sourceLength,
+                    null
+                ),
+                equalTo(OptionalLong.of(sourceLength))
+            );
+            verify(stores.destinationClient(), times(1)).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+            verify(stores.destinationClient(), never()).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+        }
+    }
+
+    private static CopyObjectResponse copyObjectAnswerWithoutAnEtag() {
+        return randomFrom(
+            CopyObjectResponse.builder().build(),
+            CopyObjectResponse.builder().copyObjectResult(result -> {}).build(),
+            CopyObjectResponse.builder().copyObjectResult(result -> result.eTag("")).build()
+        );
+    }
+
+    /**
+     * A source that goes away while the parts are copied fails an UploadPartCopy request with 404. The {@link NoSuchFileException} names
+     * the source, which is what is missing, and not the new blob. The multipart upload is aborted.
+     */
+    public void testMultipartCopyOfASourceThatIsGoneNamesTheSource() {
+        final long minPartSize = S3Repository.MIN_PART_SIZE_USING_MULTIPART.getBytes();
+        final long sourceLength = randomLongBetween(minPartSize + 1, minPartSize * 2);
+        final String sourceBlobName = randomAlphaOfLengthBetween(1, 10);
+        final var sourcePath = BlobPath.EMPTY.add(randomAlphaOfLengthBetween(1, 10));
+        final String blobName = randomAlphaOfLengthBetween(11, 20);
+        try (var stores = copyStores(minPartSize, randomAlphaOfLengthBetween(1, 10), randomAlphaOfLengthBetween(1, 10))) {
+            when(stores.sourceClient().headObject(any(HeadObjectRequest.class))).thenReturn(headAnswer(sourceLength));
+            answerMultipartCopy(stores.destinationClient(), randomAlphaOfLength(20));
+            when(stores.destinationClient().uploadPartCopy(any(UploadPartCopyRequest.class))).thenThrow(
+                s3Error(RestStatus.NOT_FOUND, "NoSuchKey")
+            );
+            when(stores.destinationClient().abortMultipartUpload(any(AbortMultipartUploadRequest.class))).thenReturn(
+                AbortMultipartUploadResponse.builder().build()
+            );
+
+            final var destination = new S3BlobContainer(BlobPath.EMPTY, stores.destination());
+            final var source = new S3BlobContainer(sourcePath, stores.source());
+            final var e = expectThrows(
+                NoSuchFileException.class,
+                () -> destination.copyBlob(randomPurpose(), source, sourceBlobName, blobName, sourceLength, null)
+            );
+
+            assertThat(e.getMessage(), containsString("Copy source [" + sourcePath.buildAsString() + sourceBlobName + "] not found"));
+            assertThat(e.getMessage(), not(containsString(blobName)));
+            verify(stores.destinationClient(), times(1)).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+        }
     }
 
     private static S3Client configureMockClient(S3BlobStore blobStore) {

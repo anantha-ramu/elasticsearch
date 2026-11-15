@@ -214,9 +214,14 @@ final class S3ClientSettings {
     );
 
     /**
-     * Maximum size allowed for copy without multipart.
-     * Objects larger than this will be copied using multipart copy. S3 enforces a minimum multipart size of 5 MiB and a maximum
-     * non-multipart copy size of 5 GiB. The default is to use the maximum allowable size in order to minimize request count.
+     * The size of the parts of a multipart copy, and the size above which a copy goes in parts. A copy compares this setting with the
+     * offset just after the last byte that the caller needs from the source blob, which is a lower bound for the length of the blob and
+     * not the length. So a blob that is longer than the setting is still copied with one CopyObject request if the caller needs no more
+     * than the setting from it. If the store refuses that request with a 400 error, for example because the blob is over 5 GiB, the
+     * copy asks for the length of the blob and goes in parts if the blob is longer than the setting. S3 enforces a minimum multipart
+     * size of 5 MiB and a maximum non-multipart copy size of 5 GiB, so the setting cannot be lower than 5 MiB or higher than 5 GiB. The
+     * default is the maximum, in order to minimize request count. A store whose limit for one request is lower than 5 GiB should set
+     * this to that limit, so that the copy goes in parts for a blob over the limit.
      */
     static final Setting.AffixSetting<ByteSizeValue> MAX_COPY_SIZE_BEFORE_MULTIPART = Setting.affixKeySetting(
         PREFIX,
