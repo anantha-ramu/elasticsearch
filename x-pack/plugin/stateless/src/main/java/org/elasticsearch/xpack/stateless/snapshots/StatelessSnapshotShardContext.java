@@ -74,11 +74,13 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     @Nullable // when snapshot runs on a different node from the primary
     private final BooleanSupplier isShardRelocated;
     private final boolean serverSideCopyEnabled;
-    // metadataSnapshot and copySource fill in the next two fields, see their Javadoc. The first generational file that one of them looks
-    // at sets segmentsFile, the location of the segments_N file of the snapshotted commit. The first carried generational file sets
-    // firstCommit, the header of the first commit of the commit blob that holds the snapshotted commit. The repository calls
-    // metadataSnapshot, and then copySource and isCopiedFileReusable for one file at a time, all on one thread, so the fields need no
-    // synchronization.
+    // metadataSnapshot and copySource fill in the next fields, see their Javadoc. The first generational file that one of them looks at
+    // sets segmentsFileName and segmentsFile, the name and the location of the segments_N file of the snapshotted commit. The first
+    // carried generational file sets firstCommit, the header of the first commit of the commit blob that holds the snapshotted commit.
+    // The repository calls metadataSnapshot, and then copySource and isCopiedFileReusable for one file at a time, all on one thread, so
+    // the fields need no synchronization.
+    @Nullable
+    private String segmentsFileName;
     @Nullable
     private BlobLocation segmentsFile;
     @Nullable
@@ -307,7 +309,8 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         if (segmentsFile == null) {
             // The commit writes its segments_N file into its own commit blob, and into no other blob. So the location of that file says
             // which commit blob holds the commit.
-            segmentsFile = fileToBlobLocations.get(SegmentInfos.getLastCommitSegmentsFileName(fileNames().toArray(String[]::new)));
+            segmentsFileName = SegmentInfos.getLastCommitSegmentsFileName(fileNames().toArray(String[]::new));
+            segmentsFile = fileToBlobLocations.get(segmentsFileName);
         }
         final BlobFile ownBlob = segmentsFile.blobFile();
         if (location.blobFile().equals(ownBlob)) {
@@ -315,15 +318,85 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         }
         if (firstCommit == null) {
             firstCommit = readFirstCommitHeader();
+            logCarriedCopiesOfFirstCommit();
         }
-        final BlobLocation copy = firstCommit.commitFiles().get(file);
-        if (copy != null && copy.blobFile().equals(ownBlob) && copy.fileLength() == location.fileLength()) {
+        final BlobLocation copy = getCopyInOwnBlob(file, location);
+        if (copy != null) {
             return copy;
         }
         // Not expected, see copySource: the header lists no copy of the file in the commit blob of the commit, or a copy with another
         // length. The file keeps its first location.
-        assert false : "commit blob [" + ownBlob.blobName() + "] has no copy of generational file [" + file + "], found " + copy;
+        assert false
+            : "commit blob ["
+                + ownBlob.blobName()
+                + "] has no copy of generational file ["
+                + file
+                + "], found "
+                + firstCommit.commitFiles().get(file);
         return location;
+    }
+
+    /**
+     * Returns the copy of a carried generational file in the commit blob of the snapshotted commit, as the header of the first commit
+     * of that blob lists the copy. The method returns {@code null} if the header lists no such copy, or a copy of another length than the
+     * file has. The method needs {@link #segmentsFile} and {@link #firstCommit}.
+     *
+     * @param location the first location of the file, in an older commit blob
+     */
+    @Nullable
+    private BlobLocation getCopyInOwnBlob(String file, BlobLocation location) {
+        final BlobLocation copy = firstCommit.commitFiles().get(file);
+        if (copy != null && copy.blobFile().equals(segmentsFile.blobFile()) && copy.fileLength() == location.fileLength()) {
+            return copy;
+        }
+        return null;
+    }
+
+    /**
+     * Logs how many carried generational files the snapshotted commit has and where their copies lie. The context calls the method right
+     * after the context has read the header of the first commit of the commit blob, which happens once, so the line comes once for each
+     * shard snapshot and not once for each file. The method logs nothing if the snapshotted commit is a later commit of the blob, or if
+     * the snapshotted commit has no carried copy.
+     * <p>
+     * The log is for a QA run, which reads what real shards do. A first commit stores its internal files, which are the carried copies
+     * and its own new files including {@code segments_N}, sorted by length and then by name. So a carried copy that is longer than
+     * {@code segments_N} comes after it. Then no read of the commit blob that stops at {@code segments_N} reaches the copy, and only the
+     * footer read at the copy location shows that the blob reaches to the end of the copy. The line says how many carried copies the
+     * commit has, and how many of them come after {@code segments_N}.
+     */
+    private void logCarriedCopiesOfFirstCommit() {
+        final BlobFile ownBlob = segmentsFile.blobFile();
+        final long commitGeneration = SegmentInfos.generationFromSegmentsFileName(segmentsFileName);
+        // The first commit of a blob has the generation of the blob. A later commit of the blob has its carried copies in the first
+        // commit, before its own segments_N file, and the read of segments_N covers them.
+        if (commitGeneration != ownBlob.generation()) {
+            return;
+        }
+        int carriedCopies = 0;
+        int copiesAfterSegmentsFile = 0;
+        for (Map.Entry<String, BlobLocation> entry : fileToBlobLocations.entrySet()) {
+            if (StatelessCompoundCommit.isGenerationalFile(entry.getKey()) == false || entry.getValue().blobFile().equals(ownBlob)) {
+                continue;
+            }
+            final BlobLocation copy = getCopyInOwnBlob(entry.getKey(), entry.getValue());
+            if (copy != null) {
+                carriedCopies++;
+                if (copy.offset() > segmentsFile.offset()) {
+                    copiesAfterSegmentsFile++;
+                }
+            }
+        }
+        if (carriedCopies > 0) {
+            logger.info(
+                "[{}]{} first commit of blob [{}] at generation [{}]: [{}] carried copies, [{}] after segments_N",
+                snapshotId(),
+                shardId,
+                ownBlob.blobName(),
+                commitGeneration,
+                carriedCopies,
+                copiesAfterSegmentsFile
+            );
+        }
     }
 
     /**

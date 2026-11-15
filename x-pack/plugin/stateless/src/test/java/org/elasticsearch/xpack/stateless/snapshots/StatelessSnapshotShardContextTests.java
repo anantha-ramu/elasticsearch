@@ -7,6 +7,8 @@
 
 package org.elasticsearch.xpack.stateless.snapshots;
 
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.core.LogEvent;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.store.Directory;
@@ -27,7 +29,9 @@ import org.elasticsearch.common.blobstore.support.FilterBlobContainer;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.io.stream.InputStreamStreamInput;
 import org.elasticsearch.common.lucene.store.InputStreamIndexInput;
+import org.elasticsearch.common.regex.Regex;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
+import org.elasticsearch.core.CheckedRunnable;
 import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.core.PathUtils;
 import org.elasticsearch.index.Index;
@@ -47,6 +51,7 @@ import org.elasticsearch.repositories.SnapshotShardContext;
 import org.elasticsearch.snapshots.AbortedSnapshotException;
 import org.elasticsearch.snapshots.SnapshotId;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.test.MockLog;
 import org.elasticsearch.xpack.stateless.commits.BatchedCompoundCommit;
 import org.elasticsearch.xpack.stateless.commits.BlobFile;
 import org.elasticsearch.xpack.stateless.commits.BlobLocation;
@@ -68,6 +73,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 
 import static org.elasticsearch.xpack.stateless.commits.StatelessCommitServiceTests.waitUntilBCCIsUploaded;
@@ -574,6 +580,127 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
 
             assertThat(failure.getMessage(), containsString("failed to get store file metadata"));
             assertThat(failure.getCause(), sameInstance(simulated));
+        }
+    }
+
+    /**
+     * The first commit of a commit blob logs once for each shard snapshot how many generational files it carries and how many of their
+     * copies come after its {@code segments_N} file, when the context has read the header of that commit. Neither the metadata snapshot
+     * nor the copy source of each file makes the context log again. A commit that is not the first of its blob, a commit that carries
+     * no file, and a context with copies off log nothing.
+     */
+    public void testFirstCommitWithCarriedCopiesLogsOnceForEachShardSnapshot() throws Exception {
+        try (var node = newNode()) {
+            // the first commit blob has no carried file, the second blob has two commits and a big carried file, and the third has one
+            final var commits = node.generateCommitsWithUnchangedGenerationalFiles(5, between(10_000, 20_000));
+            final var uploadedCommits = uploadCommitBlobs(node, commits, 2, 2, 1);
+            boolean loggedForAFirstCommit = false;
+            boolean loggedAfterSegmentsFile = false;
+            for (UploadedCommit uploaded : uploadedCommits) {
+                final var carried = carriedGenerationalFiles(node, uploaded);
+                final var header = readCommitHeader(node, uploaded);
+                final var segmentsFile = node.commitService.getBlobLocation(node.shardId, uploaded.commit().getSegmentsFileName());
+                final long copiesAfterSegmentsFile = carried.stream()
+                    .filter(file -> header.commitFiles().get(file).offset() > segmentsFile.offset())
+                    .count();
+                final boolean logs = uploaded.isFirstInBlob() && carried.isEmpty() == false;
+                loggedForAFirstCommit |= logs;
+                loggedAfterSegmentsFile |= logs && copiesAfterSegmentsFile > 0;
+
+                // metadata snapshot first, as the repository does, and then the copy source of each file
+                final var context = contextOf(node, uploaded.commit(), true);
+                final var expectation = new LogLineCounter(
+                    "["
+                        + context.snapshotId()
+                        + "]"
+                        + node.shardId
+                        + " first commit of blob [stateless_commit_"
+                        + uploaded.blobGeneration()
+                        + "] at generation ["
+                        + uploaded.blobGeneration()
+                        + "]: ["
+                        + carried.size()
+                        + "] carried copies, ["
+                        + copiesAfterSegmentsFile
+                        + "] after segments_N",
+                    logs ? 1 : 0
+                );
+                assertThatContextLogs(() -> {
+                    context.metadataSnapshot();
+                    for (String file : uploaded.commit().getFileNames()) {
+                        context.copySource(file);
+                    }
+                }, expectation);
+                // no other line of the context says anything about a first commit
+                final var anyLine = new LogLineCounter("*first commit of blob*", logs ? 1 : 0);
+                assertThatContextLogs(() -> {
+                    final var again = contextOf(node, uploaded.commit(), true);
+                    again.metadataSnapshot();
+                    for (String file : uploaded.commit().getFileNames()) {
+                        again.copySource(file);
+                    }
+                }, anyLine);
+
+                // the copy source of each file alone, without the metadata snapshot, makes the context read the header and log once too
+                if (logs) {
+                    final var copySourceOnly = contextOf(node, uploaded.commit(), true);
+                    assertThatContextLogs(() -> {
+                        for (String file : uploaded.commit().getFileNames()) {
+                            copySourceOnly.copySource(file);
+                        }
+                    }, new LogLineCounter("*first commit of blob*", 1));
+                }
+
+                // with copies off, nothing reads the header and nothing is logged
+                final var copiesOff = contextOf(node, uploaded.commit(), false);
+                assertThatContextLogs(() -> {
+                    copiesOff.metadataSnapshot();
+                    for (String file : uploaded.commit().getFileNames()) {
+                        copiesOff.copySource(file);
+                    }
+                }, new LogLineCounter("*first commit of blob*", 0));
+            }
+            assertTrue("no first commit carries a generational file", loggedForAFirstCommit);
+            assertTrue("no first commit has a carried copy after segments_N", loggedAfterSegmentsFile);
+        }
+    }
+
+    /**
+     * Runs the action and checks the expectations against what {@link StatelessSnapshotShardContext} logs while it runs.
+     */
+    private static void assertThatContextLogs(CheckedRunnable<Exception> action, MockLog.LoggingExpectation... expectations) {
+        MockLog.assertThatLogger(() -> {
+            try {
+                action.run();
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+        }, StatelessSnapshotShardContext.class, expectations);
+    }
+
+    /**
+     * Counts the INFO messages that match a pattern, in which {@code *} matches any text, and expects as many as given.
+     */
+    private static final class LogLineCounter implements MockLog.LoggingExpectation {
+        private final String pattern;
+        private final int expectedCount;
+        private final AtomicInteger count = new AtomicInteger();
+
+        LogLineCounter(String pattern, int expectedCount) {
+            this.pattern = pattern;
+            this.expectedCount = expectedCount;
+        }
+
+        @Override
+        public void match(LogEvent event) {
+            if (event.getLevel() == Level.INFO && Regex.simpleMatch(pattern, event.getMessage().getFormattedMessage())) {
+                count.incrementAndGet();
+            }
+        }
+
+        @Override
+        public void assertMatched() {
+            assertThat("INFO messages that match [" + pattern + "]", count.get(), equalTo(expectedCount));
         }
     }
 
