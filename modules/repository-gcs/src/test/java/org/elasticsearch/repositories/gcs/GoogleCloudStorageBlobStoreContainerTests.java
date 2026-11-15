@@ -10,8 +10,10 @@
 package org.elasticsearch.repositories.gcs;
 
 import com.google.cloud.BatchResult;
+import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.Bucket;
+import com.google.cloud.storage.CopyWriter;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageBatch;
 import com.google.cloud.storage.StorageBatchResult;
@@ -36,11 +38,14 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 import static org.elasticsearch.repositories.blobstore.BlobStoreTestUtil.randomPurpose;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -236,6 +241,66 @@ public class GoogleCloudStorageBlobStoreContainerTests extends ESTestCase {
             verify(meteredStorage, times(nbParts)).meteredUploadPart(any(), any(), any());
             verify(meteredStorage, times(1)).meteredCompleteMultipartUpload(any(), any());
         }
+    }
+
+    /**
+     * A container over a mock client whose copy request ends with a rewrite answer that says the source object has {@code sourceSize}
+     * bytes and the new object has {@code targetSize} bytes, or no size if {@code targetSize} is null. It runs a copy of the blob and
+     * returns what the copy returns.
+     */
+    private OptionalLong copyWithRewriteAnswer(long sourceSize, Long targetSize, long neededEnd) throws IOException {
+        final CopyWriter copyWriter = mock(CopyWriter.class);
+        when(copyWriter.isDone()).thenReturn(true);
+        when(copyWriter.getBlobSize()).thenReturn(sourceSize);
+        final Blob target = mock(Blob.class);
+        when(target.getSize()).thenReturn(targetSize);
+        when(copyWriter.getResult()).thenReturn(target);
+        final Storage storage = mock(Storage.class);
+        when(storage.copy(any(Storage.CopyRequest.class))).thenReturn(copyWriter);
+        final var storageRpc = mock(com.google.api.services.storage.Storage.class);
+        final MeteredStorage meteredStorage = new MeteredStorage(storage, storageRpc, new GcsRepositoryStatsCollector());
+        try (GoogleCloudStorageBlobStore blobStore = buildBlobStore(randomAlphaOfLengthBetween(1, 10), meteredStorage, 1024)) {
+            final BlobContainer container = blobStore.blobContainer(BlobPath.EMPTY);
+            return container.copyBlob(randomPurpose(), container, randomIdentifier(), randomIdentifier(), neededEnd, null);
+        }
+    }
+
+    /**
+     * The answers to the rewrite requests of a copy carry the size of the source object, and the last answer carries the new object with
+     * its size. A copy whose new object has the size of the source returns that size, also when the caller needs less of the source.
+     */
+    public void testCopyReturnsTheSizeThatTheRewriteAnswersCarry() throws IOException {
+        final long size = randomLongBetween(1, 10_000);
+        assertThat(copyWithRewriteAnswer(size, size, randomLongBetween(1, size)), equalTo(OptionalLong.of(size)));
+    }
+
+    /**
+     * A new object that has another size than the source object is not a whole copy, and a new object without a size cannot be checked.
+     * Both fail the copy, without a request that reads the object back.
+     */
+    public void testCopyFailsIfTheNewObjectHasAnotherSizeThanTheSource() {
+        final long size = randomLongBetween(2, 10_000);
+        final Long targetSize = switch (between(0, 2)) {
+            case 0 -> null;
+            case 1 -> randomLongBetween(0, size - 1);
+            case 2 -> size + randomLongBetween(1, 100);
+            default -> throw new AssertionError("unexpected case");
+        };
+        final IOException e = expectThrows(IOException.class, () -> copyWithRewriteAnswer(size, targetSize, size));
+        assertThat(e.getMessage(), containsString("made an object of [" + targetSize + "] bytes, but the source is [" + size + "] bytes"));
+    }
+
+    /**
+     * A source object that is shorter than the end that the caller needs fails the copy, whatever the new object looks like.
+     */
+    public void testCopyFailsIfTheSourceIsShorterThanTheCallerNeeds() {
+        final long size = randomLongBetween(1, 10_000);
+        final long neededEnd = size + randomLongBetween(1, 100);
+        final IOException e = expectThrows(IOException.class, () -> copyWithRewriteAnswer(size, size, neededEnd));
+        assertThat(
+            e.getMessage(),
+            containsString("the source is [" + size + "] bytes long, but the caller needs [" + neededEnd + "] bytes")
+        );
     }
 
     private static GoogleCloudStorageBlobStore buildBlobStore(

@@ -70,6 +70,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -88,6 +89,8 @@ import static org.elasticsearch.repositories.gcs.GoogleCloudStorageClientSetting
 import static org.elasticsearch.repositories.gcs.GoogleCloudStorageRepository.BASE_PATH;
 import static org.elasticsearch.repositories.gcs.GoogleCloudStorageRepository.BUCKET;
 import static org.elasticsearch.repositories.gcs.GoogleCloudStorageRepository.CLIENT_NAME;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
 
 @SuppressForbidden(reason = "this test uses a HttpServer to emulate a Google Cloud Storage endpoint")
 @TestIssueLogging(
@@ -323,15 +326,58 @@ public class GoogleCloudStorageBlobStoreRepositoryTests extends ESMockAPIBasedRe
         assertBusy(() -> assertTrue(sourceBlobContainer.blobExists(randomPurpose(), sourceBlobName)));
 
         final var destinationBlobContainer = repository.blobStore().blobContainer(repository.basePath().add("target"));
-        destinationBlobContainer.copyBlob(
+        // the caller needs only the start of the source, and the copy holds all of it
+        final var length = destinationBlobContainer.copyBlob(
             randomPurpose(),
             sourceBlobContainer,
             sourceBlobName,
             destinationBlobName,
-            blobBytes.length(),
+            randomLongBetween(1, blobBytes.length()),
             null
         );
         assertThat(readFully(destinationBlobContainer.readBlob(randomRetryingPurpose(), destinationBlobName)), equalBytes(blobBytes));
+        // the answers of the rewrite requests carry the size of the source, so the copy returns it without an extra request
+        assertThat(length, equalTo(OptionalLong.of(blobBytes.length())));
+
+        sourceBlobContainer.delete(randomPurpose());
+        destinationBlobContainer.delete(randomPurpose());
+    }
+
+    /**
+     * Google Cloud copies a source that is shorter than the end that the caller needs without an error, and the answers of the rewrite
+     * requests carry the size of the source. The copy compares that size with the end that the caller needs, and fails if the source is
+     * shorter. The rewrite has finished by then, so the new blob exists and the caller must delete it.
+     */
+    public void testCopyOfASourceShorterThanTheCallerNeedsFails() throws Exception {
+        final var sourceBlobName = randomIdentifier();
+        final var repoName = createRepository(randomRepositoryName(), false);
+        final var destinationBlobName = randomIdentifier();
+        final var repositoriesService = internalCluster().getAnyMasterNodeInstance(RepositoriesService.class);
+        final var repository = (BlobStoreRepository) repositoriesService.repository(ProjectId.DEFAULT, repoName);
+        final var blobStore = repository.blobStore();
+        final var sourceBlobContainer = blobStore.blobContainer(repository.basePath());
+        final var blobBytes = randomBytesReference(randomIntBetween(100, 2_000_000));
+        sourceBlobContainer.writeBlob(randomPurpose(), sourceBlobName, blobBytes, true);
+        assertBusy(() -> assertTrue(sourceBlobContainer.blobExists(randomPurpose(), sourceBlobName)));
+
+        final var destinationBlobContainer = repository.blobStore().blobContainer(repository.basePath().add("target"));
+        final long neededEnd = blobBytes.length() + randomLongBetween(1, 1_000);
+        final IOException e = expectThrows(
+            IOException.class,
+            () -> destinationBlobContainer.copyBlob(
+                randomPurpose(),
+                sourceBlobContainer,
+                sourceBlobName,
+                destinationBlobName,
+                neededEnd,
+                null
+            )
+        );
+        assertThat(
+            e.getMessage(),
+            containsString("the source is [" + blobBytes.length() + "] bytes long, but the caller needs [" + neededEnd + "] bytes of it")
+        );
+        assertTrue(destinationBlobContainer.blobExists(randomPurpose(), destinationBlobName));
 
         sourceBlobContainer.delete(randomPurpose());
         destinationBlobContainer.delete(randomPurpose());

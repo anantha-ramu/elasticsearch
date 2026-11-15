@@ -21,6 +21,7 @@ import org.elasticsearch.common.blobstore.DeleteResult;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.blobstore.OptionalBytesReference;
 import org.elasticsearch.common.blobstore.support.AbstractBlobContainer;
+import org.elasticsearch.common.blobstore.support.BlobContainerUtils;
 import org.elasticsearch.common.blobstore.support.BlobMetadata;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.core.CheckedConsumer;
@@ -139,13 +140,20 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
         blobStore.writeMultipartBlob(purpose, buildKey(blobName), blobSize, provider, failIfAlreadyExists, executor);
     }
 
+    /**
+     * Copies the source blob with rewrite requests. Their answers report the size of the source, and the copy fails if that size is
+     * less than {@code neededEnd}. The answers come after the rewrite has started, and Google Cloud copies a short source without an
+     * error, so the new blob can already exist when the copy fails. The caller must delete the new blob.
+     *
+     * @return the size of the source blob, which the answers of the rewrite requests carry, so the copy needs no extra request
+     */
     @Override
     public OptionalLong copyBlob(
         final OperationPurpose purpose,
         final BlobContainer sourceBlobContainer,
         final String sourceBlobName,
         final String blobName,
-        final long blobSize,
+        final long neededEnd,
         @Nullable final Executor executor
     ) throws IOException {
         assert BlobContainer.assertPurposeConsistency(purpose, sourceBlobName);
@@ -157,15 +165,17 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
         BlobId sourceBlobId = BlobId.of(source.blobStore.bucketName, source.buildKey(sourceBlobName));
         BlobId blobId = BlobId.of(blobStore.bucketName, buildKey(blobName));
         BlobInfo targetBlobInfo = blobStore.applyStorageClass(BlobInfo.newBuilder(blobId), purpose).build();
+        final long sourceSize;
         try {
-            blobStore.client().copy(purpose, sourceBlobId, targetBlobInfo, blobStore.getMegabytesCopiedPerChunk());
+            sourceSize = blobStore.client().copy(purpose, sourceBlobId, targetBlobInfo, blobStore.getMegabytesCopiedPerChunk());
         } catch (StorageException e) {
             if (e.getCode() == RestStatus.NOT_FOUND.getStatus()) {
                 throw new NoSuchFileException("Copy source [" + sourceBlobName + "] not found: " + e.getMessage());
             }
             throw new IOException("Unable to copy object [" + blobName + "] from [" + sourceBlobContainer + "][" + sourceBlobName + "]", e);
         }
-        return OptionalLong.empty();
+        BlobContainerUtils.ensureCopySourceLongEnough(sourceBlobName, blobName, sourceSize, neededEnd);
+        return OptionalLong.of(sourceSize);
     }
 
     @Override

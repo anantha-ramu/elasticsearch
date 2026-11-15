@@ -374,7 +374,18 @@ public class MeteredStorage {
         return statsCollector.collectSupplier(purpose, DELETE, () -> multipartUploadClient.abortMultipartUpload(request));
     }
 
-    public void copy(OperationPurpose purpose, BlobId sourceBlobId, BlobInfo targetBlobInfo, long megabytesCopiedPerChunk) {
+    /**
+     * Copies a blob inside Google Cloud Storage with as many rewrite requests as the copy needs.
+     * <p>
+     * Each answer to a rewrite request carries the size of the source object, {@code objectSize}, and the last answer carries the new
+     * object, including its size. The method fails if the new object has another size than the source object, because the copy is then
+     * not whole. The check uses only the answers and sends no request.
+     *
+     * @return the size of the source object in bytes, as the last answer reports it
+     * @throws IOException if the size of the new object is missing from the last answer, or differs from the size of the source object
+     */
+    public long copy(OperationPurpose purpose, BlobId sourceBlobId, BlobInfo targetBlobInfo, long megabytesCopiedPerChunk)
+        throws IOException {
         var stats = new OperationStats(purpose, COPY);
         var copyRequest = Storage.CopyRequest.newBuilder()
             .setSource(sourceBlobId)
@@ -386,5 +397,22 @@ public class MeteredStorage {
             statsCollector.continueWithRunnable(stats, copyWriter::copyChunk);
         }
         statsCollector.collect(stats);
+        // The copy is done, so the writer holds the last answer, and getResult sends no request.
+        final long sourceSize = copyWriter.getBlobSize();
+        final Long targetSize = copyWriter.getResult().getSize();
+        if (targetSize == null || targetSize != sourceSize) {
+            throw new IOException(
+                "The copy of ["
+                    + sourceBlobId
+                    + "] to ["
+                    + targetBlobInfo.getBlobId()
+                    + "] made an object of ["
+                    + targetSize
+                    + "] bytes, but the source is ["
+                    + sourceSize
+                    + "] bytes"
+            );
+        }
+        return sourceSize;
     }
 }
