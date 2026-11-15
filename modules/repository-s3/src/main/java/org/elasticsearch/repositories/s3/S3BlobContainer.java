@@ -84,6 +84,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -456,10 +457,11 @@ class S3BlobContainer extends AbstractBlobContainer {
      * @param blobSize            The size of the source blob in bytes (needed because some object stores use different implementations
      *                            for very large blobs)
      * @param executor            Executor for concurrent part copies, {@code null} means parts are copied serially
+     * @return an empty length, because this copy does not learn the length of the source blob
      * @throws IOException        If the operation fails on the server side
      */
     @Override
-    public void copyBlob(
+    public OptionalLong copyBlob(
         final OperationPurpose purpose,
         final BlobContainer sourceBlobContainer,
         final String sourceBlobName,
@@ -502,6 +504,7 @@ class S3BlobContainer extends AbstractBlobContainer {
             }
             throw new IOException("Unable to copy object [" + blobName + "] from [" + sourceBlobContainer + "][" + sourceBlobName + "]", e);
         }
+        return OptionalLong.empty();
     }
 
     @Override

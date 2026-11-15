@@ -55,6 +55,7 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -501,12 +502,12 @@ public class RepositoryAnalysisSuccessIT extends AbstractSnapshotIntegTestCase {
         }
 
         @Override
-        public void copyBlob(
+        public OptionalLong copyBlob(
             OperationPurpose purpose,
             BlobContainer sourceBlobContainer,
             String sourceBlobName,
             String blobName,
-            long blobSize,
+            long neededEnd,
             @Nullable Executor executor
         ) throws IOException {
             assertPurpose(purpose);
@@ -517,6 +518,7 @@ public class RepositoryAnalysisSuccessIT extends AbstractSnapshotIntegTestCase {
                 throw new FileNotFoundException(sourceBlobName + " not found");
             }
             blobs.put(blobName, sourceBlob);
+            return OptionalLong.of(sourceBlob.length);
         }
 
         @Override

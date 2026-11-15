@@ -14,11 +14,14 @@ import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.blobstore.fs.FsBlobContainer;
 import org.elasticsearch.common.blobstore.fs.FsBlobStore;
 import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.test.ESTestCase;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Path;
+import java.util.OptionalLong;
+import java.util.concurrent.Executor;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.sameInstance;
@@ -41,7 +44,7 @@ public class FilterBlobContainerTests extends ESTestCase {
         source.writeBlob(OperationPurpose.SNAPSHOT_DATA, "commit_blob", new BytesArray(contents), true);
 
         // the snapshot path always passes the innermost container as the source, whatever wraps either side
-        destination.copyBlob(
+        final OptionalLong length = destination.copyBlob(
             OperationPurpose.SNAPSHOT_DATA,
             FilterBlobContainer.unwrap(source),
             "commit_blob",
@@ -50,12 +53,30 @@ public class FilterBlobContainerTests extends ESTestCase {
             null
         );
         assertThat(readAll(destination, "c__copy"), equalTo(contents));
+        // the wrappers pass on the length that the copy of the innermost container returns
+        assertThat(length, equalTo(OptionalLong.of(contents.length)));
 
         // a wrapped destination also accepts a source that is still wrapped, at any depth
         if (destination instanceof FilterBlobContainer) {
             destination.copyBlob(OperationPurpose.SNAPSHOT_DATA, source, "commit_blob", "c__again", contents.length, null);
             assertThat(readAll(destination, "c__again"), equalTo(contents));
         }
+    }
+
+    /**
+     * A wrapper passes on what the copy of the container below it returns, also when that is no length.
+     */
+    public void testCopyBlobPassesOnAnUnknownLength() throws IOException {
+        final BlobContainer source = fsContainer(createTempDir());
+        final BlobContainer destination = wrap(new HidingLengthOfCopies(fsContainer(createTempDir())), between(1, 2));
+        final byte[] contents = randomByteArrayOfLength(between(1, 4096));
+        source.writeBlob(OperationPurpose.SNAPSHOT_DATA, "commit_blob", new BytesArray(contents), true);
+
+        assertThat(
+            destination.copyBlob(OperationPurpose.SNAPSHOT_DATA, source, "commit_blob", "c__copy", contents.length, null),
+            equalTo(OptionalLong.empty())
+        );
+        assertThat(readAll(destination, "c__copy"), equalTo(contents));
     }
 
     private static FsBlobContainer fsContainer(Path path) throws IOException {
@@ -72,6 +93,33 @@ public class FilterBlobContainerTests extends ESTestCase {
     private static byte[] readAll(BlobContainer container, String blobName) throws IOException {
         try (InputStream in = container.readBlob(OperationPurpose.SNAPSHOT_DATA, blobName)) {
             return in.readAllBytes();
+        }
+    }
+
+    /**
+     * A container whose copy works but returns no length.
+     */
+    private static final class HidingLengthOfCopies extends FilterBlobContainer {
+        HidingLengthOfCopies(BlobContainer delegate) {
+            super(delegate);
+        }
+
+        @Override
+        public OptionalLong copyBlob(
+            OperationPurpose purpose,
+            BlobContainer sourceBlobContainer,
+            String sourceBlobName,
+            String blobName,
+            long neededEnd,
+            @Nullable Executor executor
+        ) throws IOException {
+            super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor);
+            return OptionalLong.empty();
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new HidingLengthOfCopies(child);
         }
     }
 

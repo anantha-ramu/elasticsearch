@@ -64,6 +64,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -357,12 +358,12 @@ public class FsBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
-    public void copyBlob(
+    public OptionalLong copyBlob(
         OperationPurpose purpose,
         BlobContainer sourceBlobContainer,
         String sourceBlobName,
         String blobName,
-        long blobSize,
+        long neededEnd,
         @Nullable Executor executor
     ) throws IOException {
         if (sourceBlobContainer instanceof FsBlobContainer == false) {
@@ -370,6 +371,9 @@ public class FsBlobContainer extends AbstractBlobContainer {
         }
         final FsBlobContainer sourceContainer = (FsBlobContainer) sourceBlobContainer;
         final Path sourceBlobPath = sourceContainer.path.resolve(sourceBlobName);
+        // The file system gives the length of the source without a request, so a source that is too short fails before any byte is copied
+        final long sourceLength = Files.size(sourceBlobPath);
+        BlobContainerUtils.ensureCopySourceLongEnough(sourceBlobName, blobName, sourceLength, neededEnd);
         final String tempBlob = tempBlobName(blobName);
         final Path tempBlobPath = path.resolve(tempBlob);
         Files.copy(sourceBlobPath, tempBlobPath, StandardCopyOption.REPLACE_EXISTING);
@@ -383,6 +387,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
             }
             throw ex;
         }
+        return OptionalLong.of(sourceLength);
     }
 
     private static void writeToPath(BytesReference bytes, Path tempBlobPath) throws IOException {

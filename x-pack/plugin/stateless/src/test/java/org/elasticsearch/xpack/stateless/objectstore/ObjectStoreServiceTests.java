@@ -109,6 +109,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -1023,12 +1024,12 @@ public class ObjectStoreServiceTests extends ESTestCase {
                     }
 
                     @Override
-                    public void copyBlob(
+                    public OptionalLong copyBlob(
                         OperationPurpose purpose,
                         BlobContainer sourceBlobContainer,
                         String sourceBlobName,
                         String blobName,
-                        long blobSize,
+                        long neededEnd,
                         @Nullable Executor executor
                     ) throws IOException {
                         blobCopyCount.updateAndGet(count -> {
@@ -1039,6 +1040,7 @@ public class ObjectStoreServiceTests extends ESTestCase {
                             }
                             return count;
                         });
+                        return OptionalLong.empty();
                     }
                 };
             }
@@ -1102,12 +1104,12 @@ public class ObjectStoreServiceTests extends ESTestCase {
                     }
 
                     @Override
-                    public void copyBlob(
+                    public OptionalLong copyBlob(
                         OperationPurpose purpose,
                         BlobContainer sourceBlobContainer,
                         String sourceBlobName,
                         String blobName,
-                        long blobSize,
+                        long neededEnd,
                         @Nullable Executor executor
                     ) throws IOException {
                         // always fail last blob
@@ -1118,7 +1120,7 @@ public class ObjectStoreServiceTests extends ESTestCase {
                                 throw new RuntimeException("Fail copy");
                             }
                         }
-                        innerContainer.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
+                        return innerContainer.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor);
                     }
                 };
             }

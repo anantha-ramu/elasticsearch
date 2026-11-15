@@ -168,7 +168,7 @@ public class StatelessMockRepositoryStrategy {
         BlobContainer sourceBlobContainer,
         String sourceBlobName,
         String blobName,
-        long blobSize
+        long neededEnd
     ) throws IOException {
         originalRunnable.run();
     }

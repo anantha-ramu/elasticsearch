@@ -93,6 +93,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -535,19 +536,19 @@ public class StatelessCommitServiceTests extends ESTestCase {
                     }
 
                     @Override
-                    public void copyBlob(
+                    public OptionalLong copyBlob(
                         OperationPurpose purpose,
                         BlobContainer sourceBlobContainer,
                         String sourceBlobName,
                         String blobName,
-                        long blobSize,
+                        long neededEnd,
                         @Nullable Executor executor
                     ) throws IOException {
                         int attempt = copyAttempts.incrementAndGet();
                         if (attempt <= failuresBeforeSuccess) {
                             throw new IOException("simulated copy failure (attempt " + attempt + ")");
                         }
-                        super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
+                        return super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor);
                     }
                 }
                 return new WrappedContainer(innerContainer);
@@ -596,18 +597,26 @@ public class StatelessCommitServiceTests extends ESTestCase {
                     }
 
                     @Override
-                    public void copyBlob(
+                    public OptionalLong copyBlob(
                         OperationPurpose purpose,
                         BlobContainer sourceBlobContainer,
                         String sourceBlobName,
                         String blobName,
-                        long blobSize,
+                        long neededEnd,
                         @Nullable Executor executor
                     ) throws IOException {
                         copyRunning.countDown();
                         safeAwait(copyCanProceed);
-                        super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
+                        final OptionalLong length = super.copyBlob(
+                            purpose,
+                            sourceBlobContainer,
+                            sourceBlobName,
+                            blobName,
+                            neededEnd,
+                            executor
+                        );
                         copySucceeded.set(true);
+                        return length;
                     }
                 }
                 return new WrappedContainer(innerContainer);
@@ -4264,24 +4273,24 @@ public class StatelessCommitServiceTests extends ESTestCase {
                 }
 
                 @Override
-                public void copyBlob(
+                public OptionalLong copyBlob(
                     OperationPurpose purpose,
                     BlobContainer sourceBlobContainer,
                     String sourceBlobName,
                     String blobName,
-                    long blobSize,
+                    long neededEnd,
                     @Nullable Executor executor
                 ) throws IOException {
                     if (blobName.equals(copyBlockedNameRef.get())) {
                         copyStartedLatch.countDown();
                         try {
                             safeAwait(copyBlocker);
-                            super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
+                            return super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor);
                         } finally {
                             copyFinishedLatch.countDown();
                         }
                     } else {
-                        super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
+                        return super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor);
                     }
                 }
             }

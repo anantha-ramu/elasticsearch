@@ -81,6 +81,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1390,21 +1391,22 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         }
 
         @Override
-        public void copyBlob(
+        public OptionalLong copyBlob(
             OperationPurpose purpose,
             BlobContainer sourceBlobContainer,
             String sourceBlobName,
             String blobName,
-            long blobSize,
+            long neededEnd,
             @Nullable Executor executor
         ) throws IOException {
-            super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
+            final OptionalLong length = super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor);
             if (dropCopy) {
                 deleteBlobsIgnoringIfNotExists(purpose, Iterators.single(blobName));
             } else {
                 final byte[] copy = readAll(this, blobName);
                 writeBlob(purpose, blobName, new BytesArray(copy, 0, copy.length - 1), false);
             }
+            return length;
         }
 
         @Override
@@ -1474,16 +1476,17 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         }
 
         @Override
-        public void copyBlob(
+        public OptionalLong copyBlob(
             OperationPurpose purpose,
             BlobContainer sourceBlobContainer,
             String sourceBlobName,
             String blobName,
-            long blobSize,
+            long neededEnd,
             @Nullable Executor executor
         ) throws IOException {
-            super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor);
+            final OptionalLong length = super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor);
             status.get().pauseIfNotCompleted(notifyOnPaused -> notifyOnPaused.onResponse(() -> {}));
+            return length;
         }
 
         @Override

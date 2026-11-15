@@ -66,6 +66,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -1121,12 +1122,12 @@ public class RepositoryAnalysisFailureIT extends AbstractSnapshotIntegTestCase {
         }
 
         @Override
-        public void copyBlob(
+        public OptionalLong copyBlob(
             OperationPurpose purpose,
             BlobContainer sourceBlobContainer,
             String sourceBlobName,
             String blobName,
-            long blobSize,
+            long neededEnd,
             @Nullable Executor executor
         ) throws IOException {
             assertThat(sourceBlobContainer, instanceOf(DisruptableBlobContainer.class));
@@ -1138,6 +1139,7 @@ public class RepositoryAnalysisFailureIT extends AbstractSnapshotIntegTestCase {
             }
             disruption.onCopy();
             blobs.put(blobName, sourceBlob);
+            return OptionalLong.of(sourceBlob.length);
         }
 
         @Override

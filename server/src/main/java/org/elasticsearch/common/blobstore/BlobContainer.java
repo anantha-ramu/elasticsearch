@@ -23,6 +23,7 @@ import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.NoSuchFileException;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.Executor;
 
 /**
@@ -235,24 +236,38 @@ public interface BlobContainer {
      * It may be unavailable either because the blob container has no copy implementation
      * or because the target blob container is not on the same store as the source.
      * If the destination blob already exists, this operation will overwrite it.
+     * <p>
+     * The copy always holds the whole source blob. The caller does not need to know how long the source blob is. The caller gives
+     * {@code neededEnd}, the offset just after the last byte that the caller needs from the source blob, and the source must be at least
+     * that long. If the source is shorter, the copy is missing bytes that the caller relies on, and no cloud store reports that by
+     * itself. So the method throws an {@link IOException} when it learns that the source is shorter. Where an implementation learns the
+     * length before the copy, it throws before it copies anything. Where it learns the length only from the answer to the copy, the
+     * target already exists when the method fails because the source is short. The method does not delete the target. A caller that must
+     * not leave it behind has to delete it, as a snapshot does for its copies.
+     * <p>
+     * An implementation returns the exact length of the source blob only if it learned the length without a request that the copy did
+     * not need anyway. The caller can use the length for its stats, and the caller must not rely on getting a length.
      *
      * @param purpose             The purpose of the operation
-     * @param sourceBlobContainer The blob container to copy the blob into
+     * @param sourceBlobContainer The blob container to copy the blob from
      * @param sourceBlobName      The name of the blob to copy from
      * @param blobName            The name of the blob to copy to
-     * @param blobSize            The size of the source blob in bytes (needed because some object stores use different implementations
-     *                            for very large blobs)
+     * @param neededEnd           The offset just after the last byte that the caller needs from the source blob. The value is a lower
+     *                            bound for the length of the source blob, not its length. The source can be longer, and the copy has
+     *                            all of it. Some object stores copy a very large blob in another way, so they also use this value to
+     *                            choose how to copy.
      * @param executor            Executor for concurrent part copies, {@code null} means parts are copied serially
      *                            Currently only used by S3, Azure, GCS, and Fs ignore this
+     * @return the exact length of the source blob in bytes, or empty if the implementation did not learn it
      * @throws NoSuchFileException If the source blob does not exist
-     * @throws IOException        If the operation generates an IO error
+     * @throws IOException        If the operation generates an IO error, or if the source blob is shorter than {@code neededEnd}
      */
-    default void copyBlob(
+    default OptionalLong copyBlob(
         OperationPurpose purpose,
         BlobContainer sourceBlobContainer,
         String sourceBlobName,
         String blobName,
-        long blobSize,
+        long neededEnd,
         @Nullable Executor executor
     ) throws IOException {
         throw new UnsupportedOperationException("this blob container does not support copy");

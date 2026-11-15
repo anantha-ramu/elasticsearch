@@ -33,6 +33,7 @@ import java.io.OutputStream;
 import java.nio.file.NoSuchFileException;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.Executor;
 
 class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
@@ -139,7 +140,7 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
-    public void copyBlob(
+    public OptionalLong copyBlob(
         final OperationPurpose purpose,
         final BlobContainer sourceBlobContainer,
         final String sourceBlobName,
@@ -164,6 +165,7 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
             }
             throw new IOException("Unable to copy object [" + blobName + "] from [" + sourceBlobContainer + "][" + sourceBlobName + "]", e);
         }
+        return OptionalLong.empty();
     }
 
     @Override

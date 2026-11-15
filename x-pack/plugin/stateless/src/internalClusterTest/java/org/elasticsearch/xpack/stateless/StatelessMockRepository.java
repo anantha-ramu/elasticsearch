@@ -37,7 +37,9 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * A mock repository for stateless testing. It supports manipulating calls to the blob store: logic can be injected, via a
@@ -225,22 +227,26 @@ public class StatelessMockRepository extends FsRepository {
             }
 
             @Override
-            public void copyBlob(
+            public OptionalLong copyBlob(
                 OperationPurpose purpose,
                 BlobContainer sourceBlobContainer,
                 String sourceBlobName,
                 String blobName,
-                long blobSize,
+                long neededEnd,
                 @Nullable Executor executor
             ) throws IOException {
+                // The strategy hook takes a runnable, so the length goes through a reference. A strategy that does not run the copy
+                // leaves it without a length.
+                final var length = new AtomicReference<>(OptionalLong.empty());
                 getStrategy().blobContainerCopyBlob(
-                    () -> super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, blobSize, executor),
+                    () -> length.set(super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor)),
                     purpose,
                     sourceBlobContainer,
                     sourceBlobName,
                     blobName,
-                    blobSize
+                    neededEnd
                 );
+                return length.get();
             }
 
             @Override

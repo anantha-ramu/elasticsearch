@@ -59,4 +59,25 @@ public class BlobContainerUtils {
         return new BytesArray(bytes, 0, pos);
     }
 
+    /**
+     * Fails a copy whose source blob is shorter than the caller needs, see {@link BlobContainer#copyBlob}. A blob container that learns
+     * the length of the source calls this method with that length, so that all the blob containers report the failure in the same way.
+     *
+     * @throws IOException if {@code sourceLength} is less than {@code neededEnd}
+     */
+    public static void ensureCopySourceLongEnough(String sourceBlobName, String blobName, long sourceLength, long neededEnd)
+        throws IOException {
+        if (sourceLength < neededEnd) {
+            throw new IOException(
+                Strings.format(
+                    "Cannot copy blob [%s] to [%s]: the source is [%d] bytes long, but the caller needs [%d] bytes of it",
+                    sourceBlobName,
+                    blobName,
+                    sourceLength,
+                    neededEnd
+                )
+            );
+        }
+    }
+
 }

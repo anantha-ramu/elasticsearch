@@ -25,6 +25,7 @@ import java.io.OutputStream;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
 
@@ -138,17 +139,17 @@ public abstract class FilterBlobContainer implements BlobContainer {
     }
 
     @Override
-    public void copyBlob(
+    public OptionalLong copyBlob(
         OperationPurpose purpose,
         BlobContainer sourceBlobContainer,
         String sourceBlobName,
         String blobName,
-        long blobSize,
+        long neededEnd,
         @Nullable Executor executor
     ) throws IOException {
         // The innermost container's copyBlob accepts only its own repository type's container as the source, so pass the innermost
         // container of the source too. The source may be wrapped differently from this container, or not at all.
-        delegate.copyBlob(purpose, unwrap(sourceBlobContainer), sourceBlobName, blobName, blobSize, executor);
+        return delegate.copyBlob(purpose, unwrap(sourceBlobContainer), sourceBlobName, blobName, neededEnd, executor);
     }
 
     @Override

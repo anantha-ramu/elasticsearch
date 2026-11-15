@@ -37,6 +37,7 @@ import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileSystem;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -44,6 +45,7 @@ import java.nio.file.attribute.FileAttribute;
 import java.nio.file.spi.FileSystemProvider;
 import java.util.List;
 import java.util.Locale;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -56,6 +58,7 @@ import static org.elasticsearch.common.io.Streams.readFully;
 import static org.elasticsearch.repositories.blobstore.BlobStoreTestUtil.randomNonDataPurpose;
 import static org.elasticsearch.repositories.blobstore.BlobStoreTestUtil.randomPurpose;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
@@ -458,12 +461,58 @@ public class FsBlobContainerTests extends ESTestCase {
         final var blobName = randomAlphaOfLengthBetween(1, 20).toLowerCase(Locale.ROOT);
         final var contents = new BytesArray(randomByteArrayOfLength(randomIntBetween(1, 512)));
         sourceContainer.writeBlob(randomPurpose(), sourceBlobName, contents, true);
-        destinationContainer.copyBlob(randomPurpose(), sourceContainer, sourceBlobName, blobName, contents.length(), null);
+        // the copy holds the whole source, also if the caller needs only the start of it
+        final long neededEnd = randomLongBetween(1, contents.length());
+        final var length = destinationContainer.copyBlob(randomPurpose(), sourceContainer, sourceBlobName, blobName, neededEnd, null);
 
         var sourceContents = Streams.readFully(sourceContainer.readBlob(randomPurpose(), sourceBlobName));
         var targetContents = Streams.readFully(destinationContainer.readBlob(randomPurpose(), blobName));
         assertThat(targetContents, equalBytes(sourceContents));
         assertThat(targetContents, equalBytes(contents));
+        // the file system knows the length of the source for free
+        assertThat(length, equalTo(OptionalLong.of(contents.length())));
+    }
+
+    /**
+     * A source that is shorter than the end that the caller needs fails the copy before it copies a byte, so the destination has no blob
+     * and no temporary blob.
+     */
+    public void testCopyOfASourceThatIsTooShortFailsBeforeCopying() throws Exception {
+        restoreFileSystem(); // see testCopy
+        final var path = PathUtils.get(createTempDir().toString());
+        final var store = new FsBlobStore(randomIntBetween(1, 8) * 1024, path, false);
+        final var sourceContainer = store.blobContainer(BlobPath.EMPTY.add("source"));
+        final var destinationContainer = store.blobContainer(BlobPath.EMPTY.add("destination"));
+
+        final var sourceBlobName = randomAlphaOfLengthBetween(1, 20).toLowerCase(Locale.ROOT);
+        final var blobName = randomAlphaOfLengthBetween(1, 20).toLowerCase(Locale.ROOT);
+        final var contents = new BytesArray(randomByteArrayOfLength(randomIntBetween(1, 512)));
+        sourceContainer.writeBlob(randomPurpose(), sourceBlobName, contents, true);
+
+        final long neededEnd = contents.length() + randomLongBetween(1, 100);
+        final IOException e = expectThrows(
+            IOException.class,
+            () -> destinationContainer.copyBlob(randomPurpose(), sourceContainer, sourceBlobName, blobName, neededEnd, null)
+        );
+        assertThat(
+            e.getMessage(),
+            containsString("the source is [" + contents.length() + "] bytes long, but the caller needs [" + neededEnd)
+        );
+        assertThat(destinationContainer.listBlobs(randomPurpose()).keySet(), empty());
+    }
+
+    public void testCopyOfAMissingSourceFailsWithNoSuchFile() throws Exception {
+        restoreFileSystem(); // see testCopy
+        final var path = PathUtils.get(createTempDir().toString());
+        final var store = new FsBlobStore(randomIntBetween(1, 8) * 1024, path, false);
+        final var sourceContainer = store.blobContainer(BlobPath.EMPTY.add("source"));
+        final var destinationContainer = store.blobContainer(BlobPath.EMPTY.add("destination"));
+
+        expectThrows(
+            NoSuchFileException.class,
+            () -> destinationContainer.copyBlob(randomPurpose(), sourceContainer, randomIdentifier(), randomIdentifier(), 1L, null)
+        );
+        assertThat(destinationContainer.listBlobs(randomPurpose()).keySet(), empty());
     }
 
     static class MockFileSystemProvider extends FilterFileSystemProvider {

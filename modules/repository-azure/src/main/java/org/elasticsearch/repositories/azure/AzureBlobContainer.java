@@ -30,6 +30,7 @@ import java.io.OutputStream;
 import java.nio.file.NoSuchFileException;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.concurrent.Executor;
 
 public class AzureBlobContainer extends AbstractBlobContainer {
@@ -138,7 +139,7 @@ public class AzureBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
-    public void copyBlob(
+    public OptionalLong copyBlob(
         OperationPurpose purpose,
         BlobContainer sourceBlobContainer,
         String sourceBlobName,
@@ -159,6 +160,7 @@ public class AzureBlobContainer extends AbstractBlobContainer {
             buildKey(blobName),
             blobSize
         );
+        return OptionalLong.empty();
     }
 
     @Override
