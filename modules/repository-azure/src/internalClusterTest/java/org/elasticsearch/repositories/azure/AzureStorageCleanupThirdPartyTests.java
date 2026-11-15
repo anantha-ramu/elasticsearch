@@ -18,7 +18,11 @@ import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.BlobServiceClient;
 import com.azure.storage.blob.models.AccessTier;
 import com.azure.storage.blob.models.BlobProperties;
+import com.azure.storage.blob.models.BlobRange;
 import com.azure.storage.blob.models.BlobStorageException;
+import com.azure.storage.blob.sas.BlobSasPermission;
+import com.azure.storage.blob.sas.BlobServiceSasSignatureValues;
+import com.azure.storage.blob.specialized.BlockBlobClient;
 import com.carrotsearch.randomizedtesting.annotations.TimeoutSuite;
 
 import org.apache.lucene.tests.util.TimeUnits;
@@ -55,10 +59,14 @@ import java.net.HttpURLConnection;
 import java.nio.channels.Channels;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.zip.CRC32;
 import java.util.zip.CheckedInputStream;
 import java.util.zip.CheckedOutputStream;
@@ -66,8 +74,10 @@ import java.util.zip.CheckedOutputStream;
 import static org.elasticsearch.common.bytes.BytesReferenceTestUtils.equalBytes;
 import static org.elasticsearch.common.io.Streams.limitStream;
 import static org.elasticsearch.repositories.blobstore.BlobStoreTestUtil.randomPurpose;
+import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.blankOrNullString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.not;
@@ -270,7 +280,7 @@ public class AzureStorageCleanupThirdPartyTests extends AbstractThirdPartyReposi
         assertBusy(() -> assertTrue(sourceBlobContainer.blobExists(randomPurpose(), sourceBlobName)));
 
         final var destinationBlobContainer = repository.blobStore().blobContainer(repository.basePath().add("target"));
-        destinationBlobContainer.copyBlob(
+        final var length = destinationBlobContainer.copyBlob(
             randomPurpose(),
             sourceBlobContainer,
             sourceBlobName,
@@ -279,6 +289,8 @@ public class AzureStorageCleanupThirdPartyTests extends AbstractThirdPartyReposi
             null
         );
         assertThat(Streams.readFully(destinationBlobContainer.readBlob(randomPurpose(), destinationBlobName)), equalBytes(blobBytes));
+        // both containers are in one storage account, so Copy Blob copies the whole blob, and the copy does not learn its length
+        assertThat(length, equalTo(OptionalLong.empty()));
 
         sourceBlobContainer.delete(randomPurpose());
         assertThrows(
@@ -293,6 +305,81 @@ public class AzureStorageCleanupThirdPartyTests extends AbstractThirdPartyReposi
             )
         );
         destinationBlobContainer.delete(randomPurpose());
+    }
+
+    /**
+     * Probes an assumption of the TLA+ model of the copies: that Azure refuses a Put Block From URL request whose source range ends
+     * after the last byte of the source blob, and does not copy the part that the source has. TLA+ is a language for describing a design
+     * so that a tool can check every order of its steps, and the model is not part of this repository. The copy code does not depend on
+     * the assumption. A copy of a blob between two storage accounts stages its blocks with such requests, but it asks Azure for the
+     * length of the source first and never asks for a range past the end, see {@link AzureBlobStore#copyBlob}. Azure does not document
+     * what it does with such a range, and the in-JVM fixture cannot show it: it clamps the range, as it does for Get Blob, unless a test
+     * asks it to be strict. So the test needs a real storage account, and it is skipped with the fixture.
+     * <p>
+     * The test sends the requests with the SDK client, and not through {@link AzureBlobStore#copyBlob}, because that method copies
+     * inside one storage account with Copy Blob, and the test account is only one. The source of the request is the URL of the source
+     * blob with a SAS token, which Azure needs to read a source. The test uses the token of its settings, or makes one from the account
+     * key. If the test fails because Azure copies the part of the range that the source has, the assumption of the model is wrong, and
+     * the model needs another look. The copy code is not wrong then: its check of the length of the source is what keeps it from asking
+     * for such a range.
+     */
+    public void testPutBlockFromUrlWithARangePastTheEndOfTheSourceFails() throws Exception {
+        assumeFalse("only a real Azure account shows what Azure does, the fixture clamps the range", USE_FIXTURE);
+        final var repository = getRepository();
+        final var blobStore = asInstanceOf(AzureBlobStore.class, repository.blobStore());
+        final var blobContainer = blobStore.blobContainer(repository.basePath().add("range_past_the_end"));
+        final String keyPrefix = repository.basePath().add("range_past_the_end").buildAsString();
+        final var sourceName = randomIdentifier();
+        final var sourceBytes = randomBytesReference(between(100, 2_000));
+        blobContainer.writeBlob(randomPurpose(), sourceName, sourceBytes, true);
+        try (
+            var azureClient = blobStore.getService()
+                .client(ProjectId.DEFAULT, "default", LocationMode.PRIMARY_ONLY, OperationPurpose.SNAPSHOT_DATA)
+        ) {
+            final BlobContainerClient containerClient = azureClient.getSyncClient().getBlobContainerClient(blobStore.toString());
+            final BlobClient sourceClient = containerClient.getBlobClient(keyPrefix + sourceName);
+            assertThat(sourceClient.getProperties().getBlobSize(), equalTo((long) sourceBytes.length()));
+            final String sasToken = System.getProperty("test.azure.sas_token");
+            final String sourceUrl = sourceClient.getBlobUrl()
+                + "?"
+                + (Strings.hasText(sasToken)
+                    ? sasToken.startsWith("?") ? sasToken.substring(1) : sasToken
+                    : sourceClient.generateSas(
+                        new BlobServiceSasSignatureValues(OffsetDateTime.now(ZoneOffset.UTC).plusMinutes(30), BlobSasPermission.parse("r"))
+                    ));
+            final BlockBlobClient targetClient = containerClient.getBlobClient(keyPrefix + randomIdentifier()).getBlockBlobClient();
+            final long length = sourceBytes.length();
+
+            // a range that ends at the last byte of the source works
+            targetClient.stageBlockFromUrl(newBlockId(), sourceUrl, new BlobRange(0, length));
+
+            // a range that ends after the last byte of the source, and a range that starts after it, must fail
+            for (BlobRange range : List.of(new BlobRange(0, length + between(1, 1_000)), new BlobRange(length, (long) between(1, 1_000)))) {
+                final var e = expectThrows(
+                    BlobStorageException.class,
+                    "range [" + range + "] of a source of [" + length + "] bytes",
+                    () -> targetClient.stageBlockFromUrl(newBlockId(), sourceUrl, range)
+                );
+                logger.info(
+                    "--> Azure answered [{}] [{}] to the range [{}] of a source of [{}] bytes",
+                    e.getStatusCode(),
+                    e.getErrorCode(),
+                    range,
+                    length
+                );
+                assertThat(e.getStatusCode(), allOf(greaterThanOrEqualTo(400), lessThan(500)));
+            }
+        } finally {
+            blobContainer.delete(randomPurpose());
+        }
+    }
+
+    /**
+     * A block id for a Put Block or a Put Block From URL request. All the blocks of a blob need ids of the same length, and these have 22
+     * characters.
+     */
+    private static String newBlockId() {
+        return Base64.getEncoder().withoutPadding().encodeToString(Base64.getUrlDecoder().decode(UUIDs.base64UUID()));
     }
 
     /**

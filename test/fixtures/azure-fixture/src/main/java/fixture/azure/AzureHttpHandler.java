@@ -70,6 +70,7 @@ public class AzureHttpHandler implements HttpHandler {
     private final String container;
     private final Predicate<String> authHeaderPredicate;
     private final MockAzureBlobStore mockAzureBlobStore;
+    private volatile boolean strictSourceRanges = false;
 
     public AzureHttpHandler(
         final String account,
@@ -81,6 +82,17 @@ public class AzureHttpHandler implements HttpHandler {
         this.container = Objects.requireNonNull(container);
         this.authHeaderPredicate = authHeaderPredicate;
         this.mockAzureBlobStore = new MockAzureBlobStore(leaseExpiryPredicate);
+    }
+
+    /**
+     * Makes the handler refuse a Put Block From URL request whose {@code x-ms-source-range} ends after the last byte of the source blob,
+     * with the status 416 and the error code InvalidRange. By default, the handler answers such a request with the part of the range
+     * that the source has, as it does for Get Blob. Azure does not document what Put Block From URL does with a range that ends after
+     * the source, and the fixture cannot show what Azure does. A test that turns on strict ranges shows that the code under test never
+     * asks for a range past the end, which Azure may refuse.
+     */
+    public void setStrictSourceRanges(boolean strictSourceRanges) {
+        this.strictSourceRanges = strictSourceRanges;
     }
 
     private static List<String> getAuthHeader(HttpExchange exchange) {
@@ -566,7 +578,8 @@ public class AzureHttpHandler implements HttpHandler {
      * an assertion. The fixture does not check the query of the source URL, which is where a SAS token goes.
      * <p>
      * If the source blob does not exist, this method sends a 404 error and returns null, and the caller must stop handling the request. A
-     * bad range is thrown as an error, and the catch block of the handler sends it.
+     * bad range is thrown as an error, and the catch block of the handler sends it. A range that ends after the source is a bad range
+     * only with {@link #setStrictSourceRanges}. Otherwise the method clamps it to the end of the source.
      */
     @Nullable
     private BytesReference readSourceRange(HttpExchange exchange, String copySourceUrl) throws IOException {
@@ -598,6 +611,13 @@ public class AzureHttpHandler implements HttpHandler {
             throw new MockAzureBlobStore.BadRequestException(
                 "InvalidHeaderValue",
                 "Source range header does not match expected format: " + sourceRange
+            );
+        }
+        if (strictSourceRanges && range.end() != null && range.end() >= contents.length()) {
+            throw new MockAzureBlobStore.AzureBlobStoreError(
+                RestStatus.REQUESTED_RANGE_NOT_SATISFIED,
+                "InvalidRange",
+                "The range specified is invalid for the current size of the resource."
             );
         }
         final HttpHeaderParser.ResolvedRange resolved = range.resolveAgainst(contents.length());

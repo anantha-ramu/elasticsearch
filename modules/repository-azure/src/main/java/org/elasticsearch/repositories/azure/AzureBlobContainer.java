@@ -144,7 +144,7 @@ public class AzureBlobContainer extends AbstractBlobContainer {
         BlobContainer sourceBlobContainer,
         String sourceBlobName,
         String blobName,
-        long blobSize,
+        long neededEnd,
         @Nullable Executor executor
     ) throws IOException {
         assert BlobContainer.assertPurposeConsistency(purpose, sourceBlobName);
@@ -153,14 +153,13 @@ public class AzureBlobContainer extends AbstractBlobContainer {
             throw new IllegalArgumentException("source blob container must be a AzureBlobContainer");
         }
         AzureBlobContainer azureSourceBlobContainer = (AzureBlobContainer) sourceBlobContainer;
-        blobStore.copyBlob(
+        return blobStore.copyBlob(
             purpose,
             azureSourceBlobContainer.buildKey(sourceBlobName),
             azureSourceBlobContainer.blobStore,
             buildKey(blobName),
-            blobSize
+            neededEnd
         );
-        return OptionalLong.empty();
     }
 
     @Override

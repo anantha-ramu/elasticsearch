@@ -12,6 +12,9 @@ package org.elasticsearch.repositories.azure;
 import fixture.azure.AzureHttpHandler;
 import fixture.azure.MockAzureBlobStore;
 
+import com.azure.storage.blob.models.BlobRange;
+import com.azure.storage.blob.models.BlobStorageException;
+import com.azure.storage.blob.specialized.BlockBlobClient;
 import com.azure.storage.common.policy.RequestRetryOptions;
 import com.azure.storage.common.policy.RetryPolicyType;
 import com.sun.net.httpserver.HttpExchange;
@@ -21,6 +24,7 @@ import org.elasticsearch.cluster.metadata.ProjectId;
 import org.elasticsearch.cluster.metadata.RepositoryMetadata;
 import org.elasticsearch.cluster.project.TestProjectResolvers;
 import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.blobstore.BlobPath;
 import org.elasticsearch.common.blobstore.BlobStoreActionStats;
 import org.elasticsearch.common.blobstore.OperationPurpose;
@@ -50,11 +54,15 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.NoSuchFileException;
 import java.time.Duration;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -89,7 +97,9 @@ import static org.hamcrest.Matchers.not;
  * Copy Blob.
  * <p>
  * A copy between two accounts is split into byte ranges of the source blob. Azure copies each range into a block of the new blob (a Put
- * Block From URL request). One Put Block List request then commits the blocks, that is, joins them into the new blob.
+ * Block From URL request). One Put Block List request then commits the blocks, that is, joins them into the new blob. The ranges need the
+ * exact length of the source blob, so the copy first asks the source store for it with a HEAD request, and fails if the source is shorter
+ * than the caller needs.
  * <p>
  * The fixture serves only one account, so the test builds two clients with different endpoints. One client reaches the fixture at {@code
  * localhost} and the other at the numeric loopback address. {@code AzureBlobStore} compares only the endpoints of the two clients, so it
@@ -137,7 +147,11 @@ public class AzureBlobContainerCopyTests extends ESTestCase {
     /**
      * A request that reached the fixture.
      */
-    private record LoggedRequest(String method, String query, String copySource, String sourceRange) {
+    private record LoggedRequest(String method, String path, String query, String copySource, String sourceRange) {
+
+        boolean isHeadOf(String blobName) {
+            return "HEAD".equals(method) && path.equals("/" + ACCOUNT + "/" + CONTAINER + "/" + blobName);
+        }
 
         boolean isPutBlockFromUrl() {
             return "PUT".equals(method) && query.contains("comp=block&") && query.contains("blockid=") && copySource != null;
@@ -187,6 +201,7 @@ public class AzureBlobContainerCopyTests extends ESTestCase {
             final String query = exchange.getRequestURI().getRawQuery();
             final LoggedRequest request = new LoggedRequest(
                 exchange.getRequestMethod(),
+                exchange.getRequestURI().getPath(),
                 query == null ? "" : query,
                 exchange.getRequestHeaders().getFirst("x-ms-copy-source"),
                 exchange.getRequestHeaders().getFirst("x-ms-source-range")
@@ -245,7 +260,17 @@ public class AzureBlobContainerCopyTests extends ESTestCase {
     }
 
     private AzureBlobContainer buildContainer(String host, String sasToken, long blockSize, int maxConcurrentBlocks, int maxRetries) {
-        final String clientName = randomIdentifier();
+        return buildContainer(randomIdentifier(), host, sasToken, blockSize, maxConcurrentBlocks, maxRetries);
+    }
+
+    private AzureBlobContainer buildContainer(
+        String clientName,
+        String host,
+        String sasToken,
+        long blockSize,
+        int maxConcurrentBlocks,
+        int maxRetries
+    ) {
         final MockSecureSettings secureSettings = new MockSecureSettings();
         secureSettings.setString(ACCOUNT_SETTING.getConcreteSettingForNamespace(clientName).getKey(), ACCOUNT);
         if (sasToken != null) {
@@ -352,8 +377,12 @@ public class AzureBlobContainerCopyTests extends ESTestCase {
         final byte[] data = randomByteArrayOfLength(Math.toIntExact(blobSize));
         writeSource(containers, sourceName, data);
 
-        containers.destination().copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), sourceName, destinationName, blobSize, null);
+        // The copy holds the whole source blob, also if the caller needs only the start of it. It learns the length from a HEAD request.
+        final long neededEnd = randomLongBetween(1, blobSize);
+        final OptionalLong length = containers.destination()
+            .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), sourceName, destinationName, neededEnd, null);
 
+        assertThat(length, equalTo(OptionalLong.of(blobSize)));
         assertArrayEquals(data, destinationBytes(destinationName));
         final List<String> expectedRanges = expectedRanges(blobSize, blockSize);
         final List<LoggedRequest> staging = requests(LoggedRequest::isPutBlockFromUrl);
@@ -368,6 +397,8 @@ public class AzureBlobContainerCopyTests extends ESTestCase {
         assertThat(requests(LoggedRequest::isCopyBlob), empty());
         assertThat(requests(LoggedRequest::isPutBlock), empty());
         assertThat(putBlockFromUrlMaxInFlight.get(), lessThanOrEqualTo(maxConcurrentBlocks));
+        // one HEAD request asked for the length of the source, and no request asked for anything else about it
+        assertThat(requests(request -> request.isHeadOf(sourceName)), hasSize(1));
 
         // The stats count the copy as Put Block From URL operations and one Put Block List operation, not as Put Block or Copy Blob.
         final Map<String, BlobStoreActionStats> stats = containers.destination().getBlobStore().stats();
@@ -375,6 +406,13 @@ public class AzureBlobContainerCopyTests extends ESTestCase {
         assertThat(stats.get(AzureBlobStore.Operation.PUT_BLOCK_LIST.getKey()).operations(), equalTo(1L));
         assertThat(stats.get(AzureBlobStore.Operation.PUT_BLOCK.getKey()).operations(), equalTo(0L));
         assertThat(stats.get(AzureBlobStore.Operation.COPY_BLOB.getKey()).operations(), equalTo(0L));
+        // The HEAD request went through the client of the source store, so the stats of the source store count it, and the stats of the
+        // destination store do not.
+        assertThat(
+            containers.source().getBlobStore().stats().get(AzureBlobStore.Operation.GET_BLOB_PROPERTIES.getKey()).operations(),
+            equalTo(1L)
+        );
+        assertThat(stats.get(AzureBlobStore.Operation.GET_BLOB_PROPERTIES.getKey()).operations(), equalTo(0L));
     }
 
     public void testCopyInSeveralBlocks() throws IOException {
@@ -486,12 +524,13 @@ public class AzureBlobContainerCopyTests extends ESTestCase {
         final Containers containers = buildContainers(blockSize, between(1, 4), 0);
         final long blobSize = blockSize * between(1, 5);
 
-        // The fixture answers a block request with 404 CannotVerifyCopySource and says that the source blob was not found.
+        // The HEAD request for the length of the source gets 404 BlobNotFound, so the copy fails before it stages a block.
         expectThrows(
             NoSuchFileException.class,
             () -> containers.destination()
                 .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), randomIdentifier(), randomIdentifier(), blobSize, null)
         );
+        assertThat(requests(LoggedRequest::isPutBlockFromUrl), empty());
         assertThat(requests(LoggedRequest::isPutBlockList), empty());
     }
 
@@ -520,13 +559,17 @@ public class AzureBlobContainerCopyTests extends ESTestCase {
         containers.destination().writeBlob(OperationPurpose.SNAPSHOT_DATA, sourceName, new BytesArray(data), true);
         requests.clear();
 
-        containers.destination()
+        final OptionalLong length = containers.destination()
             .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.destination(), sourceName, destinationName, data.length, null);
 
         assertArrayEquals(data, destinationBytes(destinationName));
         assertThat(requests(LoggedRequest::isCopyBlob), hasSize(1));
         assertThat(requests(LoggedRequest::isPutBlockFromUrl), empty());
         assertThat(requests(LoggedRequest::isPutBlockList), empty());
+        // Copy Blob copies the whole blob and needs no length, so no request asks for the length of the source, and the copy returns none.
+        // The only HEAD requests are the polls of the copy status, which go to the new blob.
+        assertThat(requests(request -> request.isHeadOf(sourceName)), empty());
+        assertThat(length, equalTo(OptionalLong.empty()));
     }
 
     public void testBlobWithNoBytesUsesCopyBlob() throws IOException {
@@ -535,27 +578,206 @@ public class AzureBlobContainerCopyTests extends ESTestCase {
         final String destinationName = randomIdentifier();
         writeSource(containers, sourceName, new byte[0]);
 
-        containers.destination().copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), sourceName, destinationName, 0L, null);
+        final OptionalLong length = containers.destination()
+            .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), sourceName, destinationName, 0L, null);
 
         assertThat(destinationBytes(destinationName).length, equalTo(0));
-        // a blob with no bytes has no range to copy
+        // a blob with no bytes has no range to copy, and the HEAD request for its length found that out
+        assertThat(requests(request -> request.isHeadOf(sourceName)), hasSize(1));
         assertThat(requests(LoggedRequest::isCopyBlob), hasSize(1));
         assertThat(requests(LoggedRequest::isPutBlockFromUrl), empty());
+        assertThat(length, equalTo(OptionalLong.of(0L)));
     }
 
-    public void testBlobThatNeedsTooManyBlocksFails() {
+    public void testBlobThatNeedsTooManyBlocksFails() throws IOException {
         // Azure allows at most 50,000 blocks in a blob. With blocks of 1 byte, a blob of 50,001 bytes needs one block too many. The check
-        // runs before any request, so the fixture sees none. The arguments of buildContainers are a block size of 1 byte, one block at a
-        // time and no retries.
+        // runs after the HEAD request for the length of the source and before any block, so the fixture sees only the HEAD request. The
+        // arguments of buildContainers are a block size of 1 byte, one block at a time and no retries.
         final Containers containers = buildContainers(1, 1, 0);
+        final String sourceName = randomIdentifier();
+        writeSource(containers, sourceName, randomByteArrayOfLength(50_001));
 
         final IOException e = expectThrows(
             IOException.class,
             () -> containers.destination()
-                .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), randomIdentifier(), randomIdentifier(), 50_001L, null)
+                .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), sourceName, randomIdentifier(), 50_001L, null)
         );
         assertThat(e.getMessage(), containsString("need [50001] blocks"));
         assertThat(e.getMessage(), containsString(COPY_BLOCK_SIZE_SETTING.getKey()));
-        assertThat(requests, empty());
+        assertThat(requests, hasSize(1));
+        assertTrue(requests.getFirst().isHeadOf(sourceName));
+    }
+
+    /**
+     * The ranges of a copy between two storage accounts need the exact length of the source. If the answer to the HEAD request for the
+     * length is below the end that the caller needs, the copy cannot trust it: the new blob would be shorter than the caller needs, and
+     * Azure would not say so. The copy fails before it stages a block, so no block list is committed and the new blob does not exist.
+     * Here the fixture answers the HEAD request of the source with a length below the needed end, as an inexact answer would.
+     */
+    public void testLengthBelowTheNeededEndFailsBeforeAnyCopy() throws IOException {
+        final long blockSize = between(8, 32);
+        final Containers containers = buildContainers(blockSize, between(1, 4), 0);
+        final String sourceName = randomIdentifier();
+        final String destinationName = randomIdentifier();
+        final long blobSize = blockSize * between(2, 6) + between(0, (int) blockSize - 1);
+        writeSource(containers, sourceName, randomByteArrayOfLength(Math.toIntExact(blobSize)));
+
+        final long answeredLength = randomLongBetween(1, blobSize - 1);
+        fault = (exchange, request) -> {
+            if (request.isHeadOf(sourceName)) {
+                exchange.getResponseHeaders().add("Content-Length", Long.toString(answeredLength));
+                exchange.getResponseHeaders().add("x-ms-blob-type", "BlockBlob");
+                exchange.getResponseHeaders().add("ETag", "\"inexact\"");
+                exchange.getResponseHeaders()
+                    .add("Last-Modified", DateTimeFormatter.RFC_1123_DATE_TIME.format(ZonedDateTime.now(ZoneOffset.UTC)));
+                exchange.sendResponseHeaders(RestStatus.OK.getStatus(), -1);
+                return true;
+            }
+            return false;
+        };
+        final IOException e = expectThrows(
+            IOException.class,
+            () -> containers.destination()
+                .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), sourceName, destinationName, blobSize, null)
+        );
+        assertThat(e, not(instanceOf(NoSuchFileException.class)));
+        assertThat(
+            e.getMessage(),
+            containsString("the source is [" + answeredLength + "] bytes long, but the caller needs [" + blobSize + "] bytes of it")
+        );
+
+        // the HEAD request was the only request that the copy made: no block, no block list, no Copy Blob, and no new blob
+        assertThat(requests, hasSize(1));
+        assertTrue(requests.getFirst().isHeadOf(sourceName));
+        assertFalse(containers.destination().blobExists(OperationPurpose.SNAPSHOT_DATA, destinationName));
+    }
+
+    /**
+     * A source that is shorter than the end that the caller needs fails the copy before it stages a block. The fixture refuses a range
+     * that ends after the source, as Azure may, so that a copy that asked for such a range would fail in a way that the test can tell
+     * from the failure of the length check: this test asserts the length check's message, and that no block was ever requested.
+     */
+    public void testRangePastTheEndOfTheSourceIsNeverRequested() throws IOException {
+        azureHttpHandler.setStrictSourceRanges(true);
+        final long blockSize = between(8, 32);
+        final Containers containers = buildContainers(blockSize, between(1, 4), 0);
+        final String sourceName = randomIdentifier();
+        final String destinationName = randomIdentifier();
+        final long blobSize = blockSize * between(1, 6) + between(0, (int) blockSize - 1) + 1;
+        writeSource(containers, sourceName, randomByteArrayOfLength(Math.toIntExact(blobSize)));
+
+        // the caller needs a few bytes more than the source has, so that the last blocks of a copy by the needed end would pass the end
+        final long neededEnd = blobSize + randomLongBetween(1, 2 * blockSize);
+        final IOException e = expectThrows(
+            IOException.class,
+            () -> containers.destination()
+                .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), sourceName, destinationName, neededEnd, null)
+        );
+        assertThat(
+            e.getMessage(),
+            containsString("the source is [" + blobSize + "] bytes long, but the caller needs [" + neededEnd + "] bytes of it")
+        );
+        assertThat(requests(LoggedRequest::isPutBlockFromUrl), empty());
+        assertThat(requests(LoggedRequest::isPutBlockList), empty());
+        assertThat(requests(LoggedRequest::isCopyBlob), empty());
+        assertFalse(containers.destination().blobExists(OperationPurpose.SNAPSHOT_DATA, destinationName));
+    }
+
+    /**
+     * The strict mode of the fixture does what the test above relies on. A Put Block From URL request with a range that ends after the
+     * source fails with 416 InvalidRange, while the default fixture clamps the range to the end of the source, so a block list of that
+     * block makes a blob as long as the source.
+     */
+    public void testStrictFixtureRefusesARangePastTheEnd() throws IOException {
+        final String clientName = randomIdentifier();
+        final long blobSize = between(16, 64);
+        final long rangeLength = blobSize + between(1, 16);
+        final InetSocketAddress address = httpServer.getAddress();
+        final AzureBlobContainer container = buildContainer(clientName, "localhost", null, 8, 1, 0);
+        final String sourceName = randomIdentifier();
+        final String blobName = randomIdentifier();
+        container.writeBlob(OperationPurpose.SNAPSHOT_DATA, sourceName, new BytesArray(randomByteArrayOfLength((int) blobSize)), true);
+        final String sourceUrl = "http://localhost:" + address.getPort() + "/" + ACCOUNT + "/" + CONTAINER + "/" + sourceName;
+        final String blockId = Base64.getEncoder().withoutPadding().encodeToString(Base64.getUrlDecoder().decode(UUIDs.base64UUID()));
+
+        try (
+            var client = container.getBlobStore()
+                .getService()
+                .client(ProjectId.DEFAULT, clientName, LocationMode.PRIMARY_ONLY, OperationPurpose.SNAPSHOT_DATA)
+        ) {
+            final BlockBlobClient blockBlobClient = client.getSyncClient()
+                .getBlobContainerClient(CONTAINER)
+                .getBlobClient(blobName)
+                .getBlockBlobClient();
+
+            // by default the fixture clamps the range, and the block holds the bytes up to the end of the source
+            blockBlobClient.stageBlockFromUrl(blockId, sourceUrl, new BlobRange(0, rangeLength));
+            blockBlobClient.commitBlockList(List.of(blockId));
+            assertThat(destinationBytes(blobName).length, equalTo(Math.toIntExact(blobSize)));
+
+            // with strict ranges, the fixture refuses the same range
+            azureHttpHandler.setStrictSourceRanges(true);
+            final BlobStorageException e = expectThrows(
+                BlobStorageException.class,
+                () -> blockBlobClient.stageBlockFromUrl(blockId, sourceUrl, new BlobRange(0, rangeLength))
+            );
+            assertThat(e.getStatusCode(), equalTo(RestStatus.REQUESTED_RANGE_NOT_SATISFIED.getStatus()));
+            assertThat(e.getErrorCode().toString(), equalTo("InvalidRange"));
+            // a range that ends at the last byte of the source is fine
+            blockBlobClient.stageBlockFromUrl(blockId, sourceUrl, new BlobRange(0, blobSize));
+        }
+    }
+
+    /**
+     * If the HEAD request for the length fails for another reason than a missing blob, the copy fails with an {@link IOException}, not a
+     * {@link NoSuchFileException}, and it stages no block.
+     */
+    public void testFailedLengthRequestFailsTheCopy() throws IOException {
+        final long blockSize = between(8, 32);
+        final Containers containers = buildContainers(blockSize, between(1, 4), 0);
+        final String sourceName = randomIdentifier();
+        writeSource(containers, sourceName, randomByteArrayOfLength(Math.toIntExact(blockSize * 2)));
+
+        fault = (exchange, request) -> {
+            if (request.isHeadOf(sourceName)) {
+                AzureHttpHandler.sendError(exchange, RestStatus.FORBIDDEN, "AuthorizationFailure", "This request is not authorized.");
+                return true;
+            }
+            return false;
+        };
+        final IOException e = expectThrows(
+            IOException.class,
+            () -> containers.destination()
+                .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), sourceName, randomIdentifier(), blockSize, null)
+        );
+        assertThat(e, not(instanceOf(NoSuchFileException.class)));
+        assertThat(e.getMessage(), containsString("Unable to get the length of copy source [" + sourceName + "]"));
+        assertThat(requests(LoggedRequest::isPutBlockFromUrl), empty());
+        assertThat(requests(LoggedRequest::isPutBlockList), empty());
+    }
+
+    /**
+     * A failure of the client itself, with no answer from Azure at all, such as a connection that the other side closes, is not a
+     * {@code BlobStorageException}. The request for the length fails the copy with an {@link IOException} all the same, as a failed
+     * copy in blocks does, and the copy stages no block.
+     */
+    public void testHeadRequestThatFailsInTheClientFailsTheCopyWithAnIOException() throws IOException {
+        final long blockSize = between(8, 32);
+        final Containers containers = buildContainers(blockSize, between(1, 4), 0);
+        final String sourceName = randomIdentifier();
+        writeSource(containers, sourceName, randomByteArrayOfLength(Math.toIntExact(blockSize * 2)));
+
+        // the fixture closes the connection without an answer
+        fault = (exchange, request) -> request.isHeadOf(sourceName);
+        final IOException e = expectThrows(
+            IOException.class,
+            () -> containers.destination()
+                .copyBlob(OperationPurpose.SNAPSHOT_DATA, containers.source(), sourceName, randomIdentifier(), blockSize, null)
+        );
+        assertThat(e, not(instanceOf(NoSuchFileException.class)));
+        assertThat(e.getMessage(), containsString("Unable to get the length of copy source [" + sourceName + "]"));
+        assertThat(e.getCause(), not(instanceOf(BlobStorageException.class)));
+        assertThat(requests(LoggedRequest::isPutBlockFromUrl), empty());
+        assertThat(requests(LoggedRequest::isPutBlockList), empty());
     }
 }

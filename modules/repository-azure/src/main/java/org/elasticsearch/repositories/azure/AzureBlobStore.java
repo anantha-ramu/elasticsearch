@@ -111,6 +111,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Spliterator;
 import java.util.Spliterators;
 import java.util.concurrent.Callable;
@@ -818,22 +819,30 @@ public class AzureBlobStore implements BlobStore {
     }
 
     /**
-     * Copies the blob {@code sourceBlobName} of {@code sourceBlobStore} to the blob {@code blobName} of this store.
+     * Copies the blob {@code sourceBlobName} of {@code sourceBlobStore} to the blob {@code blobName} of this store. The copy holds the
+     * whole source blob.
      * <p>
      * How the copy runs depends on the storage accounts of the two stores. A storage account is the Azure resource that holds containers
      * and blobs. Two stores are in the same storage account when their clients have the same storage endpoint. The names of the accounts
      * are not compared.
      * <ul>
      * <li>Same storage account: this method sends a Copy Blob request, and polls the status of the copy until Azure reports that it is
-     * done.</li>
+     * done. The request copies the whole blob and needs no length, so the method sends no other request to the source. The method does
+     * not learn the length of the source, so it cannot check {@code neededEnd}, and it returns no length.</li>
      * <li>Different storage accounts: Azure has to move the bytes. A Copy Blob request between accounts is asynchronous and best-effort,
      * and Azure may run several pending copies one after another, so a copy of a large blob can wait for the others. Blocks that are
      * staged, in contrast, run in parallel. So this method splits the source blob into blocks of {@code copy_block_size} bytes. It asks
      * Azure to fill each block of the new blob from a byte range of the source blob (Put Block From URL), with up to
      * {@code max_concurrent_copy_blocks} requests at the same time. Then it sends one Put Block List request, which commits the blocks,
-     * that is, joins them into the new blob. No bytes pass through this node.</li>
+     * that is, joins them into the new blob. No bytes pass through this node. The blocks need the exact length of the source blob. A
+     * length that is too small gives a shorter new blob without an error, and Azure does not say what it does with a range that ends
+     * after the source. So before the first block, the method asks the source store for the length with one Get Blob Properties request
+     * (a HEAD request, which asks for the properties of a blob and not its content), using the client and the purpose of the source
+     * store, so that the stats of the source store count that request. If the source is shorter than {@code neededEnd}, the method
+     * throws before it copies anything.</li>
      * </ul>
-     * A blob with no bytes has no byte range to copy, so it always uses Copy Blob.
+     * A blob with no bytes has no byte range to copy, so the method copies it with Copy Blob, also between two storage accounts. The
+     * HEAD request has already given the length of such a blob, which is 0, and the method returns it.
      * <p>
      * Azure reads the source blob by its URL. So when the two stores are in different storage accounts, the client of the source store
      * needs a SAS (shared access signature) token. This is checked first, so an empty blob needs the token too.
@@ -843,15 +852,22 @@ public class AzureBlobStore implements BlobStore {
      * https://docs.microsoft.com/en-us/rest/api/storageservices/put-block#remarks. A delete of the new blob after such a failure may find
      * no blob, and the caller can ignore that.
      *
-     * @param blobSize the exact length of the source blob in bytes. A copy between two storage accounts uses it to work out the blocks
-     *                 and does not check it, so a value below the real length gives a shorter new blob without an error. A copy inside
-     *                 one storage account does not use it.
+     * @param neededEnd the offset just after the last byte that the caller needs from the source blob, see
+     *                  {@link BlobContainer#copyBlob(OperationPurpose, BlobContainer, String, String, long, java.util.concurrent.Executor)}
+     * @return the exact length of the source blob if the stores are in different storage accounts, because the method has to learn the
+     *         length then, and empty if they are in the same storage account. The length is 0 for a blob with no bytes.
      * @throws NoSuchFileException      if the source blob does not exist
      * @throws IllegalArgumentException if the stores are in different storage accounts and the source has no SAS token
-     * @throws IOException              if the copy fails, or if the blob needs more than 50,000 blocks of the chosen size
+     * @throws IOException              if the copy fails, if the stores are in different storage accounts and the source is shorter than
+     *                                  {@code neededEnd}, or if the blob needs more than 50,000 blocks of the chosen size
      */
-    public void copyBlob(OperationPurpose purpose, String sourceBlobName, AzureBlobStore sourceBlobStore, String blobName, long blobSize)
-        throws IOException {
+    public OptionalLong copyBlob(
+        OperationPurpose purpose,
+        String sourceBlobName,
+        AzureBlobStore sourceBlobStore,
+        String blobName,
+        long neededEnd
+    ) throws IOException {
 
         try (var sourceClient = sourceBlobStore.getAzureBlobServiceClientClient(purpose)) {
             final BlobServiceClient sourceSyncClient = sourceClient.getSyncClient();
@@ -880,11 +896,36 @@ public class AzureBlobStore implements BlobStore {
                 );
             }
 
-            if (sameStorageAccount || blobSize == 0) {
+            if (sameStorageAccount) {
+                copyBlobWithCopyBlob(purpose, sourceUrl, sourceBlobName, blobName, hasSasToken);
+                return OptionalLong.empty();
+            }
+            final long sourceLength = getSourceLength(sourceBlobSyncClient, sourceBlobName);
+            BlobContainerUtils.ensureCopySourceLongEnough(sourceBlobName, blobName, sourceLength, neededEnd);
+            if (sourceLength == 0) {
                 copyBlobWithCopyBlob(purpose, sourceUrl, sourceBlobName, blobName, hasSasToken);
             } else {
-                copyBlobInBlocks(purpose, sourceUrl, sourceBlobName, blobName, blobSize, hasSasToken);
+                copyBlobInBlocks(purpose, sourceUrl, sourceBlobName, blobName, sourceLength, hasSasToken);
             }
+            return OptionalLong.of(sourceLength);
+        }
+    }
+
+    /**
+     * Asks Azure for the length of the source blob of a copy between storage accounts, with a Get Blob Properties request through the
+     * client of the source store.
+     */
+    private static long getSourceLength(BlobClient sourceBlobSyncClient, String sourceBlobName) throws IOException {
+        try {
+            return sourceBlobSyncClient.getProperties().getBlobSize();
+        } catch (BlobStorageException e) {
+            if (e.getStatusCode() == RestStatus.NOT_FOUND.getStatus() && BlobErrorCode.BLOB_NOT_FOUND.equals(e.getErrorCode())) {
+                throw new NoSuchFileException("Copy source [" + sourceBlobName + "] not found: " + e.getMessage());
+            }
+            throw new IOException("Unable to get the length of copy source [" + sourceBlobName + "]", e);
+        } catch (RuntimeException e) {
+            // like a failed copy in blocks, a failure of the client itself, such as a network error, is an IOException
+            throw new IOException("Unable to get the length of copy source [" + sourceBlobName + "]", e);
         }
     }
 
@@ -917,14 +958,14 @@ public class AzureBlobStore implements BlobStore {
         String sourceUrl,
         String sourceBlobName,
         String blobName,
-        long blobSize,
+        long sourceLength,
         boolean hasSasToken
     ) throws IOException {
-        final List<CopyBlock> blocks = computeCopyBlocks(blobName, blobSize, copyBlockSize.getBytes());
+        final List<CopyBlock> blocks = computeCopyBlocks(blobName, sourceLength, copyBlockSize.getBytes());
         logger.debug(
             "{}: copying [{}] bytes from [{}] in [{}] blocks, at most [{}] at a time",
             blobName,
-            blobSize,
+            sourceLength,
             sourceBlobName,
             blocks.size(),
             maxConcurrentCopyBlocks
