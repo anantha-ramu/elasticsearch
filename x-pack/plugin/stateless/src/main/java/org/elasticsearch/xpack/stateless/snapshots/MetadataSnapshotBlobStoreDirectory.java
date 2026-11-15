@@ -24,6 +24,7 @@ import org.elasticsearch.xpack.stateless.commits.BlobLocation;
 import java.io.EOFException;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
@@ -38,6 +39,10 @@ import java.util.function.BiFunction;
  * For all other files, only the Lucene footer ({@link CodecUtil#footerLength()} bytes) is read,
  * since {@link Store.MetadataSnapshot#loadFromIndexCommit} only needs the footer checksum for
  * those files.
+ * <p>
+ * Each read must return all the bytes that the location of the file asks for. If a blob ends before the file does, the read fails
+ * with a {@link CorruptIndexException}. That is how a snapshot that copies a commit blob learns that the blob reaches to the end of
+ * the file, also where the copy call cannot check the length of the blob, see {@link StatelessSnapshotShardContext#copySource}.
  */
 class MetadataSnapshotBlobStoreDirectory extends BaseDirectory {
 
@@ -94,7 +99,7 @@ class MetadataSnapshotBlobStoreDirectory extends BaseDirectory {
         try (
             var stream = blobContainer.readBlob(OperationPurpose.SNAPSHOT_METADATA, blobLocation.blobName(), blobLocation.offset(), length)
         ) {
-            stream.readNBytes(bytes, 0, length);
+            readFully(name, blobLocation, blobLocation.offset(), stream, bytes);
         }
         return new ByteArrayIndexInput(name, bytes);
     }
@@ -104,17 +109,36 @@ class MetadataSnapshotBlobStoreDirectory extends BaseDirectory {
         checkFooterLength(name, fileLength);
         final var footerLength = CodecUtil.footerLength();
         final var footer = new byte[footerLength];
-        try (
-            var stream = blobContainer.readBlob(
-                OperationPurpose.SNAPSHOT_METADATA,
-                blobLocation.blobName(),
-                blobLocation.offset() + fileLength - footerLength,
-                footerLength
-            )
-        ) {
-            stream.readNBytes(footer, 0, footerLength);
+        final var footerOffset = blobLocation.offset() + fileLength - footerLength;
+        try (var stream = blobContainer.readBlob(OperationPurpose.SNAPSHOT_METADATA, blobLocation.blobName(), footerOffset, footerLength)) {
+            readFully(name, blobLocation, footerOffset, stream, footer);
         }
         return new FooterOnlyIndexInput(name, fileLength, footer);
+    }
+
+    /**
+     * Fills {@code bytes} from the stream, which reads the blob of {@code blobLocation} from {@code position}. An object store answers a
+     * request for a range that runs past the end of a blob with the bytes up to the end. So if the blob is shorter than its location says,
+     * the stream ends early. The method fails then, with a {@link CorruptIndexException} that names the blob and the position, because
+     * the rest of the array would stay zero and look like file content.
+     */
+    private static void readFully(String name, BlobLocation blobLocation, long position, InputStream stream, byte[] bytes)
+        throws IOException {
+        final int read = stream.readNBytes(bytes, 0, bytes.length);
+        if (read != bytes.length) {
+            throw new CorruptIndexException(
+                "the blob ["
+                    + blobLocation.blobName()
+                    + "] ends early: expected ["
+                    + bytes.length
+                    + "] bytes at offset ["
+                    + position
+                    + "] but read ["
+                    + read
+                    + "]",
+                name
+            );
+        }
     }
 
     private static void checkFooterLength(String name, long fileLength) throws CorruptIndexException {

@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.stateless.test;
 
 import org.apache.lucene.analysis.core.KeywordAnalyzer;
+import org.apache.lucene.document.BinaryDocValuesField;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.KeywordField;
 import org.apache.lucene.document.NumericDocValuesField;
@@ -612,6 +613,19 @@ public class FakeStatelessNode implements Closeable {
      * Call this method once for a test, because the document ids and the sequence numbers start from zero on every call.
      */
     public List<StatelessCommitRef> generateCommitsWithUnchangedGenerationalFiles(int commitsNumber) throws IOException {
+        return generateCommitsWithUnchangedGenerationalFiles(commitsNumber, 0);
+    }
+
+    /**
+     * Same as {@link #generateCommitsWithUnchangedGenerationalFiles(int)}, but with {@code bigUpdateBytes} above zero the second commit
+     * also updates a binary doc values field of the first document with that many random bytes. That gives the segment of the first
+     * document a doc values file of at least that size, which stays the same in every later commit. If the size is larger than all
+     * other files of the commits, the copy of that file is the largest internal file of the first commit of a commit blob that carries
+     * it. A commit blob stores the internal files of a commit sorted by length, so that copy comes last, after {@code segments_N}, and
+     * at the end of a commit blob that has no other commit.
+     */
+    public List<StatelessCommitRef> generateCommitsWithUnchangedGenerationalFiles(int commitsNumber, int bigUpdateBytes)
+        throws IOException {
         final var indexWriterConfig = new IndexWriterConfig(new KeywordAnalyzer());
         indexWriterConfig.setIndexDeletionPolicy(NoDeletionPolicy.INSTANCE);
         indexWriterConfig.setMergePolicy(NoMergePolicy.INSTANCE);
@@ -623,9 +637,28 @@ public class FakeStatelessNode implements Closeable {
                 previousCommit = indexReader.getIndexCommit();
             }
             for (int i = 0; i < commitsNumber; i++) {
-                indexWriter.addDocument(List.of(new StringField("id", "doc" + i, Field.Store.NO), new NumericDocValuesField("value", 0)));
+                if (bigUpdateBytes > 0) {
+                    indexWriter.addDocument(
+                        List.of(
+                            new StringField("id", "doc" + i, Field.Store.NO),
+                            new NumericDocValuesField("value", 0),
+                            new BinaryDocValuesField("payload", new BytesRef())
+                        )
+                    );
+                } else {
+                    indexWriter.addDocument(
+                        List.of(new StringField("id", "doc" + i, Field.Store.NO), new NumericDocValuesField("value", 0))
+                    );
+                }
                 if (i > 0) {
                     indexWriter.updateNumericDocValue(new Term("id", "doc" + (i - 1)), "value", i);
+                }
+                if (i == 1 && bigUpdateBytes > 0) {
+                    indexWriter.updateBinaryDocValue(
+                        new Term("id", "doc0"),
+                        "payload",
+                        new BytesRef(ESTestCase.randomByteArrayOfLength(bigUpdateBytes))
+                    );
                 }
                 indexWriter.setLiveCommitData(Map.of(SequenceNumbers.MAX_SEQ_NO, Integer.toString(i)).entrySet());
                 indexWriter.commit();

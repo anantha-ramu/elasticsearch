@@ -21,6 +21,7 @@ import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.io.stream.InputStreamStreamInput;
 import org.elasticsearch.common.lucene.Lucene;
+import org.elasticsearch.common.util.Maps;
 import org.elasticsearch.core.Assertions;
 import org.elasticsearch.core.IOUtils;
 import org.elasticsearch.core.Nullable;
@@ -73,10 +74,11 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     @Nullable // when snapshot runs on a different node from the primary
     private final BooleanSupplier isShardRelocated;
     private final boolean serverSideCopyEnabled;
-    // copySource fills in the next two fields, see its Javadoc. The first generational file sets segmentsFile, the location of the
-    // segments_N file of the snapshotted commit. The first carried generational file sets firstCommit, the header of the first commit of
-    // the commit blob that holds the snapshotted commit. The repository calls copySource from the loop over the files of one shard
-    // snapshot, on one thread and one file at a time, so the fields need no synchronization.
+    // metadataSnapshot and copySource fill in the next two fields, see their Javadoc. The first generational file that one of them looks
+    // at sets segmentsFile, the location of the segments_N file of the snapshotted commit. The first carried generational file sets
+    // firstCommit, the header of the first commit of the commit blob that holds the snapshotted commit. The repository calls
+    // metadataSnapshot, and then copySource and isCopiedFileReusable for one file at a time, all on one thread, so the fields need no
+    // synchronization.
     @Nullable
     private BlobLocation segmentsFile;
     @Nullable
@@ -147,16 +149,43 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
         return false;
     }
 
+    /**
+     * Reads the metadata of the files of the snapshotted commit from the object store: the checksum in the footer of each file, and the
+     * whole content of the small files.
+     * <p>
+     * With server-side copy off, each file is read at the first location that the primary learned for it, which is where a snapshot
+     * uploads it from. With server-side copy on, each file is read at the location that the repository copies it from, see
+     * {@link #copySource}. The two differ for a carried generational file: the first location is in an older commit blob, and the copy
+     * is in the commit blob of the snapshotted commit. Not every object store checks the length of the blob during the copy, so this
+     * read is where the snapshot learns that the commit blob reaches to the end of each file. Reading a carried file in the older blob
+     * would show nothing about the blob that the repository copies. A blob that ends early fails the read, see
+     * {@link MetadataSnapshotBlobStoreDirectory}, and the snapshot then fails with an {@link IndexShardSnapshotFailedException}.
+     */
     @Override
     public Store.MetadataSnapshot metadataSnapshot() {
         try (
             var ignore = maybeWithSnapshotIndexCommitRef();
-            var dir = new MetadataSnapshotBlobStoreDirectory(fileToBlobLocations, blobContainerFunc, shardId)
+            var dir = new MetadataSnapshotBlobStoreDirectory(getLocationsToRead(), blobContainerFunc, shardId)
         ) {
             return Store.MetadataSnapshot.loadFromIndexCommit(null, dir, logger);
         } catch (IOException e) {
             throw new IndexShardSnapshotFailedException(shardId, "failed to get store file metadata", e);
         }
+    }
+
+    /**
+     * Returns where {@link #metadataSnapshot} reads each file: its first location with server-side copy off, and the location that the
+     * repository copies it from with server-side copy on, see {@link #getLocationToCopy}.
+     */
+    private Map<String, BlobLocation> getLocationsToRead() {
+        if (serverSideCopyEnabled == false) {
+            return fileToBlobLocations;
+        }
+        final Map<String, BlobLocation> locations = Maps.newHashMapWithExpectedSize(fileToBlobLocations.size());
+        for (String file : fileToBlobLocations.keySet()) {
+            locations.put(file, getLocationToCopy(file));
+        }
+        return locations;
     }
 
     @Override

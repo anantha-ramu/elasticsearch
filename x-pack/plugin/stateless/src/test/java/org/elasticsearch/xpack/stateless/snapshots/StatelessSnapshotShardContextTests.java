@@ -24,6 +24,7 @@ import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.blobstore.fs.FsBlobContainer;
 import org.elasticsearch.common.blobstore.fs.FsBlobStore;
 import org.elasticsearch.common.blobstore.support.FilterBlobContainer;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.io.stream.InputStreamStreamInput;
 import org.elasticsearch.common.lucene.store.InputStreamIndexInput;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
@@ -59,6 +60,7 @@ import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -73,11 +75,14 @@ import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.sameInstance;
 import static org.mockito.Mockito.mock;
 
 /**
@@ -431,6 +436,160 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
     }
 
     /**
+     * With server-side copy on, the metadata snapshot reads the footer of a carried generational file at the copy of the file in the commit
+     * blob of the commit, which is the blob that the repository copies. With copies off, it reads the footer at the first location of
+     * the file in an older commit blob, which is where a snapshot uploads the file from. Either way the metadata is the metadata of the
+     * commit. The read of the header of the first commit, which finds the copies, happens only with copies on.
+     */
+    public void testMetadataSnapshotReadsTheFootersOfCarriedFilesAtTheirCopyWhenCopying() throws Exception {
+        try (var node = newNode()) {
+            final var uploadedCommits = uploadCommitBlobs(node, between(2, 3), 3, between(1, 3));
+            final long footerLength = CodecUtil.footerLength();
+
+            boolean checkedACarriedFile = false;
+            for (UploadedCommit uploaded : uploadedCommits) {
+                final var expected = node.indexingStore.getMetadata(uploaded.commit().getIndexCommit());
+                final var header = readCommitHeader(node, uploaded);
+                final var segmentsFile = node.commitService.getBlobLocation(node.shardId, uploaded.commit().getSegmentsFileName());
+                final var headerRead = new MetadataRead(segmentsFile.blobName(), 0L, segmentsFile.offset());
+                final var carried = carriedGenerationalFiles(node, uploaded);
+                for (boolean copiesOn : new boolean[] { true, false }) {
+                    metadataReads.clear();
+                    final var actual = contextOf(node, uploaded.commit(), copiesOn).metadataSnapshot();
+
+                    assertThat(actual.fileMetadataMap().keySet(), equalTo(expected.fileMetadataMap().keySet()));
+                    for (var entry : expected.fileMetadataMap().entrySet()) {
+                        assertThat(entry.getKey(), actual.get(entry.getKey()).checksum(), equalTo(entry.getValue().checksum()));
+                    }
+                    // the header is read once to find the copies, and only if the commit carries a file and copies are on
+                    assertThat(
+                        metadataReads.stream().filter(headerRead::equals).count(),
+                        equalTo(copiesOn && carried.isEmpty() == false ? 1L : 0L)
+                    );
+                    for (String file : carried) {
+                        final BlobLocation first = node.commitService.getBlobLocation(node.shardId, file);
+                        final BlobLocation copy = header.commitFiles().get(file);
+                        assertThat(copy.blobName(), not(equalTo(first.blobName())));
+                        final var footerAtCopy = new MetadataRead(
+                            copy.blobName(),
+                            copy.offset() + copy.fileLength() - footerLength,
+                            footerLength
+                        );
+                        final var footerAtFirstLocation = new MetadataRead(
+                            first.blobName(),
+                            first.offset() + first.fileLength() - footerLength,
+                            footerLength
+                        );
+                        assertThat(file, metadataReads.contains(footerAtCopy), equalTo(copiesOn));
+                        assertThat(file, metadataReads.contains(footerAtFirstLocation), equalTo(copiesOn == false));
+                        checkedACarriedFile = true;
+                    }
+                }
+            }
+            assertTrue("no commit carries a generational file", checkedACarriedFile);
+        }
+    }
+
+    /**
+     * A commit blob that ends early, here because its last bytes are gone, fails the metadata snapshot when copies are on, as the
+     * footer of the last file in the blob comes back short. The snapshot fails with an {@link IndexShardSnapshotFailedException}, and
+     * the repository would not copy that blob.
+     */
+    public void testCommitBlobThatEndsEarlyFailsTheMetadataSnapshotWhenCopying() throws Exception {
+        try (var node = newNode()) {
+            final var uploaded = uploadCommitBlobs(node, 2, between(1, 3)).getLast();
+            cutBlob(node, BatchedCompoundCommit.blobNameFromGeneration(uploaded.blobGeneration()), between(1, CodecUtil.footerLength()));
+            final var context = contextOf(node, uploaded.commit(), true);
+
+            final var failure = expectThrows(IndexShardSnapshotFailedException.class, context::metadataSnapshot);
+
+            assertThat(failure.getMessage(), containsString("failed to get store file metadata"));
+            assertThat(failure.getCause(), instanceOf(CorruptIndexException.class));
+            assertThat(failure.getCause().getMessage(), containsString("ends early"));
+        }
+    }
+
+    /**
+     * A first commit that carries a copy of a large generational file, and a commit blob that has no other commit. The copy comes after
+     * the {@code segments_N} file of the commit, and it is the last thing in the blob, so no read of the blob that stops at
+     * {@code segments_N} reaches it. If the blob loses its last byte, the footer of the copy comes back short. With copies on, the
+     * metadata snapshot reads that footer at the copy and fails. With copies off, it reads the footer in the older blob, where the file
+     * is whole, so nothing shows that the blob that holds the copy has lost a byte. That is why copies need the read at the copy.
+     */
+    public void testCarriedCopyAfterSegmentsFileThatLosesItsLastByteFailsTheMetadataSnapshotWhenCopying() throws Exception {
+        try (var node = newNode()) {
+            final var commits = node.generateCommitsWithUnchangedGenerationalFiles(3, between(10_000, 20_000));
+            final var uploaded = uploadCommitBlobs(node, commits, 2, 1).getLast();
+            assertTrue(uploaded.isFirstInBlob());
+            final var header = readCommitHeader(node, uploaded);
+            final var segmentsFile = node.commitService.getBlobLocation(node.shardId, uploaded.commit().getSegmentsFileName());
+            final String blobName = BatchedCompoundCommit.blobNameFromGeneration(uploaded.blobGeneration());
+            // the largest carried file has its copy after segments_N, at the end of the commit blob
+            final String largestCarried = carriedGenerationalFiles(node, uploaded).stream()
+                .max((a, b) -> Long.compare(header.commitFiles().get(a).fileLength(), header.commitFiles().get(b).fileLength()))
+                .orElseThrow();
+            final BlobLocation copy = header.commitFiles().get(largestCarried);
+            assertThat(copy.offset(), greaterThan(segmentsFile.offset()));
+            assertThat(
+                copy.offset() + copy.fileLength(),
+                equalTo(node.getShardContainer().listBlobs(OperationPurpose.INDICES).get(blobName).length())
+            );
+
+            cutBlob(node, blobName, 1);
+
+            final var failure = expectThrows(
+                IndexShardSnapshotFailedException.class,
+                () -> contextOf(node, uploaded.commit(), true).metadataSnapshot()
+            );
+            assertThat(failure.getCause(), instanceOf(CorruptIndexException.class));
+            assertThat(failure.getCause().getMessage(), containsString(largestCarried));
+            // with copies off, the file is read in the older blob, and the cut is not seen
+            assertThat(contextOf(node, uploaded.commit(), false).metadataSnapshot().get(largestCarried), notNullValue());
+        }
+    }
+
+    /**
+     * If the footer read at the copy of a carried file fails, in any way, the metadata snapshot fails with an
+     * {@link IndexShardSnapshotFailedException}, and does not fall back to the first location of the file in an older commit blob. The
+     * test fails the read of the footer at the copy only, and every other read works.
+     */
+    public void testFailedFooterReadAtTheCopyFailsTheMetadataSnapshot() throws Exception {
+        try (var node = newNode()) {
+            final var uploaded = uploadCommitBlobs(node, 2, 2).getLast();
+            final String carriedFile = randomFrom(carriedGenerationalFiles(node, uploaded));
+            final BlobLocation copy = readCommitHeader(node, uploaded).commitFiles().get(carriedFile);
+            final long footerStart = copy.offset() + copy.fileLength() - CodecUtil.footerLength();
+            final IOException simulated = randomBoolean()
+                ? new IOException("simulated failure of the read")
+                : new NoSuchFileException(copy.blobName());
+            metadataReadOverride = (container, read) -> {
+                if (read.blobName().equals(copy.blobName()) && read.position() == footerStart) {
+                    throw simulated;
+                }
+                return container.readBlob(OperationPurpose.SNAPSHOT_METADATA, read.blobName(), read.position(), read.length());
+            };
+            final var context = contextOf(node, uploaded.commit(), true);
+
+            final var failure = expectThrows(IndexShardSnapshotFailedException.class, context::metadataSnapshot);
+
+            assertThat(failure.getMessage(), containsString("failed to get store file metadata"));
+            assertThat(failure.getCause(), sameInstance(simulated));
+        }
+    }
+
+    /**
+     * Cuts the given number of bytes off the end of a commit blob, as if the blob had been written short.
+     */
+    private static void cutBlob(FakeStatelessNode node, String blobName, int bytes) throws IOException {
+        final var container = node.getShardContainer();
+        final byte[] contents;
+        try (var in = container.readBlob(OperationPurpose.INDICES, blobName)) {
+            contents = in.readAllBytes();
+        }
+        container.writeBlob(OperationPurpose.INDICES, blobName, new BytesArray(contents, 0, contents.length - bytes), false);
+    }
+
+    /**
      * A node with an object store whose reads with the purpose SNAPSHOT_METADATA the test can see and replace.
      */
     private FakeStatelessNode newNode() throws IOException {
@@ -457,7 +616,19 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
      * commit blob of each group ends with the last commit of the group.
      */
     private static List<UploadedCommit> uploadCommitBlobs(FakeStatelessNode node, int... commitsPerBlob) throws IOException {
-        final var commits = node.generateCommitsWithUnchangedGenerationalFiles(IntStream.of(commitsPerBlob).sum());
+        return uploadCommitBlobs(
+            node,
+            node.generateCommitsWithUnchangedGenerationalFiles(IntStream.of(commitsPerBlob).sum()),
+            commitsPerBlob
+        );
+    }
+
+    /**
+     * Uploads the given commits in commit blobs of the given sizes. The commit blob of each group ends with the last commit of the group.
+     */
+    private static List<UploadedCommit> uploadCommitBlobs(FakeStatelessNode node, List<StatelessCommitRef> commits, int... commitsPerBlob)
+        throws IOException {
+        assertThat(commits.size(), equalTo(IntStream.of(commitsPerBlob).sum()));
         final var uploadedCommits = new ArrayList<UploadedCommit>();
         int next = 0;
         for (int size : commitsPerBlob) {
