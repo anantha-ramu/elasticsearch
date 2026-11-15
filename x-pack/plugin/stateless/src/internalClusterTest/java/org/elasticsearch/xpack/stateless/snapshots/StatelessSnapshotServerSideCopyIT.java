@@ -8,6 +8,7 @@
 package org.elasticsearch.xpack.stateless.snapshots;
 
 import org.apache.logging.log4j.Level;
+import org.apache.lucene.index.IndexFileNames;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.admin.cluster.snapshots.create.CreateSnapshotResponse;
 import org.elasticsearch.action.admin.cluster.snapshots.restore.RestoreSnapshotResponse;
@@ -21,6 +22,7 @@ import org.elasticsearch.common.CheckedSupplier;
 import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
+import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.io.stream.InputStreamStreamInput;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
@@ -97,7 +99,9 @@ import static org.elasticsearch.xpack.stateless.reshard.SplitSourceService.RESHA
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.RELOCATION_DURING_SNAPSHOT_ENABLED_SETTING;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.STATELESS_SNAPSHOT_ENABLED_SETTING;
+import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.anEmptyMap;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
@@ -105,6 +109,7 @@ import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.matchesPattern;
 import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.startsWith;
 
 /**
  * Shard snapshots that copy stateless commit blobs into the repository server-side, and the snapshot operations that read them: restore,
@@ -195,7 +200,8 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
                     + "][*] shard snapshot copy stats: new copies [*], copied bytes [*], total copy time [*ms], slowest copy [*ms],"
                     + " files in new copies [*], reused copies [0], files in reused copies [0], files reused by name, uploaded [0],"
                     + " bytes reused by name, uploaded [0], files reused by name, copied [0], bytes reused by name, copied [0],"
-                    + " uploaded files [0], uploaded bytes [0], dead bytes [*], dead bytes per new copy [*]"
+                    + " uploaded files [0], uploaded bytes [0], dead bytes [*], dead bytes per new copy [*], copied bytes at least [*],"
+                    + " exact lengths [* of *], copied bytes and dead bytes count only the new copies with an exact length"
             )
         );
         assertAllDataFilesCopied(repoName, indexName, "snap");
@@ -497,6 +503,103 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
         assertHitCount(prepareSearch("restored"), firstDocCount);
     }
 
+    /**
+     * A shard snapshot copies a commit blob that is one byte short, and the copy call cannot tell. An S3 CopyObject request is such a
+     * call: S3 copies what the source holds, and does not say how long the source was. The mock repository can act the same way.
+     * <p>
+     * Then the footer read is the only check left. A shard snapshot reads the footer of each file before it copies anything, at the place
+     * that the copy takes the file from. A footer is the last 16 bytes of a Lucene file. The footer holds the checksum of the file. The
+     * test cuts the newest commit blob so that the commit blob ends one byte before the end of its last file. That cut removes the last
+     * byte of the footer of that file. The footer read must find that the blob ends early. The shard snapshot must fail with an error
+     * that says so, before any copy, so that no copied blob stays in the repository. After the commit blob is whole again, the next
+     * snapshot works.
+     */
+    public void testShortCommitBlobWithHiddenLengthFailsTheShardSnapshotBeforeAnyCopy() throws Exception {
+        final Settings settings = copySettings().build();
+        final String indexNode = startMasterAndIndexNode(settings);
+        startSearchNode(settings);
+        final String indexName = randomIdentifier();
+        createIndex(indexName, 1, 1);
+        ensureGreen(indexName);
+        final long docCount = indexDocsAndFlush(indexName, between(1, 3));
+
+        // the snapshot repository is the mock one, so that its copies can hide the length of the source blob
+        final String repoName = randomIdentifier();
+        final Path location = randomRepoPath();
+        createRepository(logger, repoName, StatelessMockRepositoryPlugin.TYPE, Settings.builder().put("location", location), true);
+        final var copyCalls = new AtomicInteger();
+        snapshotRepositoryOnNode(repoName, indexNode).setStrategy(new StatelessMockRepositoryStrategy() {
+            @Override
+            public boolean blobContainerCopyBlobKnowsLength() {
+                return false;
+            }
+
+            @Override
+            public void blobContainerCopyBlob(
+                CheckedRunnable<IOException> originalRunnable,
+                OperationPurpose purpose,
+                BlobContainer sourceBlobContainer,
+                String sourceBlobName,
+                String blobName,
+                long neededEnd
+            ) throws IOException {
+                copyCalls.incrementAndGet();
+                originalRunnable.run();
+            }
+        });
+
+        // cut the newest commit blob in the object store, so that it ends one byte before the end of its last file
+        final BlobContainer commitBlobs = getShardCommitsContainerForCurrentPrimaryTerm(indexName, indexNode, 0);
+        final String commitBlob = newestCommitBlob(commitBlobs);
+        final byte[] whole;
+        try (InputStream in = commitBlobs.readBlob(OperationPurpose.INDICES, commitBlob)) {
+            whole = in.readAllBytes();
+        }
+        final StatelessCompoundCommit newestCommit = readCommitHeaders(
+            commitBlobs,
+            OperationPurpose.INDICES,
+            commitBlob,
+            commitBlob,
+            whole.length
+        ).lastCompoundCommit();
+        final String lastFile = newestCommit.internalFiles()
+            .stream()
+            .max(Comparator.comparingLong(file -> newestCommit.commitFiles().get(file).offset()))
+            .orElseThrow();
+        // The commit blob stores its files sorted by size, so the last file is a large data file, and not the small segments_N file. The
+        // cut leaves segments_N whole, so only the footer read of the last file sees the cut. If the cut hit segments_N instead, the
+        // read of that file would fail first, and the test would not show that the footer read works.
+        assertThat(lastFile, not(startsWith(IndexFileNames.SEGMENTS)));
+        final BlobLocation lastLocation = newestCommit.commitFiles().get(lastFile);
+        final int cutLength = Math.toIntExact(lastLocation.offset() + lastLocation.fileLength() - 1);
+        commitBlobs.writeBlob(OperationPurpose.INDICES, commitBlob, new BytesArray(whole, 0, cutLength), false);
+
+        final CreateSnapshotResponse failed = clusterAdmin().prepareCreateSnapshot(TEST_REQUEST_TIMEOUT, repoName, "short")
+            .setIndices(indexName)
+            .setWaitForCompletion(true)
+            .setPartial(true)
+            .get();
+        final SnapshotInfo failedInfo = failed.getSnapshotInfo();
+        assertThat(failedInfo.state(), equalTo(SnapshotState.PARTIAL));
+        assertThat(failedInfo.failedShards(), equalTo(1));
+        assertThat(
+            failedInfo.shardFailures().getFirst().reason(),
+            allOf(containsString("failed to get store file metadata"), containsString("ends early"))
+        );
+        // the failure came before the first copy, so the snapshot made no copy and left none in the repository
+        assertThat(copyCalls.get(), equalTo(0));
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), empty());
+
+        // the commit blob is whole again, so the next snapshot copies it, and the snapshot restores
+        commitBlobs.writeBlob(OperationPurpose.INDICES, commitBlob, new BytesArray(whole), false);
+        createSnapshot(repoName, "whole", List.of(indexName), List.of());
+        assertThat(copyCalls.get(), greaterThan(0));
+        assertAllDataFilesCopied(repoName, indexName, "whole");
+        assertCopiedBlobsMatchShardGenerations(repoName, indexName, location);
+        restore(repoName, "whole", indexName, "restored");
+        assertHitCount(prepareSearch("restored"), docCount);
+    }
+
     public void testCloneKeepsCopiesUntilDeleted() throws Exception {
         final Settings settings = copySettings().build();
         startMasterAndIndexNode(settings);
@@ -790,7 +893,8 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
                     + busyReusedCopied.size()
                     + "], bytes reused by name, copied ["
                     + busyReusedCopied.stream().mapToLong(FileInfo::length).sum()
-                    + "], uploaded files [*], uploaded bytes [*], dead bytes [*], dead bytes per new copy [*]"
+                    + "], uploaded files [*], uploaded bytes [*], dead bytes [*], dead bytes per new copy [*], copied bytes at least [*],"
+                    + " exact lengths [* of *], copied bytes and dead bytes count only the new copies with an exact length"
             )
         );
         final Set<String> busyCopiesAtThird = copiedBlobs(repoName, busy, 0);
@@ -1280,7 +1384,8 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
                     + "\\]\\[snap/[^\\]]+\\]\\["
                     + indexName
                     + "\\]\\[\\d+\\] shard snapshot copy stats: attempt \\[paused\\], copies made \\[[1-9]\\d*\\], "
-                    + "copied bytes \\[\\d+\\], total copy time \\[\\d+ms\\]"
+                    + "copied bytes \\[\\d+\\], total copy time \\[\\d+ms\\], copied bytes at least \\[\\d+\\], "
+                    + "exact lengths \\[\\d+ of [1-9]\\d*\\], copied bytes count only the copies made with an exact length"
             )
         );
 
@@ -1847,14 +1952,39 @@ public class StatelessSnapshotServerSideCopyIT extends AbstractStatelessPluginIn
     private BatchedCompoundCommit readCopiedBlob(String repoName, String indexName, String copy, String commitBlobName) throws IOException {
         final BlobContainer shardContainer = shardContainer(repoName, indexName, 0);
         final long length = shardContainer.listBlobs(OperationPurpose.SNAPSHOT_METADATA).get(copy).length();
+        return readCommitHeaders(shardContainer, OperationPurpose.SNAPSHOT_DATA, copy, commitBlobName, length);
+    }
+
+    /**
+     * Reads the commit headers of a blob with the reader that the stateless plugin uses for commit blobs. The reader takes the generation
+     * from the name of a commit blob, so the method takes that name next to the name of the blob that it reads, see
+     * {@link #readCopiedBlob}. For a commit blob in the object store, the two names are the same.
+     */
+    private static BatchedCompoundCommit readCommitHeaders(
+        BlobContainer container,
+        OperationPurpose purpose,
+        String blobName,
+        String commitBlobName,
+        long length
+    ) throws IOException {
         return BatchedCompoundCommit.readFromStore(
             commitBlobName,
             length,
-            (ignored, offset, readLength) -> new InputStreamStreamInput(
-                shardContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, copy, offset, readLength)
-            ),
+            (ignored, offset, readLength) -> new InputStreamStreamInput(container.readBlob(purpose, blobName, offset, readLength)),
             true
         );
+    }
+
+    /**
+     * The name of the commit blob with the highest generation, among the commit blobs in the given container of a shard.
+     */
+    private static String newestCommitBlob(BlobContainer commitBlobs) throws IOException {
+        return commitBlobs.listBlobs(OperationPurpose.INDICES)
+            .keySet()
+            .stream()
+            .filter(BatchedCompoundCommit::startsWithBlobPrefix)
+            .max(Comparator.comparingLong(BatchedCompoundCommit::parseGenerationFromBlobName))
+            .orElseThrow();
     }
 
     /**

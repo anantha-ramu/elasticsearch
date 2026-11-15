@@ -156,10 +156,11 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
      * With server-side copy off, each file is read at the first location that the primary learned for it, which is where a snapshot
      * uploads it from. With server-side copy on, each file is read at the location that the repository copies it from, see
      * {@link #copySource}. The two differ for a carried generational file: the first location is in an older commit blob, and the copy
-     * is in the commit blob of the snapshotted commit. Not every object store checks the length of the blob during the copy, so this
-     * read is where the snapshot learns that the commit blob reaches to the end of each file. Reading a carried file in the older blob
-     * would show nothing about the blob that the repository copies. A blob that ends early fails the read, see
-     * {@link MetadataSnapshotBlobStoreDirectory}, and the snapshot then fails with an {@link IndexShardSnapshotFailedException}.
+     * is in the commit blob of the snapshotted commit. The repository lists the commit blob neither before nor after the copy, and not
+     * every object store checks the length of the blob during the copy. So this read is where the snapshot learns that the commit blob
+     * reaches to the end of each file. Reading a carried file in the older blob would show nothing about the blob that the repository
+     * copies. A blob that ends early fails the read, see {@link MetadataSnapshotBlobStoreDirectory}, and the snapshot then fails with an
+     * {@link IndexShardSnapshotFailedException}.
      */
     @Override
     public Store.MetadataSnapshot metadataSnapshot() {
@@ -262,6 +263,11 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
      * location, which is where snapshots took the file from before. The index node keeps the commit blob at that location while Lucene
      * still has the file. Tests run with assertions, so a missing copy fails a test. If the read fails, the method throws
      * {@link IndexShardSnapshotFailedException}, which fails the shard snapshot as the failed read of a footer does.
+     * <p>
+     * The repository relies on {@link #metadataSnapshot} to check the commit blob that this method returns, see
+     * {@link SnapshotShardContext#copySource}. {@link #metadataSnapshot} reads the footer of each file at the same location that this
+     * method returns, so for a carried generational file the footer comes from the copy in the commit blob of the commit. A blob that
+     * ends before the end of the file fails that read.
      */
     @Override
     public CopySource copySource(String file) {

@@ -235,17 +235,25 @@ public class StatelessMockRepository extends FsRepository {
                 long neededEnd,
                 @Nullable Executor executor
             ) throws IOException {
+                // A strategy can make the copy behave like one that cannot know the length of its source: it asks for no length, and it
+                // returns none.
+                final boolean knowsLength = getStrategy().blobContainerCopyBlobKnowsLength();
                 // The strategy hook takes a runnable, so the length goes through a reference. A strategy that does not run the copy
                 // leaves it without a length.
                 final var length = new AtomicReference<>(OptionalLong.empty());
-                getStrategy().blobContainerCopyBlob(
-                    () -> length.set(super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor)),
-                    purpose,
-                    sourceBlobContainer,
-                    sourceBlobName,
-                    blobName,
-                    neededEnd
-                );
+                getStrategy().blobContainerCopyBlob(() -> {
+                    final var copiedLength = super.copyBlob(
+                        purpose,
+                        sourceBlobContainer,
+                        sourceBlobName,
+                        blobName,
+                        knowsLength ? neededEnd : 0L,
+                        executor
+                    );
+                    if (knowsLength) {
+                        length.set(copiedLength);
+                    }
+                }, purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd);
                 return length.get();
             }
 

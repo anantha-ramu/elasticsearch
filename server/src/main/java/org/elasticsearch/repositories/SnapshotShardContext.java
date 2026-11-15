@@ -116,6 +116,13 @@ public abstract class SnapshotShardContext extends DelegatingActionListener<Shar
      * that holds the files of one or more Lucene commits, see {@link BlobStoreIndexShardSnapshot.FileInfo}. Only a stateless shard can
      * return a commit blob, and only when server-side copy is enabled. While a copy runs, the caller holds the shard's commit with
      * {@link #fileReader} of a file in that blob, as an upload of that file would, so that the commit blob stays in the object store.
+     * <p>
+     * The repository lists the commit blob neither before nor after the copy. A copy call fails if the commit blob is missing, and
+     * where the call can learn the length of the blob, it fails if the blob ends before the end of the last file that the snapshot takes
+     * from it. Some calls cannot learn the length, and they copy whatever the blob holds. So the repository relies on the context for
+     * one more check. Before the repository asks for the copy source of a file, {@link #metadataSnapshot} must have read the footer of
+     * the file, from the commit blob and at the offset that the copy source gives, and the snapshot must fail if that read returned
+     * fewer bytes than the footer has. A footer that is there shows that the commit blob reaches at least to the end of the file.
      */
     @Nullable
     public CopySource copySource(String file) {

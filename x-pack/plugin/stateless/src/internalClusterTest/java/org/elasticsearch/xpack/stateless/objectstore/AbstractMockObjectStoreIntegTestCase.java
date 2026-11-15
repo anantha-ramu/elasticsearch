@@ -153,7 +153,8 @@ public abstract class AbstractMockObjectStoreIntegTestCase extends AbstractObjec
                 "the failed attempt made the allowed copy",
                 BlobStoreRepository.class.getCanonicalName(),
                 Level.INFO,
-                "*shard snapshot copy stats: attempt [failed], copies made [1], copied bytes [*], total copy time [*ms]"
+                "*shard snapshot copy stats: attempt [failed], copies made [1], copied bytes [*], total copy time [*ms],"
+                    + " copied bytes at least [*], exact lengths [* of 1], copied bytes count only the copies made with an exact length"
             )
         );
         final SnapshotInfo snapshotInfo = response.get().getSnapshotInfo();

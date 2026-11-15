@@ -632,13 +632,8 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
     /**
      * A copy request that S3 answers with HTTP status 200 and an error document in the body fails the shard snapshot. The S3 client reads
      * the body and finds the error. The error code is InternalError, so the client retries the copy. Every retry gets the same error, so
-     * the client gives up and throws, and {@code S3BlobContainer.copyBlob} fails.
-     * <p>
-     * Before a shard snapshot writes its shard snapshot blob, {@code snap-<uuid>.dat}, it checks the copies that it made. Each copy is a
-     * copied blob in the repository, named {@code c__<shard generation>_<primary term>_<commit blob>}, and it is a copy of a commit blob
-     * from the object store. A commit blob holds the files of a commit. The check is that each copied blob exists and has the length of its
-     * commit blob. A failed check has "but expected" in its message. The check runs only after every copy call has returned normally. Here
-     * a copy call throws, so the shard snapshot never reaches the check.
+     * the client gives up and throws, and {@code S3BlobContainer.copyBlob} fails. The shard snapshot lists nothing to find that out: it
+     * relies on the copy call, which fails.
      */
     public void testCopyThatAnswers200WithAnErrorBodyFailsTheShardSnapshot() throws Exception {
         final String reason = snapshotWhileCopiesAnswer200WithAnError("", Declaration.BEFORE_WHITESPACE);
@@ -646,8 +641,6 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
         assertThat(reason, containsString("Unable to copy object"));
         // the exception of the S3 client has the message of the error document
         assertThat(reason, containsString(COPY_ERROR_MESSAGE));
-        // a reason without "but expected" shows that the shard snapshot failed in copyBlob, and not in the check of the copies
-        assertThat(reason, not(containsString("but expected")));
     }
 
     /**
@@ -667,7 +660,6 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
         } else {
             assertThat(reason, containsString(COPY_ERROR_MESSAGE));
         }
-        assertThat(reason, not(containsString("but expected")));
     }
 
     /**
@@ -811,7 +803,8 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
                 "the failed attempt made the allowed copy",
                 BlobStoreRepository.class.getCanonicalName(),
                 Level.INFO,
-                "*shard snapshot copy stats: attempt [failed], copies made [1], copied bytes [*], total copy time [*ms]"
+                "*shard snapshot copy stats: attempt [failed], copies made [1], copied bytes [*], total copy time [*ms],"
+                    + " copied bytes at least [*], exact lengths [* of 1], copied bytes count only the copies made with an exact length"
             )
         );
         final SnapshotInfo snapshotInfo = response.get().getSnapshotInfo();

@@ -174,6 +174,16 @@ public class StatelessMockRepositoryStrategy {
     }
 
     /**
+     * Whether a copy knows the length of its source blob. The default is {@code true}, and a copy then checks that the source reaches to
+     * the needed end and returns the length, as the file system does. A copy can be unable to know the length. An S3 CopyObject request
+     * is one, and so is an Azure copy inside one storage account: they copy whatever the source holds, without a check of its length,
+     * and return no length. With {@code false}, the copy of the mock repository behaves like that.
+     */
+    public boolean blobContainerCopyBlobKnowsLength() {
+        return true;
+    }
+
+    /**
      * Called in {@link BlobContainer#writeMetadataBlob(OperationPurpose, String, boolean, boolean, CheckedConsumer)}.
      */
     public void blobContainerWriteMetadataBlob(

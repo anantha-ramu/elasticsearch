@@ -28,7 +28,6 @@ import org.elasticsearch.common.blobstore.fs.FsBlobContainer;
 import org.elasticsearch.common.blobstore.fs.FsBlobStore;
 import org.elasticsearch.common.blobstore.support.BlobMetadata;
 import org.elasticsearch.common.blobstore.support.FilterBlobContainer;
-import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.collect.Iterators;
 import org.elasticsearch.common.io.stream.BytesStreamOutput;
@@ -72,12 +71,14 @@ import org.elasticsearch.test.junit.annotations.TestLogging;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -85,8 +86,10 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.IntPredicate;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
@@ -96,6 +99,7 @@ import java.util.stream.Stream;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 
@@ -118,15 +122,19 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             );
             final Snapshot snapshot = shardAndRepository.newSnapshot();
             final IndexShardSnapshotStatus status = IndexShardSnapshotStatus.newInitializing(null, randomLongBetween(1, Long.MAX_VALUE));
-            // The copy stats log line counts each commit blob as one new copy, of the blob's whole length. Its dead bytes are the filler
-            // that writeCommitBlobs puts before and between the files, because no file uses it.
+            // The copy stats log line counts each commit blob as one new copy, of the blob's whole length, which the copy call returns. Its
+            // dead bytes are the filler that writeCommitBlobs puts before, between and after the files, because no file uses it. The
+            // needed end of a copy is where the last file in the blob ends, so it is shorter than the blob if there is filler after it.
             final Map<String, BlobMetadata> objectStoreBlobs = shardAndRepository.objectStore.listBlobs(OperationPurpose.SNAPSHOT_METADATA);
             final Map<String, Long> blobLengths = new HashMap<>();
             final Map<String, Long> fileBytes = new HashMap<>();
+            final Map<String, Long> neededEnds = new HashMap<>();
             for (Map.Entry<String, SnapshotShardContext.CopySource> entry : sources.entrySet()) {
                 final String blobName = entry.getValue().blobName();
                 blobLengths.put(blobName, objectStoreBlobs.get(blobName).length());
-                fileBytes.merge(blobName, shardAndRepository.fileLength(entry.getKey()), Long::sum);
+                final long fileLength = shardAndRepository.fileLength(entry.getKey());
+                fileBytes.merge(blobName, fileLength, Long::sum);
+                neededEnds.merge(blobName, entry.getValue().offset() + fileLength, Math::max);
             }
             final List<Long> deadBytes = blobLengths.keySet()
                 .stream()
@@ -148,6 +156,7 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                     + deadBytes.stream().mapToLong(Long::longValue).sum()
                     + "], dead bytes per new copy "
                     + deadBytes
+                    + statsTail(neededEnds.values().stream().mapToLong(Long::longValue).sum(), blobLengths.size(), blobLengths.size())
             );
 
             // every data file is a range of a copy of the commit blob that holds it, at the same offset
@@ -192,8 +201,8 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
     }
 
     /**
-     * Each copy of a commit blob is logged at debug with the name of the copy, its size and the time that the copy call took. A run can
-     * then show which copies were slow.
+     * Each copy of a commit blob is logged at debug with the name of the copy, the bytes that the snapshot needs from the commit blob,
+     * the length of the commit blob and the time that the copy call took. A run can then show which copies were slow.
      */
     @TestLogging(reason = "the copies are logged at debug", value = "org.elasticsearch.repositories.blobstore.BlobStoreRepository:DEBUG")
     public void testEachCopyIsLoggedAtDebug() throws IOException {
@@ -211,7 +220,15 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             for (SnapshotShardContext.CopySource source : sources.values()) {
                 blobNameBySource.put(source.source(), source.blobName());
             }
-            // one line for each commit blob, with the length of the commit blob, which the copy has as well
+            // one line for each commit blob, with the length of the commit blob, which the copy has as well, and the needed end
+            final Map<String, Long> neededEnds = new HashMap<>();
+            for (Map.Entry<String, SnapshotShardContext.CopySource> entry : sources.entrySet()) {
+                neededEnds.merge(
+                    entry.getValue().source(),
+                    entry.getValue().offset() + shardAndRepository.fileLength(entry.getKey()),
+                    Math::max
+                );
+            }
             final List<MockLog.LoggingExpectation> expectations = new ArrayList<>();
             for (Map.Entry<String, String> entry : blobNameBySource.entrySet()) {
                 expectations.add(
@@ -222,9 +239,11 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                         shardAndRepository.logPrefix(snapshot)
                             + " copied blob [c__*] from ["
                             + entry.getKey()
-                            + "]: ["
+                            + "]: needed ["
+                            + neededEnds.get(entry.getKey())
+                            + "] bytes, source length ["
                             + objectStoreBlobs.get(entry.getValue()).length()
-                            + "] bytes in [*ms]"
+                            + "], in [*ms]"
                     )
                 );
             }
@@ -275,6 +294,7 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                     + "], bytes reused by name, copied ["
                     + reusedByName.stream().mapToLong(FileInfo::length).sum()
                     + "], uploaded files [0], uploaded bytes [0], dead bytes [0], dead bytes per new copy []"
+                    + statsTail(0, 0, 0)
             );
             assertThat(copiedBlobs(shardAndRepository.shardContainer()), equalTo(copiesAfterFirst));
             final FileInfo hiddenFileInfo = shardAndRepository.loadShardSnapshot(second)
@@ -521,7 +541,8 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                     + reusedCopied.size()
                     + "], bytes reused by name, copied ["
                     + reusedCopied.stream().mapToLong(FileInfo::length).sum()
-                    + "], uploaded files [0], uploaded bytes [0], dead bytes [*], dead bytes per new copy [*]"
+                    + "], uploaded files [0], uploaded bytes [0], dead bytes [*], dead bytes per new copy [*], copied bytes at least [*],"
+                    + " exact lengths [1 of 1], copied bytes and dead bytes count only the new copies with an exact length"
             );
 
             shardAndRepository.restoreAndCheck(second);
@@ -675,7 +696,7 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 .length();
 
             // The second snapshot reuses that copy for the hidden file and copies a second commit blob for its new files. One of its copies
-            // fails inside the copy task: the listing shows a commit blob that is not there, so the length check passes and the copy fails.
+            // fails inside the copy task: the commit blob of one new file is not in the object store.
             shardAndRepository.indexSegments(1);
             final Set<String> known = Set.copyOf(sources.keySet());
             final Map<String, SnapshotShardContext.CopySource> newSources = shardAndRepository.writeCommitBlobs(
@@ -684,29 +705,19 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 0
             );
             final String missingBlob = "stateless_commit_missing";
-            final BlobContainer listingWithMissingBlob = new ListingWithMissingBlob(shardAndRepository.objectStore, missingBlob);
             final String failingFile = randomFrom(newSources.keySet());
-            for (Map.Entry<String, SnapshotShardContext.CopySource> entry : newSources.entrySet()) {
-                final SnapshotShardContext.CopySource source = entry.getValue();
-                sources.put(
-                    entry.getKey(),
-                    entry.getKey().equals(failingFile)
-                        ? new SnapshotShardContext.CopySource(
-                            source.source() + "_missing",
-                            "1_" + missingBlob,
-                            listingWithMissingBlob,
-                            missingBlob,
-                            0
-                        )
-                        : new SnapshotShardContext.CopySource(
-                            source.source(),
-                            source.copyName(),
-                            listingWithMissingBlob,
-                            source.blobName(),
-                            source.offset()
-                        )
-                );
-            }
+            sources.putAll(newSources);
+            final SnapshotShardContext.CopySource failingSource = newSources.get(failingFile);
+            sources.put(
+                failingFile,
+                new SnapshotShardContext.CopySource(
+                    failingSource.source() + "_missing",
+                    "1_" + missingBlob,
+                    shardAndRepository.objectStore,
+                    missingBlob,
+                    0
+                )
+            );
             expectThrows(
                 Exception.class,
                 () -> shardAndRepository.snapshot(
@@ -752,11 +763,15 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         }
     }
 
-    public void testCommitBlobTooShortFailsBeforeAnyCopy() throws IOException {
+    /**
+     * The repository does not list the commit blobs before it copies them, so the copy call checks that a commit blob reaches to the end
+     * of the last file that the snapshot takes from it. Here each commit blob loses its last bytes, so the range of the last file in it
+     * runs past its end. The FS container knows the length of the source for free, and it fails the copy before it copies a byte.
+     */
+    public void testCommitBlobTooShortFailsTheShardSnapshot() throws IOException {
         final var shardAndRepository = new ShardAndRepository();
         try {
             shardAndRepository.indexSegments(between(1, 3));
-            // Each commit blob loses its last bytes, so the range of the last file written into it runs past its end.
             final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
                 between(1, 3),
                 name -> true,
@@ -764,14 +779,21 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             );
             final Snapshot snapshot = shardAndRepository.newSnapshot();
             final Exception e = expectThrows(Exception.class, () -> shardAndRepository.snapshot(snapshot, sources::get));
-            assertThat(e.getMessage(), containsString("does not fit in commit blob"));
+            final IOException failure = (IOException) ExceptionsHelper.unwrap(e, IOException.class);
+            assertThat(e.toString(), failure, notNullValue());
+            assertThat(failure.getMessage(), containsString("the source is ["));
+            assertThat(failure.getMessage(), containsString("bytes long, but the caller needs ["));
             shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
         } finally {
             shardAndRepository.close();
         }
     }
 
-    public void testMissingCommitBlobFailsBeforeAnyCopy() throws IOException {
+    /**
+     * A commit blob that is not in the object store fails its copy call with a {@link NoSuchFileException}, without a listing before it.
+     * The failure fails the shard snapshot, which deletes the copies that it made and writes no {@code snap-<uuid>.dat} blob.
+     */
+    public void testMissingCommitBlobFailsTheShardSnapshot() throws IOException {
         final var shardAndRepository = new ShardAndRepository();
         try {
             shardAndRepository.indexSegments(between(1, 3));
@@ -780,22 +802,31 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 name -> true,
                 0
             );
-            // One of the commit blobs is gone from the object store, so the listing taken before any copy does not show it.
+            // One of the commit blobs is gone from the object store.
             final String missingBlob = randomFrom(sources.values()).blobName();
             shardAndRepository.objectStore.deleteBlobsIgnoringIfNotExists(OperationPurpose.SNAPSHOT_DATA, Iterators.single(missingBlob));
             final Snapshot snapshot = shardAndRepository.newSnapshot();
             final Exception e = expectThrows(Exception.class, () -> shardAndRepository.snapshot(snapshot, sources::get));
-            assertThat(e.getMessage(), containsString("to copy is missing"));
+            assertThat(e.toString(), ExceptionsHelper.unwrap(e, NoSuchFileException.class), notNullValue());
             shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
         } finally {
             shardAndRepository.close();
         }
     }
 
-    public void testBrokenCopyFailsBeforeShardSnapshotIsWritten() throws IOException {
-        // The repository's copy call returns as if it worked, but the copy is then missing, or one byte short.
-        final boolean dropCopy = randomBoolean();
-        final var shardAndRepository = new ShardAndRepository(container -> new BrokenCopies(container, dropCopy));
+    /**
+     * A copy call that fails, here with an {@link IOException} as a cloud client throws it, fails the shard snapshot. No other copy
+     * makes the shard snapshot succeed. The shard snapshot writes no {@code snap-<uuid>.dat} blob, and its failure cleanup deletes the
+     * copies that did work.
+     */
+    public void testFailedCopyFailsTheShardSnapshotBeforeItIsWritten() throws IOException {
+        final AtomicInteger copyCalls = new AtomicInteger();
+        // the copy that fails is one of them, or all of them, chosen when the number of copies is known
+        final AtomicInteger failingCall = new AtomicInteger();
+        final boolean failAll = randomBoolean();
+        final var shardAndRepository = new ShardAndRepository(
+            container -> new FailingCopies(container, copyCalls, call -> failAll || call == failingCall.get())
+        );
         try {
             shardAndRepository.indexSegments(between(1, 3));
             final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
@@ -803,13 +834,79 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 name -> true,
                 0
             );
+            final int copies = Math.toIntExact(sources.values().stream().map(SnapshotShardContext.CopySource::blobName).distinct().count());
+            failingCall.set(between(1, copies));
             final Snapshot snapshot = shardAndRepository.newSnapshot();
             final Exception e = expectThrows(Exception.class, () -> shardAndRepository.snapshot(snapshot, sources::get));
-            assertThat(e.getMessage(), containsString("but expected"));
-            assertThat(e.getMessage(), e.getMessage().contains("none, it is missing"), equalTo(dropCopy));
-            // the check of the copies failed before snap-<uuid>.dat was written, and the failure cleanup deleted any copy still in the
-            // shard's folder
+            assertThat(e.toString(), ExceptionsHelper.unwrap(e, IOException.class), notNullValue());
+            assertThat(copyCalls.get(), greaterThanOrEqualTo(1));
             shardAndRepository.assertFailedSnapshotLeftNoData(snapshot);
+        } finally {
+            shardAndRepository.close();
+        }
+    }
+
+    /**
+     * A copy call can return no length, as an S3 CopyObject request does. The line of the copy stats says how many of the new copies
+     * have an exact length. Copied bytes and dead bytes count only those copies, and the needed ends of all the new copies add up to a
+     * lower bound of the bytes that the snapshot copied.
+     */
+    public void testStatsCountOnlyTheCopiesWithAnExactLength() throws IOException {
+        final var hiddenLengths = new HashSet<String>();
+        final var shardAndRepository = new ShardAndRepository(container -> new HidingLengthOfCopies(container, hiddenLengths::contains));
+        try {
+            shardAndRepository.indexSegments(between(2, 4));
+            final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
+                between(2, 4),
+                name -> true,
+                0
+            );
+            // at least one commit blob has an exact length, and at least one has none
+            final List<String> blobNames = sources.values().stream().map(SnapshotShardContext.CopySource::blobName).distinct().toList();
+            assertThat(blobNames.size(), greaterThanOrEqualTo(2));
+            final List<String> hidden = randomNonEmptySubsetOf(blobNames.subList(1, blobNames.size()));
+            hiddenLengths.addAll(hidden);
+
+            final Map<String, BlobMetadata> objectStoreBlobs = shardAndRepository.objectStore.listBlobs(OperationPurpose.SNAPSHOT_METADATA);
+            final Map<String, Long> fileBytes = new HashMap<>();
+            final Map<String, Long> neededEnds = new HashMap<>();
+            for (Map.Entry<String, SnapshotShardContext.CopySource> entry : sources.entrySet()) {
+                final String blobName = entry.getValue().blobName();
+                final long fileLength = shardAndRepository.fileLength(entry.getKey());
+                fileBytes.merge(blobName, fileLength, Long::sum);
+                neededEnds.merge(blobName, entry.getValue().offset() + fileLength, Math::max);
+            }
+            long copiedBytes = 0;
+            final List<Long> deadBytes = new ArrayList<>();
+            for (String blobName : blobNames) {
+                if (hidden.contains(blobName) == false) {
+                    copiedBytes += objectStoreBlobs.get(blobName).length();
+                    deadBytes.add(objectStoreBlobs.get(blobName).length() - fileBytes.get(blobName));
+                }
+            }
+            deadBytes.sort(Comparator.reverseOrder());
+
+            final Snapshot snapshot = shardAndRepository.newSnapshot();
+            assertCopyStatsLogged(
+                () -> shardAndRepository.snapshot(snapshot, sources::get),
+                shardAndRepository.copyStatsPrefix(snapshot)
+                    + ": new copies ["
+                    + blobNames.size()
+                    + "], copied bytes ["
+                    + copiedBytes
+                    + "], total copy time [*ms], slowest copy [*ms], files in new copies [*], reused copies [0],"
+                    + " files in reused copies [0], files reused by name, uploaded [0], bytes reused by name, uploaded [0],"
+                    + " files reused by name, copied [0],"
+                    + " bytes reused by name, copied [0], uploaded files [0], uploaded bytes [0], dead bytes ["
+                    + deadBytes.stream().mapToLong(Long::longValue).sum()
+                    + "], dead bytes per new copy "
+                    + deadBytes
+                    + statsTail(
+                        neededEnds.values().stream().mapToLong(Long::longValue).sum(),
+                        blobNames.size() - hidden.size(),
+                        blobNames.size()
+                    )
+            );
         } finally {
             shardAndRepository.close();
         }
@@ -863,30 +960,37 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
      * copies.
      */
     public void testFailedAttemptLogsCopyStatsBeforeCleanup() throws IOException {
-        // The copy calls return, but the copies are then missing or one byte short, so the check of the copies fails after all the copies
-        // are made.
-        final boolean dropCopy = randomBoolean();
+        // The last copy call to start fails. The shard snapshot fails when all the copy calls are done, so by then the other copy calls
+        // have returned, and they are the copies that the attempt made.
+        final AtomicInteger copyCalls = new AtomicInteger();
+        final AtomicInteger lastCall = new AtomicInteger();
         final var statsLogged = new AtomicBoolean();
         final var statsLoggedBeforeCleanup = new AtomicReference<Boolean>();
         final var shardAndRepository = new ShardAndRepository(
             container -> new RunBeforeDelete(
-                new BrokenCopies(container, dropCopy),
+                new FailingCopies(container, copyCalls, call -> call == lastCall.get()),
                 () -> statsLoggedBeforeCleanup.compareAndSet(null, statsLogged.get())
             )
         );
         try {
-            shardAndRepository.indexSegments(between(1, 3));
+            shardAndRepository.indexSegments(between(2, 3));
             final Map<String, SnapshotShardContext.CopySource> sources = shardAndRepository.writeCommitBlobs(
-                between(1, 3),
+                between(2, 3),
                 name -> true,
                 0
             );
-            final long copies = sources.values().stream().map(SnapshotShardContext.CopySource::blobName).distinct().count();
+            final int copies = Math.toIntExact(sources.values().stream().map(SnapshotShardContext.CopySource::blobName).distinct().count());
+            assertThat(copies, greaterThanOrEqualTo(2));
+            lastCall.set(copies);
             final Snapshot snapshot = shardAndRepository.newSnapshot();
             final String message = shardAndRepository.copyStatsPrefix(snapshot)
                 + ": attempt [failed], copies made ["
-                + copies
-                + "], copied bytes [*], total copy time [*ms]";
+                + (copies - 1)
+                + "], copied bytes [*], total copy time [*ms], copied bytes at least [*], exact lengths ["
+                + (copies - 1)
+                + " of "
+                + (copies - 1)
+                + "], copied bytes count only the copies made with an exact length";
             MockLog.assertThatLogger(
                 () -> expectThrows(Exception.class, () -> shardAndRepository.snapshot(snapshot, sources::get)),
                 BlobStoreRepository.class,
@@ -913,7 +1017,8 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             final var status = IndexShardSnapshotStatus.newInitializing(null, randomLongBetween(1, Long.MAX_VALUE));
             statusRef.set(status);
             final String message = shardAndRepository.copyStatsPrefix(snapshot)
-                + ": attempt [paused], copies made [1], copied bytes [*], total copy time [*ms]";
+                + ": attempt [paused], copies made [1], copied bytes [*], total copy time [*ms], copied bytes at least [*],"
+                + " exact lengths [1 of 1], copied bytes count only the copies made with an exact length";
             MockLog.assertThatLogger(() -> {
                 final Exception e = expectThrows(
                     Exception.class,
@@ -925,6 +1030,20 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         } finally {
             shardAndRepository.close();
         }
+    }
+
+    /**
+     * The end of a copy stats line, which comes after the dead bytes per new copy: the sum of the needed ends of the new copies, the
+     * number of new copies that have an exact length out of all the new copies, and the note about what the bytes count.
+     */
+    private static String statsTail(long neededBytes, long exactLengths, long newCopies) {
+        return ", copied bytes at least ["
+            + neededBytes
+            + "], exact lengths ["
+            + exactLengths
+            + " of "
+            + newCopies
+            + "], copied bytes and dead bytes count only the new copies with an exact length";
     }
 
     /**
@@ -984,6 +1103,8 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
         @FixForMultiProject(description = "randomize when snapshot and restore support multiple projects, see also ES-10225, ES-10228")
         private final BlobStoreRepository repository;
         private final BlobContainer objectStore;
+        // the calls that list blobs or folders, on the shard containers of the repository and on the object store
+        private final AtomicInteger listings = new AtomicInteger();
         private IndexShard shard;
         private int commitBlobCount;
 
@@ -999,7 +1120,7 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 ProjectId.DEFAULT,
                 createTempDir(),
                 xContentRegistry(),
-                shardContainers
+                container -> new ListCounting(shardContainers == null ? container : shardContainers.apply(container), listings)
             );
             final Path objectStorePath = createTempDir();
             BlobContainer container = new FsBlobContainer(
@@ -1012,7 +1133,7 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             for (int i = between(0, 2); i > 0; i--) {
                 container = new WrappedContainer(container);
             }
-            objectStore = container;
+            objectStore = new ListCounting(container, listings);
             shard = newShard(shardId, true);
             recoverShardFromStore(shard);
         }
@@ -1059,8 +1180,9 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
 
         /**
          * Writes the chosen data files of the shard's last commit into {@code blobCount} commit blobs in the object store, with random
-         * filler before and between the files, and returns where each file can be copied from. {@code truncateBy} cuts that many bytes
-         * off the end of each blob, to make its last file's range too long for it.
+         * filler before and between the files, and returns where each file can be copied from. With no cut there is filler after the
+         * last file too, so the blob is longer than the end of its last file. {@code truncateBy} cuts that many bytes off the end of
+         * each blob instead, to make its last file's range too long for it.
          */
         Map<String, SnapshotShardContext.CopySource> writeCommitBlobs(int blobCount, Predicate<String> files, int truncateBy)
             throws IOException {
@@ -1096,6 +1218,9 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                                 input.readBytes(bytes, 0, bytes.length);
                                 blobBytes.writeBytes(bytes);
                             }
+                        }
+                        if (truncateBy == 0) {
+                            blobBytes.writeBytes(randomByteArrayOfLength(between(0, 512)));
                         }
                         final BytesReference bytes = blobBytes.bytes();
                         objectStore.writeBlob(OperationPurpose.SNAPSHOT_DATA, blobName, bytes.slice(0, bytes.length() - truncateBy), true);
@@ -1206,6 +1331,9 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             @Nullable Predicate<FileInfo> reusableCopies
         ) throws IOException {
             final PlainActionFuture<ShardSnapshotResult> future = new PlainActionFuture<>();
+            final int listingsBefore = listings.get();
+            // the shard snapshot sets the generation of the status when it is done, so ask before it starts
+            final boolean startsWithoutGeneration = status.generation() == null;
             try (Engine.IndexCommitRef commitRef = shard.acquireLastIndexCommit(true)) {
                 final var localContext = new LocalPrimarySnapshotShardContext(
                     shard.store(),
@@ -1221,6 +1349,17 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
                 );
                 repository.snapshotShard(new CopyingSnapshotShardContext(localContext, copySources, visibleFiles, reusableCopies));
                 return future.actionGet().getGeneration();
+            } finally {
+                // A shard snapshot lists neither the commit blobs before it copies them, nor the copies after. The only listing that it
+                // makes is the one of the shard's folder that finds the latest shard generation when the repository gives none, which is
+                // the case for the first shard snapshot of a shard. A repository with numeric shard generations lists more.
+                if (SnapshotsServiceUtils.useShardGenerations(repositoryMetaVersion)) {
+                    assertThat(
+                        "the shard snapshot listed blobs other than to find the latest shard generation",
+                        listings.get() - listingsBefore,
+                        equalTo(startsWithoutGeneration ? 1 : 0)
+                    );
+                }
             }
         }
 
@@ -1354,40 +1493,85 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
     }
 
     /**
-     * A container whose listing also shows one large blob that does not exist. A snapshot that copies that blob passes its length check,
-     * then fails when it copies the blob, inside the copy task.
+     * A container that counts its calls that list blobs or folders in {@code listings}.
      */
-    private static final class ListingWithMissingBlob extends FilterBlobContainer {
-        private final String missingBlob;
+    private static final class ListCounting extends FilterBlobContainer {
+        private final AtomicInteger listings;
 
-        ListingWithMissingBlob(BlobContainer delegate, String missingBlob) {
+        ListCounting(BlobContainer delegate, AtomicInteger listings) {
             super(delegate);
-            this.missingBlob = missingBlob;
+            this.listings = listings;
         }
 
         @Override
         public Map<String, BlobMetadata> listBlobs(OperationPurpose purpose) throws IOException {
-            final Map<String, BlobMetadata> blobs = new HashMap<>(super.listBlobs(purpose));
-            blobs.put(missingBlob, new BlobMetadata(missingBlob, 1L << 30));
-            return blobs;
+            listings.incrementAndGet();
+            return super.listBlobs(purpose);
+        }
+
+        @Override
+        public Map<String, BlobMetadata> listBlobsByPrefix(OperationPurpose purpose, String blobNamePrefix) throws IOException {
+            listings.incrementAndGet();
+            return super.listBlobsByPrefix(purpose, blobNamePrefix);
+        }
+
+        @Override
+        public Map<String, BlobContainer> children(OperationPurpose purpose) throws IOException {
+            listings.incrementAndGet();
+            return super.children(purpose);
         }
 
         @Override
         protected BlobContainer wrapChild(BlobContainer child) {
-            return new ListingWithMissingBlob(child, missingBlob);
+            return new ListCounting(child, listings);
         }
     }
 
     /**
-     * A shard container whose copies report success without leaving a complete blob behind: right after each copy, the copy is deleted or
-     * cut one byte short. The shard snapshot's check of its copies must catch that before it writes {@code snap-<uuid>.dat}.
+     * A shard container whose copy calls fail with an {@link IOException}, as a cloud client throws it, when {@code fails} accepts the
+     * number of the call. The calls are counted from 1 in {@code copyCalls}, and the failed ones copy nothing.
      */
-    private static final class BrokenCopies extends FilterBlobContainer {
-        private final boolean dropCopy;
+    private static final class FailingCopies extends FilterBlobContainer {
+        private final AtomicInteger copyCalls;
+        private final IntPredicate fails;
 
-        BrokenCopies(BlobContainer delegate, boolean dropCopy) {
+        FailingCopies(BlobContainer delegate, AtomicInteger copyCalls, IntPredicate fails) {
             super(delegate);
-            this.dropCopy = dropCopy;
+            this.copyCalls = copyCalls;
+            this.fails = fails;
+        }
+
+        @Override
+        public OptionalLong copyBlob(
+            OperationPurpose purpose,
+            BlobContainer sourceBlobContainer,
+            String sourceBlobName,
+            String blobName,
+            long neededEnd,
+            @Nullable Executor executor
+        ) throws IOException {
+            if (fails.test(copyCalls.incrementAndGet())) {
+                throw new IOException("simulated failure of the copy of [" + sourceBlobName + "]");
+            }
+            return super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor);
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new FailingCopies(child, copyCalls, fails);
+        }
+    }
+
+    /**
+     * A shard container whose copy calls return no length for the commit blobs that {@code hidden} accepts, as an S3 CopyObject request
+     * does. The copy itself works.
+     */
+    private static final class HidingLengthOfCopies extends FilterBlobContainer {
+        private final Predicate<String> hidden;
+
+        HidingLengthOfCopies(BlobContainer delegate, Predicate<String> hidden) {
+            super(delegate);
+            this.hidden = hidden;
         }
 
         @Override
@@ -1400,18 +1584,12 @@ public class BlobStoreRepositoryCopyTests extends IndexShardTestCase {
             @Nullable Executor executor
         ) throws IOException {
             final OptionalLong length = super.copyBlob(purpose, sourceBlobContainer, sourceBlobName, blobName, neededEnd, executor);
-            if (dropCopy) {
-                deleteBlobsIgnoringIfNotExists(purpose, Iterators.single(blobName));
-            } else {
-                final byte[] copy = readAll(this, blobName);
-                writeBlob(purpose, blobName, new BytesArray(copy, 0, copy.length - 1), false);
-            }
-            return length;
+            return hidden.test(sourceBlobName) ? OptionalLong.empty() : length;
         }
 
         @Override
         protected BlobContainer wrapChild(BlobContainer child) {
-            return new BrokenCopies(child, dropCopy);
+            return new HidingLengthOfCopies(child, hidden);
         }
     }
 
