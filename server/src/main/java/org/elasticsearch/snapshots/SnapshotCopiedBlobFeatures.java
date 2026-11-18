@@ -21,27 +21,33 @@ public class SnapshotCopiedBlobFeatures implements FeatureSpecification {
 
     /**
      * A copied blob is a copy of a whole commit blob, made by the object store itself. A copied file is a file that is stored as a byte
-     * range of a copied blob. The shard's snapshot metadata records a copied file with three fields: {@code blob}, the name of the copied
-     * blob; {@code offset}, the position in the copied blob where the file starts; and {@code source}, the path of the commit blob that
-     * was copied. See {@link org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo#isCopied()}.
+     * range of a copied blob. The shard's snapshot metadata records a copied file with the {@code name} of the copied blob, which many
+     * files share, and a field that uploaded files do not have: {@code offset}, the position in the copied blob where the file starts.
+     * The shard's index blob also refers to a copied file by name and offset. See
+     * {@link org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo#isCopied()}.
      * <p>
      * A node with this feature can read, delete, clone and restore snapshots that hold copied files.
      * <p>
      * A node without this feature cannot parse the metadata that records a copied file, because its parser rejects fields it does not
-     * know. That node then fails to take, clone or delete a snapshot of the shard, and to restore a snapshot that holds a copied file. So
-     * code that records a copied file in the shard's snapshot metadata must first call
-     * {@link org.elasticsearch.features.FeatureService#clusterHasFeature}. It may record the file only if every node in the cluster has
-     * this feature.
+     * know, and it cannot read the list of files that refers to a copied file by name and offset. That node then fails to take, clone or
+     * delete a snapshot of the shard, and to restore a snapshot that holds a copied file. So code that records a copied file in the
+     * shard's snapshot metadata must first call {@link org.elasticsearch.features.FeatureService#clusterHasFeature}. It may record the
+     * file only if every node in the cluster has this feature.
+     * <p>
+     * The id names the offset, because the offset is what an older node cannot read. An earlier prototype recorded a copied file with
+     * the fields {@code blob}, {@code offset} and {@code source}, under the id {@code snapshots.copied_blob_ranges}. No node of this
+     * version publishes that id, so a node of that prototype does not pass this check, and a node of this version cannot read what that
+     * prototype wrote.
      * <p>
      * Never set {@code assumedAfterNextCompatibilityBoundary} to true for this feature. With that flag, {@code clusterHasFeature} also
      * counts a node that does not publish the feature, if the build of that node reports
      * {@link org.elasticsearch.env.BuildVersion#canRemoveAssumedFeatures()} as true. A build that always reports true, such as the
      * serverless build, would make the check pass while nodes that cannot read copied files are still in the cluster.
      */
-    public static final NodeFeature COPIED_BLOB_RANGES = new NodeFeature("snapshots.copied_blob_ranges");
+    public static final NodeFeature COPIED_FILE_OFFSETS = new NodeFeature("snapshots.copied_file_offsets");
 
     @Override
     public Set<NodeFeature> getFeatures() {
-        return Set.of(COPIED_BLOB_RANGES);
+        return Set.of(COPIED_FILE_OFFSETS);
     }
 }

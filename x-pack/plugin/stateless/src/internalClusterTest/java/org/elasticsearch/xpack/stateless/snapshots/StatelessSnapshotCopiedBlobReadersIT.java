@@ -18,6 +18,7 @@ import org.elasticsearch.features.FeatureService;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
+import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoriesService;
@@ -47,9 +48,9 @@ import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcke
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertHitCount;
 import static org.elasticsearch.xpack.stateless.snapshots.StatelessSnapshotSettings.SERVER_SIDE_COPY_ENABLED_SETTING;
 import static org.hamcrest.Matchers.empty;
-import static org.hamcrest.Matchers.emptyOrNullString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
@@ -65,7 +66,8 @@ import static org.hamcrest.Matchers.startsWith;
  * <li>A copied blob is a copy of a whole commit blob. The object store makes the copy itself, so the node does not read or upload any
  * file data.</li>
  * <li>A copied file is a file that is stored as a byte range of a copied blob. The shard's snapshot metadata records it with the name of
- * the copied blob and the offset where the file starts in the copied blob.</li>
+ * the copied blob, which many files share, and the offset where the file starts in the copied blob. A copied blob is named like an
+ * uploaded blob, so only the offset tells a copied file from an uploaded one.</li>
  * <li>A data file is a file whose bytes are not kept in the shard's snapshot metadata. The bytes are in blobs of their own, or in a copied
  * blob. Small files such as {@code segments_N} and {@code .si} are not data files, because the metadata keeps their whole content. They
  * are never copied, so the test ignores them.</li>
@@ -148,15 +150,20 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
         // Every copied file is a byte range that lies inside a copied blob in the shard's folder.
         final Map<String, BlobMetadata> blobs = shardContainer().listBlobs(OperationPurpose.SNAPSHOT_METADATA);
         for (FileInfo fileInfo : Stream.concat(copied(mixedFiles).stream(), copied(mergedFiles).stream()).toList()) {
-            assertThat(fileInfo.blob(), startsWith(BlobStoreRepository.COPIED_DATA_BLOB_PREFIX));
-            assertThat(fileInfo.source(), not(emptyOrNullString()));
-            final BlobMetadata copiedBlob = blobs.get(fileInfo.blob());
+            assertThat(fileInfo.name(), startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX));
+            final BlobMetadata copiedBlob = blobs.get(fileInfo.name());
             assertThat("copied blob of " + fileInfo, copiedBlob, notNullValue());
             assertThat(fileInfo.offset() + fileInfo.length(), lessThanOrEqualTo(copiedBlob.length()));
         }
+        // Many copied files share one copied blob, and each of them has an offset of its own in it.
+        assertThat(copiedBlobs(mergedFiles), hasSize(lessThan(mergedFiles.size())));
+        assertThat(
+            mergedFiles.stream().map(fileInfo -> fileInfo.name() + "@" + fileInfo.offset()).collect(Collectors.toSet()),
+            hasSize(mergedFiles.size())
+        );
 
         // The shard generation is the index-<uuid> blob in the shard's folder. It lists the files of all three snapshots, and it refers to
-        // exactly the copied blobs that are in the folder.
+        // exactly the data blobs that are in the folder, the copied blobs and the uploaded blobs.
         final BlobStoreRepository repository = repository();
         final RepositoryData repositoryData = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository);
         final IndexId indexId = repositoryData.resolveIndexId(INDEX);
@@ -166,7 +173,11 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
             repositoryData.shardGenerations().getShardGen(indexId, 0)
         );
         assertThat(shardGeneration.snapshots(), hasSize(3));
-        assertThat(shardGeneration.copiedBlobNames(), equalTo(blobNamesWithPrefix(blobs, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX)));
+        final Set<String> referencedBlobs = new HashSet<>();
+        for (SnapshotFiles snapshotFiles : shardGeneration) {
+            referencedBlobs.addAll(dataBlobs(snapshotFiles.indexFiles()));
+        }
+        assertThat(referencedBlobs, equalTo(blobNamesWithPrefix(blobs, BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX)));
 
         restoreAndCountDocuments(UPLOADED, 20);
         restoreAndCountDocuments(MIXED, 30);
@@ -175,7 +186,8 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
 
     /**
      * Clones "mixed" as "clone", then deletes all snapshots in three steps. After each step, a copied or uploaded data blob must still be
-     * there if a remaining snapshot refers to it, and must be gone if no remaining snapshot does.
+     * there if a remaining snapshot refers to it, and must be gone if no remaining snapshot does. A copied blob stays as long as a file
+     * of a remaining snapshot is in it.
      */
     public void testCloneAndDeleteSnapshotsThatHoldCopiedFiles() throws Exception {
         startNodes();
@@ -189,16 +201,24 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
         // "mixed" and "merged" have no copied blob in common. So the test can tell the copied blobs that must go from the copied blobs that
         // must stay.
         assertThat(union(mixedCopies, mergedCopies), hasSize(mixedCopies.size() + mergedCopies.size()));
-        final Set<String> uploadedBlobs = blobsWithPrefix(location, BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX);
+        // the blobs of the uploaded files, which "uploaded" and "mixed" refer to
+        final Set<String> uploadedBlobs = union(uploadedBlobs(dataFiles(UPLOADED)), uploadedBlobs(mixedFiles));
         assertThat(uploadedBlobs, not(empty()));
+        // the data blobs in the repository are the copied blobs and the uploaded blobs
+        assertThat(
+            blobsWithPrefix(location, BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX),
+            equalTo(union(union(mixedCopies, mergedCopies), uploadedBlobs))
+        );
 
         // The clone keeps the file entries of "mixed", so it refers to the same copied and uploaded blobs.
         assertAcked(clusterAdmin().prepareCloneSnapshot(TEST_REQUEST_TIMEOUT, REPOSITORY, MIXED, CLONE).setIndices(INDEX).get());
-        final Map<String, FileInfo> mixedFilesByName = mixedFiles.stream().collect(Collectors.toMap(FileInfo::name, fileInfo -> fileInfo));
+        // files of one copied blob share its name, so the files are told apart by their physical names
+        final Map<String, FileInfo> mixedFilesByPhysicalName = mixedFiles.stream()
+            .collect(Collectors.toMap(FileInfo::physicalName, fileInfo -> fileInfo));
         final List<FileInfo> cloneFiles = dataFiles(CLONE);
         assertThat(cloneFiles, hasSize(mixedFiles.size()));
         for (FileInfo cloneFile : cloneFiles) {
-            final FileInfo original = mixedFilesByName.get(cloneFile.name());
+            final FileInfo original = mixedFilesByPhysicalName.get(cloneFile.physicalName());
             assertThat("file of " + MIXED + " for " + cloneFile, original, notNullValue());
             assertTrue(cloneFile + " is not the same as " + original, cloneFile.isSame(original));
         }
@@ -206,20 +226,20 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
         // Delete step 1. Only "merged" and "clone" are left. "clone" refers to every blob of "uploaded" and "mixed", so no data blob is
         // removed.
         deleteSnapshots(UPLOADED, MIXED);
-        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(union(mixedCopies, mergedCopies)));
-        assertThat(blobsWithPrefix(location, BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX), equalTo(uploadedBlobs));
+        assertThat(
+            blobsWithPrefix(location, BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX),
+            equalTo(union(union(mixedCopies, mergedCopies), uploadedBlobs))
+        );
         restoreAndCountDocuments(CLONE, 30);
 
         // Delete step 2. Only "merged" is left. No snapshot refers to the blobs of "uploaded" and "mixed" now, so they are removed.
         // "merged" keeps its copied blobs.
         deleteSnapshots(CLONE);
-        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), equalTo(mergedCopies));
-        assertThat(blobsWithPrefix(location, BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX), empty());
+        assertThat(blobsWithPrefix(location, BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX), equalTo(mergedCopies));
         restoreAndCountDocuments(MERGED, 35);
 
         // Delete step 3. No snapshot is left, so no data blob is left.
         deleteSnapshots(MERGED);
-        assertThat(blobsWithPrefix(location, BlobStoreRepository.COPIED_DATA_BLOB_PREFIX), empty());
         assertThat(blobsWithPrefix(location, BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX), empty());
     }
 
@@ -260,7 +280,7 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
 
     /**
      * Checks that every node accepts {@link StatelessSnapshotSettings#SERVER_SIDE_COPY_ENABLED_SETTING}, and that the cluster has
-     * {@link SnapshotCopiedBlobFeatures#COPIED_BLOB_RANGES}. Each node publishes that feature to say that it can read copied files.
+     * {@link SnapshotCopiedBlobFeatures#COPIED_FILE_OFFSETS}. Each node publishes that feature to say that it can read copied files.
      */
     public void testSettingIsRegisteredAndNodesHaveTheReadersFeature() {
         // Starting the nodes with the setting in their configuration shows that the setting is registered, because a node refuses to start
@@ -274,10 +294,10 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
         updateClusterSettings(Settings.builder().putNull(SERVER_SIDE_COPY_ENABLED_SETTING.getKey()));
 
         final FeatureService featureService = internalCluster().getCurrentMasterNodeInstance(FeatureService.class);
-        assertTrue(featureService.clusterHasFeature(clusterService().state(), SnapshotCopiedBlobFeatures.COPIED_BLOB_RANGES));
+        assertTrue(featureService.clusterHasFeature(clusterService().state(), SnapshotCopiedBlobFeatures.COPIED_FILE_OFFSETS));
         // The feature must not be marked as assumed. Otherwise a build that always assumes features, such as serverless, would count nodes
-        // that cannot read copied files as having the feature. The Javadoc of COPIED_BLOB_RANGES gives the full reason.
-        assertFalse(SnapshotCopiedBlobFeatures.COPIED_BLOB_RANGES.assumedAfterNextCompatibilityBoundary());
+        // that cannot read copied files as having the feature. The Javadoc of COPIED_FILE_OFFSETS gives the full reason.
+        assertFalse(SnapshotCopiedBlobFeatures.COPIED_FILE_OFFSETS.assumedAfterNextCompatibilityBoundary());
     }
 
     /**
@@ -362,7 +382,29 @@ public class StatelessSnapshotCopiedBlobReadersIT extends AbstractStatelessPlugi
     }
 
     private static Set<String> copiedBlobs(List<FileInfo> fileInfos) {
-        return copied(fileInfos).stream().map(FileInfo::blob).collect(Collectors.toSet());
+        return copied(fileInfos).stream().map(FileInfo::name).collect(Collectors.toSet());
+    }
+
+    /**
+     * The blobs of the uploaded files among the given file infos: a blob for each part of each file that has blobs of its own.
+     */
+    private static Set<String> uploadedBlobs(List<FileInfo> fileInfos) {
+        final Set<String> blobs = new HashSet<>();
+        for (FileInfo fileInfo : uploaded(fileInfos)) {
+            if (fileInfo.metadata().hashEqualsContents() == false) {
+                for (int part = 0; part < fileInfo.numberOfParts(); part++) {
+                    blobs.add(fileInfo.partName(part));
+                }
+            }
+        }
+        return blobs;
+    }
+
+    /**
+     * The data blobs that the given file infos refer to, which are the copied blobs and the blobs of the uploaded files.
+     */
+    private static Set<String> dataBlobs(List<FileInfo> fileInfos) {
+        return union(copiedBlobs(fileInfos), uploadedBlobs(fileInfos));
     }
 
     private static Set<String> union(Set<String> first, Set<String> second) {

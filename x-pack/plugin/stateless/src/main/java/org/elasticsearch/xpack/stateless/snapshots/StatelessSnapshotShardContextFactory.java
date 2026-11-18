@@ -164,7 +164,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
      * file. The object store makes that copy itself.
      * <p>
      * The shard snapshot copies only if {@link StatelessSnapshotSettings#SERVER_SIDE_COPY_ENABLED_SETTING} is on and every node in the
-     * cluster has {@link SnapshotCopiedBlobFeatures#COPIED_BLOB_RANGES}. A node has that feature when it can read copied files. Every node
+     * cluster has {@link SnapshotCopiedBlobFeatures#COPIED_FILE_OFFSETS}. A node has that feature when it can read copied files. Every node
      * needs it, because a node without it cannot parse the shard's snapshot metadata, which lists the files of each snapshot, once that
      * metadata records a copied file. That node then fails on the shard.
      * <p>
@@ -181,7 +181,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
         if (serverSideCopyEnabled == false) {
             return false;
         }
-        if (featureService.clusterHasFeature(clusterService.state(), SnapshotCopiedBlobFeatures.COPIED_BLOB_RANGES)) {
+        if (featureService.clusterHasFeature(clusterService.state(), SnapshotCopiedBlobFeatures.COPIED_FILE_OFFSETS)) {
             return true;
         }
         logger.info(
@@ -190,7 +190,7 @@ public class StatelessSnapshotShardContextFactory implements SnapshotShardContex
             shardId,
             snapshot,
             SERVER_SIDE_COPY_ENABLED_SETTING.getKey(),
-            SnapshotCopiedBlobFeatures.COPIED_BLOB_RANGES.id()
+            SnapshotCopiedBlobFeatures.COPIED_FILE_OFFSETS.id()
         );
         return false;
     }

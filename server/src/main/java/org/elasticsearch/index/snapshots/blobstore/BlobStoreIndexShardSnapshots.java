@@ -9,8 +9,10 @@
 
 package org.elasticsearch.index.snapshots.blobstore;
 
+import org.elasticsearch.ElasticsearchParseException;
 import org.elasticsearch.common.util.CollectionUtils;
 import org.elasticsearch.common.xcontent.XContentParserUtils;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
 import org.elasticsearch.index.store.StoreFileMetadata;
@@ -24,12 +26,12 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -37,15 +39,43 @@ import java.util.stream.Collectors;
  * <p>
  * This class is used to find shard files that were already snapshotted and clear out shard files that are no longer referenced by any
  * snapshots of the shard.
+ * <p>
+ * The class holds the file infos that the snapshots of the shard list, each of them once. A file info is identified by its name and its
+ * offset, because files that were copied together share the name of the copied blob that holds them, and only the offset tells them
+ * apart.
  */
 public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, ToXContentFragment {
 
     public static final BlobStoreIndexShardSnapshots EMPTY = new BlobStoreIndexShardSnapshots(Map.of(), List.of());
 
-    private final List<SnapshotFiles> shardSnapshots;
-    private final Map<String, FileInfo> files;
+    /**
+     * What identifies a file info in the shard's snapshot metadata: the name, and the offset if the file is a byte range of a copied blob
+     * (see {@link FileInfo#isCopied()}). The name alone is not enough, because every file of a copied blob has the name of that blob. A
+     * file that is not copied has no offset, so its key is as unique as its name was before copies existed.
+     *
+     * @param name   the {@link FileInfo#name()} of the file info
+     * @param offset the {@link FileInfo#offset()} of the file info, or {@code null} if the file is not copied
+     */
+    private record FileKey(String name, @Nullable Long offset) {
 
-    private BlobStoreIndexShardSnapshots(Map<String, FileInfo> files, List<SnapshotFiles> shardSnapshots) {
+        static FileKey of(FileInfo fileInfo) {
+            return new FileKey(fileInfo.name(), fileInfo.isCopied() ? fileInfo.offset() : null);
+        }
+
+        /**
+         * The name of the file info, and its offset if it has one, for the messages about a damaged shard generation. The text for a file
+         * that is not copied is its name alone, as it was before there were copied files.
+         */
+        @Override
+        public String toString() {
+            return offset == null ? name : name + " at offset " + offset;
+        }
+    }
+
+    private final List<SnapshotFiles> shardSnapshots;
+    private final Map<FileKey, FileInfo> files;
+
+    private BlobStoreIndexShardSnapshots(Map<FileKey, FileInfo> files, List<SnapshotFiles> shardSnapshots) {
         this.shardSnapshots = List.copyOf(shardSnapshots);
         this.files = files;
     }
@@ -60,14 +90,14 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
         }
         final var survivingSnapshotNames = retainedSnapshots.stream().map(SnapshotId::getName).collect(Collectors.toSet());
         final ArrayList<SnapshotFiles> updatedSnapshots = new ArrayList<>(survivingSnapshotNames.size());
-        Map<String, FileInfo> newFiles = new HashMap<>();
+        Map<FileKey, FileInfo> newFiles = new HashMap<>();
         for (SnapshotFiles snapshot : shardSnapshots) {
             if (survivingSnapshotNames.contains(snapshot.snapshot()) == false) {
                 continue;
             }
             updatedSnapshots.add(snapshot);
             for (FileInfo fileInfo : snapshot.indexFiles()) {
-                FileInfo oldFile = newFiles.put(fileInfo.name(), fileInfo);
+                FileInfo oldFile = newFiles.put(FileKey.of(fileInfo), fileInfo);
                 assert oldFile == null || oldFile.isSame(fileInfo);
             }
         }
@@ -79,14 +109,15 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
      * ({@link SnapshotFiles}).
      */
     public BlobStoreIndexShardSnapshots withAddedSnapshot(SnapshotFiles snapshotFiles) {
-        Map<String, FileInfo> updatedFiles = null;
+        Map<FileKey, FileInfo> updatedFiles = null;
         for (FileInfo fileInfo : snapshotFiles.indexFiles()) {
-            final FileInfo known = files.get(fileInfo.name());
+            final FileKey key = FileKey.of(fileInfo);
+            final FileInfo known = files.get(key);
             if (known == null) {
                 if (updatedFiles == null) {
                     updatedFiles = new HashMap<>(files);
                 }
-                updatedFiles.put(fileInfo.name(), fileInfo);
+                updatedFiles.put(key, fileInfo);
             } else {
                 assert fileInfo.isSame(known);
             }
@@ -131,7 +162,7 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
         return this.shardSnapshots;
     }
 
-    // index of Lucene file name to collection of file info in the repository
+    // index of Lucene file name to collection of file info in the repository, in the order in which the snapshots list them
     // lazy computed because building this is map is rather expensive and only needed for the snapshot create operation
     private Map<String, Collection<FileInfo>> physicalFiles;
 
@@ -142,15 +173,32 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
      * @return the file info that matches the specified physical file or null if the file is not present in any of snapshots
      */
     public FileInfo findPhysicalIndexFile(StoreFileMetadata storeFileMetadata) {
+        return findPhysicalIndexFile(storeFileMetadata, fileInfo -> true);
+    }
+
+    /**
+     * Finds reference to a snapshotted file by its {@link StoreFileMetadata}, among the file infos that {@code isCandidate} accepts. The
+     * repository can hold several file infos for one Lucene file, because snapshots stored the file in different places, for example in
+     * an uploaded blob and in a copied blob. The caller says which of them it can use, so that a file info that it cannot use does not
+     * hide one that it can.
+     * <p>
+     * If more than one file info matches and is accepted, the method returns the one that comes first when the snapshots are read in
+     * order, each snapshot's list of files in order. That order does not change between calls or between runs.
+     *
+     * @param storeFileMetadata store file metadata to find file info for
+     * @param isCandidate       says whether the caller can use a file info that is the same file
+     * @return the first file info that matches the specified physical file and that {@code isCandidate} accepts, or null if there is none
+     */
+    public FileInfo findPhysicalIndexFile(StoreFileMetadata storeFileMetadata, Predicate<FileInfo> isCandidate) {
         var p = this.physicalFiles;
         if (p == null) {
             p = new HashMap<>();
             for (SnapshotFiles snapshot : shardSnapshots) {
                 for (FileInfo fileInfo : snapshot.indexFiles()) {
-                    // we use identity hash set since we lookup all instances from the same map and thus equality == instance equality
-                    // and we don't want to add the same file to the map multiple times
-                    p.computeIfAbsent(fileInfo.physicalName(), k -> Collections.newSetFromMap(new IdentityHashMap<>()))
-                        .add(files.get(fileInfo.name()));
+                    // We use a linked hash set. A file info has no equals method, and we lookup all instances from the same map, so
+                    // equality == instance equality and we don't add the same file to the map multiple times. The set keeps the order in
+                    // which the snapshots list the files, so a lookup that finds several matches always finds the same one first.
+                    p.computeIfAbsent(fileInfo.physicalName(), k -> new LinkedHashSet<>()).add(files.get(FileKey.of(fileInfo)));
                 }
             }
             physicalFiles = p;
@@ -160,79 +208,35 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
             return null;
         }
         for (FileInfo fileInfo : found) {
-            if (fileInfo.isSame(storeFileMetadata)) {
+            if (fileInfo.isSame(storeFileMetadata) && isCandidate.test(fileInfo)) {
                 return fileInfo;
             }
         }
         return null;
     }
 
+    // index of file info name to a file info with that name
+    // lazy computed, like physicalFiles, because building this map is rather expensive and only the snapshot delete operation needs it
+    private volatile Map<String, FileInfo> filesByName;
+
     /**
-     * Finds reference to a snapshotted file by its snapshot name
+     * Finds reference to a snapshotted file by its snapshot name. Files of one copied blob share the name of that blob, so the method
+     * returns any of the file infos with that name. That is enough for what callers need to know, which is whether any file still uses
+     * the blob with that name.
      *
      * @param name file name
      * @return file info or null if file is not present in any of snapshots
      */
     public FileInfo findNameFile(String name) {
-        return files.get(name);
-    }
-
-    // Built on first use, like physicalFiles, because only snapshot create and delete need them: the names of the copied blobs that
-    // file infos refer to, and each copy keyed by the commit blob it was copied from.
-    private Set<String> copiedBlobNames;
-    private Map<String, String> copiedBlobsBySource;
-
-    /**
-     * Returns the names of all copied blobs that file infos of this shard refer to. Snapshot delete keeps these copied blobs and deletes
-     * every other copied blob in the shard's folder, including copies that a failed snapshot left behind.
-     *
-     * @return the names of the referenced copied blobs, see {@link FileInfo#blob()}
-     */
-    public Set<String> copiedBlobNames() {
-        var names = this.copiedBlobNames;
-        if (names == null) {
-            final Set<String> found = new HashSet<>();
+        var byName = this.filesByName;
+        if (byName == null) {
+            byName = new HashMap<>();
             for (FileInfo fileInfo : files.values()) {
-                if (fileInfo.isCopied()) {
-                    found.add(fileInfo.blob());
-                }
+                byName.putIfAbsent(fileInfo.name(), fileInfo);
             }
-            names = Collections.unmodifiableSet(found);
-            copiedBlobNames = names;
+            filesByName = byName;
         }
-        return names;
-    }
-
-    /**
-     * Finds the copied blob that is a copy of the given commit blob, so that a new snapshot that needs a file from that commit blob can
-     * point its file info at the existing copy instead of copying the commit blob again. If this object holds several copies of the commit
-     * blob, the method returns one of them, and which one is not defined. The same object returns the same copy on every call.
-     *
-     * @param source path of a commit blob, see {@link FileInfo#source()}
-     * @return the name of the copied blob, or null if no file info refers to a copy of {@code source}
-     */
-    public String findCopiedBlob(String source) {
-        var bySource = this.copiedBlobsBySource;
-        if (bySource == null) {
-            bySource = new HashMap<>();
-            for (FileInfo fileInfo : files.values()) {
-                if (fileInfo.isCopied()) {
-                    // This object can hold two copies of the same commit blob. index-<uuid> is the blob that lists the files of every
-                    // snapshot of the shard, and snap-<uuid>.dat is the blob that lists the files of a single snapshot. If index-<uuid>
-                    // is missing, the repository rebuilds it from all the snap-<uuid>.dat blobs. Then the copy that a failed snapshot
-                    // left behind comes in next to the copy of a later snapshot. Keep the first copy found. The map has no order, so the
-                    // pick is arbitrary. The picked copy may be one that a snapshot delete is still removing, like an uploaded __ blob that
-                    // the rebuild brings back. Such a delete removes every copy that its new shard generation does not refer to, such as
-                    // the copy of a failed or deleted snapshot. The rebuild still reads the snap-<uuid>.dat blob of such a snapshot until
-                    // the delete removes that blob.
-                    // If no snapshot delete is removing the picked copy, the copy stays: the snapshot that reuses the copy writes a new
-                    // index-<uuid> that refers to the copy, so a later snapshot delete does not remove the copy.
-                    bySource.putIfAbsent(fileInfo.source(), fileInfo.blob());
-                }
-            }
-            copiedBlobsBySource = bySource;
-        }
-        return bySource.get(source);
+        return byName.get(name);
     }
 
     @Override
@@ -244,6 +248,8 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
         static final String FILES = "files";
         static final String SNAPSHOTS = "snapshots";
         static final String SHARD_STATE_ID = "shard_state_id";
+        static final String NAME = "name";
+        static final String OFFSET = "offset";
     }
 
     /**
@@ -297,13 +303,24 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
      * }
      * </code>
      * </pre>
+     * Each snapshot lists its files by name, as in the example. Files that were copied together share the name of the copied blob, so
+     * the list refers to a copied file by an object that also gives the offset, and the "files" array above holds one file info for each
+     * pair of name and offset. A list can hold both kinds of reference. So a shard whose snapshots have no copied files is written as in
+     * the example, and a list with one file that is not copied and two copied files looks like this:
+     * <pre>
+     * <code>
+     *         "snapshot_3": {
+     *             "files": ["__0", {"name": "__7", "offset": 900}, {"name": "__7", "offset": 5000}]
+     *         }
+     * </code>
+     * </pre>
      */
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         // First we list all blobs with their file infos:
         builder.startArray(Fields.FILES);
-        for (Map.Entry<String, FileInfo> entry : files.entrySet()) {
-            FileInfo.toXContent(entry.getValue(), builder, params);
+        for (FileInfo fileInfo : files.values()) {
+            FileInfo.toXContent(fileInfo, builder, params);
         }
         builder.endArray();
         // Then we list all snapshots with list of all blobs that are used by the snapshot
@@ -312,7 +329,15 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
             builder.startObject(snapshot.snapshot());
             builder.startArray(Fields.FILES);
             for (FileInfo fileInfo : snapshot.indexFiles()) {
-                builder.value(fileInfo.name());
+                if (fileInfo.isCopied()) {
+                    // The name is shared with other files of the same copied blob, so the offset says which of them it is.
+                    builder.startObject();
+                    builder.field(Fields.NAME, fileInfo.name());
+                    builder.field(Fields.OFFSET, fileInfo.offset());
+                    builder.endObject();
+                } else {
+                    builder.value(fileInfo.name());
+                }
             }
             builder.endArray();
             if (snapshot.shardStateIdentifier() != null) {
@@ -335,10 +360,10 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
         if (token == null) { // New parser
             token = parser.nextToken();
         }
-        // list of tuples of snapshot name and file ids in the snapshot
-        List<Tuple<String, List<String>>> snapshotsAndFiles = new ArrayList<>();
+        // list of tuples of snapshot name and the keys of the files in the snapshot
+        List<Tuple<String, List<FileKey>>> snapshotsAndFiles = new ArrayList<>();
         Map<String, String> historyUUIDs = new HashMap<>();
-        Map<String, FileInfo> files = new HashMap<>();
+        Map<FileKey, FileInfo> files = new HashMap<>();
         XContentParserUtils.ensureExpectedToken(XContentParser.Token.START_OBJECT, token, parser);
         String currentFieldName;
         while ((currentFieldName = parser.nextFieldName()) != null) {
@@ -350,7 +375,7 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
                     }
                     while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
                         FileInfo fileInfo = FileInfo.fromXContent(parser);
-                        files.put(fileInfo.name(), fileInfo);
+                        files.put(FileKey.of(fileInfo), fileInfo);
                     }
                 }
                 case START_OBJECT -> {
@@ -365,7 +390,10 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
                             if (Fields.FILES.equals(currentFieldName)) {
                                 if (token == XContentParser.Token.START_ARRAY) {
                                     snapshotsAndFiles.add(
-                                        Tuple.tuple(snapshot, XContentParserUtils.parseList(parser, XContentParser::text))
+                                        Tuple.tuple(
+                                            snapshot,
+                                            XContentParserUtils.parseList(parser, BlobStoreIndexShardSnapshots::parseFileKey)
+                                        )
                                     );
                                 }
                             } else if (Fields.SHARD_STATE_ID.equals(currentFieldName)) {
@@ -379,9 +407,9 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
         }
 
         List<SnapshotFiles> snapshots = new ArrayList<>(snapshotsAndFiles.size());
-        for (Tuple<String, List<String>> entry : snapshotsAndFiles) {
+        for (Tuple<String, List<FileKey>> entry : snapshotsAndFiles) {
             List<FileInfo> fileInfosBuilder = new ArrayList<>();
-            for (String file : entry.v2()) {
+            for (FileKey file : entry.v2()) {
                 FileInfo fileInfo = files.get(file);
                 if (fileInfo == null) {
                     // could happen in production if the repo contents are corrupted
@@ -396,4 +424,34 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
         return new BlobStoreIndexShardSnapshots(files, snapshots);
     }
 
+    /**
+     * Parses one reference from a snapshot's list of files, which is either the name of a file that is not copied, as a string, or an
+     * object with the name and the offset of a copied file. The parser is at the value to read.
+     */
+    private static FileKey parseFileKey(XContentParser parser) throws IOException {
+        if (parser.currentToken().isValue()) {
+            return new FileKey(parser.text(), null);
+        }
+        XContentParserUtils.ensureExpectedToken(XContentParser.Token.START_OBJECT, parser.currentToken(), parser);
+        String name = null;
+        Long offset = null;
+        String currentFieldName;
+        while ((currentFieldName = parser.nextFieldName()) != null) {
+            final XContentParser.Token token = parser.nextToken();
+            if (token.isValue() == false) {
+                XContentParserUtils.throwUnknownToken(token, parser);
+            }
+            switch (currentFieldName) {
+                case Fields.NAME -> name = parser.text();
+                case Fields.OFFSET -> offset = parser.longValue();
+                default -> XContentParserUtils.throwUnknownField(currentFieldName, parser);
+            }
+        }
+        if (name == null || offset == null) {
+            throw new ElasticsearchParseException(
+                "a reference to a copied file needs both a name and an offset, got name [" + name + "] and offset [" + offset + "]"
+            );
+        }
+        return new FileKey(name, offset);
+    }
 }

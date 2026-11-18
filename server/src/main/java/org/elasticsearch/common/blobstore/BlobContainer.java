@@ -421,7 +421,6 @@ public interface BlobContainer {
             case SNAPSHOT_METADATA -> {
                 // must not be used for blobs with names that look like data blobs
                 assert blobName.startsWith(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX) == false
-                    && blobName.startsWith(BlobStoreRepository.COPIED_DATA_BLOB_PREFIX) == false
                     : blobName + " should not use purpose " + purpose;
             }
             case REPOSITORY_ANALYSIS, CLUSTER_STATE, INDICES, TRANSLOG -> {

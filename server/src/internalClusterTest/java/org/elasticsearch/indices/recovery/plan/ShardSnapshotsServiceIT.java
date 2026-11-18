@@ -283,7 +283,11 @@ public class ShardSnapshotsServiceIT extends ESIntegTestCase {
         }
     }
 
-    public void testSkipsSnapshotWithFilesInsideCopiedBlobs() throws Exception {
+    /**
+     * A node that recovers from a snapshot reads each file that is a byte range of a copied blob from its offset, so a snapshot whose
+     * files are in a copied blob is a snapshot that recovery can use.
+     */
+    public void testUsesSnapshotWithFilesInsideCopiedBlobs() throws Exception {
         final String indexName = "test";
         createIndex(indexName, Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).build());
         final ShardId shardId = getShardIdForIndex(indexName);
@@ -296,7 +300,7 @@ public class ShardSnapshotsServiceIT extends ESIntegTestCase {
         createSnapshot(repositoryName, "snap", indexName);
         assertThat(getLatestShardSnapshot(shardId).isPresent(), is(true));
 
-        // once the snapshot stores its files inside a copied blob, recovery must not use that snapshot
+        // once the snapshot stores its files inside a copied blob, recovery still uses that snapshot
         final BlobStoreRepository repository = (BlobStoreRepository) internalCluster().getAnyMasterNodeInstance(RepositoriesService.class)
             .repository(repositoryName);
         final RepositoryData repositoryData = ESBlobStoreRepositoryIntegTestCase.getRepositoryData(repository);
@@ -311,7 +315,18 @@ public class ShardSnapshotsServiceIT extends ESIntegTestCase {
             randomBoolean()
         );
         assertThat(moved.isEmpty(), is(false));
-        assertThat(getLatestShardSnapshot(shardId).isPresent(), is(false));
+        final Optional<ShardSnapshot> latestShardSnapshot = getLatestShardSnapshot(shardId);
+        assertThat(latestShardSnapshot.isPresent(), is(true));
+        // the snapshot files that recovery reads are the copied file infos, each with its own offset in the copied blob
+        final List<BlobStoreIndexShardSnapshot.FileInfo> copiedFiles = latestShardSnapshot.get()
+            .getSnapshotFiles()
+            .stream()
+            .filter(BlobStoreIndexShardSnapshot.FileInfo::isCopied)
+            .toList();
+        assertThat(copiedFiles.size(), is(equalTo(moved.size())));
+        for (BlobStoreIndexShardSnapshot.FileInfo copiedFile : copiedFiles) {
+            assertThat(moved.stream().anyMatch(movedFile -> movedFile.isSame(copiedFile)), is(true));
+        }
     }
 
     private Optional<ShardSnapshot> getLatestShardSnapshot(ShardId shardId) throws Exception {

@@ -32,7 +32,7 @@ import static org.elasticsearch.test.ESTestCase.randomAlphaOfLength;
 
 public class TestUtils {
     /** Create a {@link Repository} with a random name **/
-    static Repository createRepository(ProjectId projectId, Path tempDir, NamedXContentRegistry xContentRegistry) {
+    public static Repository createRepository(ProjectId projectId, Path tempDir, NamedXContentRegistry xContentRegistry) {
         return createRepository(projectId, tempDir, xContentRegistry, null);
     }
 

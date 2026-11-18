@@ -31,6 +31,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.empty;
@@ -103,6 +105,22 @@ public abstract class AbstractMockObjectStoreIntegTestCase extends AbstractObjec
         throw new UnsupportedOperationException();
     }
 
+    // a data blob in the folder of a shard in a snapshot repository: indices/<index UUID>/<shard number>/__<name>
+    private static final Pattern DATA_BLOB_IN_SHARD_FOLDER = Pattern.compile(
+        "(.*/)?indices/[^/]+/[0-9]+/" + Pattern.quote(BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX) + "[^/]+"
+    );
+
+    /**
+     * The paths of the data blobs of the snapshot repository in the fake storage service. A copied blob is named like an uploaded blob, so
+     * these are the copies and the uploaded blobs together. The commit blobs that the copies come from are one folder deeper, in a folder
+     * for the primary term, so they do not match.
+     */
+    protected final Set<String> dataBlobPathsInFakeStorage() {
+        return blobPathsInFakeStorage().stream()
+            .filter(path -> DATA_BLOB_IN_SHARD_FOLDER.matcher(path).matches())
+            .collect(Collectors.toUnmodifiableSet());
+    }
+
     /**
      * A text that the cloud's access denied error holds, and so the failure of a shard snapshot that was refused a copy.
      */
@@ -163,7 +181,8 @@ public abstract class AbstractMockObjectStoreIntegTestCase extends AbstractObjec
         assertThat(snapshotInfo.shardFailures().get(0).reason(), containsString(accessDeniedText()));
         // there was a copy that was allowed, and a copy that was refused
         assertThat(copyRequests.get(), greaterThanOrEqualTo(2));
-        // the allowed copy was made, as the log line above says, and the failure cleanup deleted it
-        assertThat(blobPathsInFakeStorage().stream().filter(path -> path.contains("/c__")).toList(), empty());
+        // The allowed copy was made, as the log line above says, and no file was uploaded, so the failure cleanup left no data blob in the
+        // repository if it deleted the copy. A copy is named like an uploaded blob, so the data blobs are the copies here.
+        assertThat(dataBlobPathsInFakeStorage(), empty());
     }
 }

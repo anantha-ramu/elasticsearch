@@ -132,15 +132,22 @@ public abstract class SnapshotShardContext extends DelegatingActionListener<Shar
     /**
      * Says whether the snapshot may reuse {@code existingFileInfo}. A file info is the entry in the shard's snapshot metadata that says
      * where one file is stored. An earlier snapshot of the shard made {@code existingFileInfo} when it stored the same file as a byte
-     * range of a copied commit blob, see {@link #copySource}. The repository calls this method only for such a file info that it found
-     * by the name, length and checksum of the file.
+     * range of a copied commit blob, see {@link #copySource}. The repository asks this method about each copied file info that has the
+     * name, length and checksum of the file that the snapshot takes now. It never asks about a file info of a file that an earlier
+     * snapshot uploaded, so a copied file info that gets {@code false} does not hide an uploaded file info of the same file.
      * <p>
-     * The default is {@code true}. On {@code false}, the repository handles the file as new. The repository asks {@link #copySource} for
-     * the commit blob that holds the file now, and makes a new file info that points at a copy of that commit blob. If an earlier
-     * snapshot already made such a copy, the new file info points at that copy. A context answers {@code false} when the file is in
-     * another commit blob now than the commit blob that the earlier file info points at, so that the repository can delete the copy of
-     * the old commit blob once no other file needs that copy. A context must answer {@code true} when {@link #copySource} returns
-     * {@code null}, because the repository would then upload the file again, although the repository already holds a copy.
+     * The default is {@code true}. If no file info of the file can be reused, the repository handles the file as new. The repository
+     * asks {@link #copySource} for the commit blob that holds the file now, or uploads the file if there is none, and makes a new file
+     * info for the file.
+     * <p>
+     * A context answers {@code false} for a generational file, which is a file that a segment gets after it was first written, such as
+     * {@code _0_1.liv}. Every new commit blob carries the generational files that are still in use. So an earlier file info of such a
+     * file points into a commit blob that is older than the commit blob of the snapshotted commit, and reusing that file info would
+     * keep the copy of the old commit blob alive for as long as any snapshot lists the file info. The new file info points into the
+     * commit blob of the snapshotted commit instead, and the snapshot makes one copy of that commit blob for all the files that it takes
+     * from it. The old copy can then be deleted once no other file needs it. Other files never change after they are written, and
+     * their file infos stay valid. The repository does not look for an earlier copy of the commit blob that holds a generational file
+     * now. The answer of this method is the only thing that decides whether the file gets a new file info.
      *
      * @param existingFileInfo a file info of an earlier snapshot that is stored as a byte range of a copied commit blob, see
      *                         {@link BlobStoreIndexShardSnapshot.FileInfo#isCopied()}
@@ -152,17 +159,14 @@ public abstract class SnapshotShardContext extends DelegatingActionListener<Shar
     /**
      * A commit blob in an object store that holds a file, and where the file starts in it.
      *
-     * @param source    path of the commit blob, unique across indices and shards. A snapshot reuses an existing copy made from the same
-     *                  path, see {@link BlobStoreIndexShardSnapshot.FileInfo#source()}.
-     * @param copyName  the part of the copy's name that comes after the shard generation. It must be unique among the sources that one
-     *                  shard snapshot copies, so that two copies of one shard snapshot never get the same name. It may use only characters
-     *                  that {@link org.elasticsearch.common.Strings#validFileName} accepts, because the repository refuses to read a file
-     *                  info whose copied blob name has any other character.
+     * @param source    path of the commit blob, unique across indices and shards. A shard snapshot makes one copy of each commit blob that
+     *                  it copies from, so it uses this path to see which files come from the same commit blob. The path is not written to
+     *                  the repository.
      * @param container the container that holds the commit blob
      * @param blobName  the name of the commit blob in {@code container}
      * @param offset    the position in that blob where the file starts
      */
-    public record CopySource(String source, String copyName, BlobContainer container, String blobName, long offset) {}
+    public record CopySource(String source, BlobContainer container, String blobName, long offset) {}
 
     public interface FileReader extends Closeable {
 

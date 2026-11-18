@@ -14,7 +14,10 @@ import org.elasticsearch.common.UUIDs;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
 import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.index.seqno.SequenceNumbersTestUtils;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
+import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
+import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.RepositoryData;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
@@ -24,6 +27,8 @@ import java.util.List;
 
 import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertAcked;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.notNullValue;
 
 /**
  * Snapshot clone, delete and restore of shard snapshots whose files are stored as byte ranges of copied blobs. Nothing creates copied
@@ -56,7 +61,7 @@ public class CopiedBlobSnapshotsIT extends AbstractSnapshotIntegTestCase {
             randomBoolean()
         );
         assertFalse("no file was moved", moved.isEmpty());
-        final String copiedBlob = moved.get(0).blob();
+        final String copiedBlob = moved.get(0).name();
         final BlobContainer shardContainer = repository.shardContainer(indexId, 0);
 
         // a clone refers to the same copied blob, so deleting the original snapshot keeps the blob, and the clone restores from it
@@ -65,8 +70,9 @@ public class CopiedBlobSnapshotsIT extends AbstractSnapshotIntegTestCase {
         assertTrue(shardContainer.blobExists(OperationPurpose.SNAPSHOT_DATA, copiedBlob));
         assertRestoredDocCount(repoName, "clone-1", indexName, docCount);
 
-        // a copied blob that no file refers to, like one a failed snapshot leaves behind
-        final String orphan = BlobStoreRepository.COPIED_DATA_BLOB_PREFIX + UUIDs.randomBase64UUID(random());
+        // A blob that no file refers to, like a copy that a failed snapshot leaves behind. A copy has the same kind of name as an uploaded
+        // blob, so delete removes it by the same rule.
+        final String orphan = BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX + UUIDs.randomBase64UUID(random());
         shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, orphan, new BytesArray(randomByteArrayOfLength(between(1, 1024))), true);
 
         // snap-2 shares no file with clone-1: more documents and a force merge replace every segment
@@ -79,6 +85,92 @@ public class CopiedBlobSnapshotsIT extends AbstractSnapshotIntegTestCase {
         assertFalse(shardContainer.blobExists(OperationPurpose.SNAPSHOT_DATA, copiedBlob));
         assertFalse(shardContainer.blobExists(OperationPurpose.SNAPSHOT_DATA, orphan));
         assertRestoredDocCount(repoName, "snap-2", indexName, docCount);
+    }
+
+    /**
+     * A snapshot of an unchanged shard takes the file list of the earlier snapshot, so both snapshots list the same files in the same
+     * copied blob, each at its own offset. Deleting the first snapshot keeps the copied blob because a file of the second snapshot is in
+     * it, and only the delete of the last snapshot that lists a file in it removes it.
+     */
+    public void testUnchangedShardSharesTheCopiedBlobWithTheEarlierSnapshot() throws Exception {
+        final String repoName = "test-repo";
+        createRepository(repoName, "fs");
+        final String indexName = "test-index";
+        createIndex(indexName, indexSettingsNoReplicas(1).build());
+        long docCount = 0;
+        for (int segment = between(2, 4); segment > 0; segment--) {
+            docCount += indexDocsAndFlush(indexName);
+        }
+        // A shard has a state identifier only if its global checkpoint is persisted, and only then can a snapshot take the shortcut.
+        SequenceNumbersTestUtils.persistGlobalCheckpointOnPrimaryShards(indexName);
+        createSnapshot(repoName, "snap-1", List.of(indexName));
+
+        final BlobStoreRepository repository = getRepositoryOnMaster(repoName);
+        final RepositoryData repositoryData = getRepositoryData(repoName);
+        final IndexId indexId = repositoryData.resolveIndexId(indexName);
+        final List<BlobStoreIndexShardSnapshot.FileInfo> moved = BlobStoreTestUtil.moveFilesIntoCopiedBlob(
+            repository,
+            indexId,
+            0,
+            repositoryData.shardGenerations().getShardGen(indexId, 0),
+            snapshotId(repositoryData, "snap-1"),
+            fileInfo -> true,
+            randomBoolean()
+        );
+        assertThat("the files must share a copied blob", moved.size(), greaterThanOrEqualTo(2));
+        final String copiedBlob = moved.get(0).name();
+        final BlobContainer shardContainer = repository.shardContainer(indexId, 0);
+
+        // Nothing changed in the shard, so the second snapshot takes the file list of the first, with the files that share a copied blob.
+        createSnapshot(repoName, "snap-2", List.of(indexName));
+        final RepositoryData afterSecond = getRepositoryData(repoName);
+        final BlobStoreIndexShardSnapshot first = repository.loadShardSnapshot(shardContainer, snapshotId(afterSecond, "snap-1"));
+        final BlobStoreIndexShardSnapshot second = repository.loadShardSnapshot(shardContainer, snapshotId(afterSecond, "snap-2"));
+        assertThat(second.indexFiles().size(), equalTo(first.indexFiles().size()));
+        for (int i = 0; i < first.indexFiles().size(); i++) {
+            assertTrue(
+                second.indexFiles().get(i) + " is not " + first.indexFiles().get(i),
+                second.indexFiles().get(i).isSame(first.indexFiles().get(i))
+            );
+        }
+        // the shard generation keeps each of the files at its own offset, for both snapshots
+        final BlobStoreIndexShardSnapshots generation = repository.getBlobStoreIndexShardSnapshots(
+            indexId,
+            0,
+            afterSecond.shardGenerations().getShardGen(indexId, 0)
+        );
+        assertThat(generation.snapshots().size(), equalTo(2));
+        // The shortcut ran because both snapshots have the same shard state identifier. Without it, the second snapshot would take the path
+        // that goes through the files one by one and would reuse every file by its name, and it would write the same list.
+        final String shardStateId = generation.snapshots().get(0).shardStateIdentifier();
+        assertThat(shardStateId, notNullValue());
+        assertThat(generation.snapshots().get(1).shardStateIdentifier(), equalTo(shardStateId));
+        for (SnapshotFiles snapshotFiles : generation) {
+            final List<BlobStoreIndexShardSnapshot.FileInfo> expected = snapshotFiles.snapshot().equals("snap-1")
+                ? first.indexFiles()
+                : second.indexFiles();
+            assertThat(snapshotFiles.indexFiles().size(), equalTo(expected.size()));
+            for (int i = 0; i < expected.size(); i++) {
+                assertTrue(snapshotFiles.indexFiles().get(i).isSame(expected.get(i)));
+            }
+        }
+        assertThat(
+            "the copied files keep their own offsets",
+            moved.stream().map(BlobStoreIndexShardSnapshot.FileInfo::offset).distinct().count(),
+            equalTo((long) moved.size())
+        );
+
+        // the second snapshot holds files in the copied blob, so deleting the first snapshot keeps the blob, and the second still restores
+        deleteSnapshotAndAwaitCleanup(repoName, afterSecond, "snap-1", shardContainer);
+        assertTrue(shardContainer.blobExists(OperationPurpose.SNAPSHOT_DATA, copiedBlob));
+        assertRestoredDocCount(repoName, "snap-2", indexName, docCount);
+
+        // a third snapshot takes the same shortcut, and the blob goes only with the last snapshot that lists a file in it
+        createSnapshot(repoName, "snap-3", List.of(indexName));
+        deleteSnapshotAndAwaitCleanup(repoName, getRepositoryData(repoName), "snap-2", shardContainer);
+        assertTrue("snap-3 reused the files of snap-2", shardContainer.blobExists(OperationPurpose.SNAPSHOT_DATA, copiedBlob));
+        deleteSnapshotAndAwaitCleanup(repoName, getRepositoryData(repoName), "snap-3", shardContainer);
+        assertFalse(shardContainer.blobExists(OperationPurpose.SNAPSHOT_DATA, copiedBlob));
     }
 
     /**

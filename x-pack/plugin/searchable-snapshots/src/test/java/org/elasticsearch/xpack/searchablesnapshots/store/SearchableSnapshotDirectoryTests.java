@@ -829,9 +829,7 @@ public class SearchableSnapshotDirectoryTests extends AbstractSearchableSnapshot
             final BlobStoreIndexShardSnapshot.FileInfo copied = new BlobStoreIndexShardSnapshot.FileInfo(
                 "__" + randomAlphaOfLength(10),
                 new StoreFileMetadata("_1.cfs", between(16, 1000), "def", luceneVersion),
-                "c__" + randomAlphaOfLength(10),
-                between(0, 4096),
-                "indices/aBcDeFgH/0/1/stateless_commit_5"
+                between(0, 4096)
             );
             final BlobStoreIndexShardSnapshot snapshot = new BlobStoreIndexShardSnapshot(
                 "_snapshot",
@@ -877,7 +875,10 @@ public class SearchableSnapshotDirectoryTests extends AbstractSearchableSnapshot
                     IllegalArgumentException.class,
                     () -> directory.loadSnapshot(createRecoveryState(randomBoolean()), () -> false, new PlainActionFuture<>())
                 );
-                assertThat(e.getMessage(), containsString("is stored inside copied blob [" + copied.blob() + "]"));
+                assertThat(
+                    e.getMessage(),
+                    containsString("is stored at offset [" + copied.offset() + "] of copied blob [" + copied.name() + "]")
+                );
             } finally {
                 sharedBlobCacheService.close();
                 assertThreadPoolNotBusy(threadPool);

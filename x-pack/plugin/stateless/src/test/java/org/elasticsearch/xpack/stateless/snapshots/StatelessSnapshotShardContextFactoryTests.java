@@ -342,7 +342,7 @@ public class StatelessSnapshotShardContextFactoryTests extends ESTestCase {
     private void setNodeFeatures(DiscoveryNode otherNode, boolean otherNodeHasFeature) {
         final ClusterService clusterService = testHarness.stateless().getClusterService();
         final ClusterState state = clusterService.state();
-        final Set<String> featureIds = Set.of(SnapshotCopiedBlobFeatures.COPIED_BLOB_RANGES.id());
+        final Set<String> featureIds = Set.of(SnapshotCopiedBlobFeatures.COPIED_FILE_OFFSETS.id());
         ClusterServiceUtils.setState(
             clusterService,
             ClusterState.builder(state)

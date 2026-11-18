@@ -19,7 +19,6 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.Version;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.PlainActionFuture;
-import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.BlobPath;
 import org.elasticsearch.common.blobstore.OperationPurpose;
@@ -41,8 +40,6 @@ import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.snapshots.IndexShardSnapshotFailedException;
 import org.elasticsearch.index.snapshots.IndexShardSnapshotStatus;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot.FileInfo;
-import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
-import org.elasticsearch.index.snapshots.blobstore.SnapshotFiles;
 import org.elasticsearch.index.store.StoreFileMetadata;
 import org.elasticsearch.repositories.IndexId;
 import org.elasticsearch.repositories.ShardGeneration;
@@ -194,62 +191,43 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
     }
 
     /**
-     * A snapshot repository keeps one folder for all indices that have the same name. So an index that is deleted and created again with
-     * the same name shares the folder, and the shard generation in it, with the old index. The new index must not reuse a copy of a commit
-     * blob of the old index. A copy is found by the source path of its commit blob, so the path must differ between the two indices. It
-     * does, because it holds the index UUID.
+     * The copy source path identifies a commit blob, so that a shard snapshot copies a commit blob once for all the files that it takes
+     * from it. Within a shard, the primary term and the name of a commit blob identify the commit blob. A snapshot repository keeps one
+     * folder for all indices that have the same name, and the path holds the index UUID, so an index that is deleted and created again
+     * with the same name has other paths.
      */
-    public void testCopySourceDiffersForIndicesWithTheSameName() throws IOException {
+    public void testCopySourceIdentifiesTheCommitBlob() throws IOException {
         final String indexName = randomIdentifier();
         final int shard = between(0, 5);
-        final var blobLocation = new BlobLocation(
-            new BlobFile("stateless_commit_7", new PrimaryTermAndGeneration(1L, 7L)),
-            between(0, 50),
-            between(100, 1000)
-        );
-        final var oldCopySource = copySource(new ShardId(new Index(indexName, randomUUID()), shard), blobLocation);
-        final var newCopySource = copySource(new ShardId(new Index(indexName, randomUUID()), shard), blobLocation);
-        assertThat(newCopySource.source(), not(equalTo(oldCopySource.source())));
-
-        // The shard generation holds a copy of the old index's commit blob. The old index finds it, and the new index does not.
-        final var metadata = new StoreFileMetadata("_0.cfs", blobLocation.fileLength(), "checksum", Version.LATEST.toString());
-        final var generation = BlobStoreIndexShardSnapshots.EMPTY.withAddedSnapshot(
-            new SnapshotFiles(
-                "snapshot",
-                List.of(new FileInfo("__file", metadata, "c__old", oldCopySource.offset(), oldCopySource.source())),
-                null
-            )
-        );
-        assertThat(generation.findCopiedBlob(oldCopySource.source()), equalTo("c__old"));
-        assertThat(generation.findCopiedBlob(newCopySource.source()), nullValue());
-    }
-
-    /**
-     * The repository puts the copy name after the shard generation in the name of a copy, and the sources that one shard snapshot copies
-     * need different copy names. Within a shard, the primary term and the name of a commit blob identify the commit blob, so the copy name
-     * holds both.
-     */
-    public void testCopyNameIdentifiesTheCommitBlobWithinTheShard() throws IOException {
-        final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
         final long primaryTerm = randomLongBetween(1, 100);
         final long generation = randomLongBetween(1, 1000);
-        final var copyName = copySource(shardId, commitBlobLocation(primaryTerm, generation)).copyName();
+        final var shardId = new ShardId(new Index(indexName, randomUUID()), shard);
+        final var source = copySource(shardId, commitBlobLocation(primaryTerm, generation));
 
-        assertThat(copyName, equalTo(primaryTerm + "_stateless_commit_" + generation));
-        assertTrue(Strings.validFileName(copyName));
-        assertThat(copySource(shardId, commitBlobLocation(primaryTerm, generation)).copyName(), equalTo(copyName));
-        // a commit blob with another generation, or with another primary term, has another copy name
-        assertThat(copySource(shardId, commitBlobLocation(primaryTerm, generation + 1)).copyName(), not(equalTo(copyName)));
-        assertThat(copySource(shardId, commitBlobLocation(primaryTerm + 1, generation)).copyName(), not(equalTo(copyName)));
+        // the same commit blob, whatever the offset of the file in it
+        assertThat(copySource(shardId, commitBlobLocation(primaryTerm, generation)).source(), equalTo(source.source()));
+        assertThat(source.blobName(), equalTo("stateless_commit_" + generation));
+        // a commit blob with another generation, or with another primary term, has another source
+        assertThat(copySource(shardId, commitBlobLocation(primaryTerm, generation + 1)).source(), not(equalTo(source.source())));
+        assertThat(copySource(shardId, commitBlobLocation(primaryTerm + 1, generation)).source(), not(equalTo(source.source())));
+        // an index with the same name and another UUID, and another shard of the same index
+        assertThat(
+            copySource(new ShardId(new Index(indexName, randomUUID()), shard), commitBlobLocation(primaryTerm, generation)).source(),
+            not(equalTo(source.source()))
+        );
+        assertThat(
+            copySource(new ShardId(shardId.getIndex(), shard + 1), commitBlobLocation(primaryTerm, generation)).source(),
+            not(equalTo(source.source()))
+        );
     }
 
     /**
      * A generational file is stored in more than one commit blob, because each new commit blob copies the generational files. The snapshot
-     * points the file at the commit blob of the snapshotted commit. So an earlier file info, which points at a copy of an older commit
-     * blob, can be reused only while the file is in the same commit blob. If the file is at another offset of the same commit blob, the
-     * earlier file info can still be reused.
+     * points the file at the commit blob of the snapshotted commit. So an earlier copied file info of a generational file is never
+     * reused, whatever commit blob it points at and whether or not the commit blob is the one that holds the file now. The context does
+     * not look at where the earlier file info points: the file info has no record of the commit blob that was copied.
      */
-    public void testGenerationalFileIsReusableOnlyInTheSameCommitBlob() throws IOException {
+    public void testCopiedGenerationalFileIsNeverReused() throws IOException {
         final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
         final String file = randomFrom("_0_1.liv", "_3_2.fnm", "_12_1_Lucene90_0.dvd", "_7_4_Lucene90_0.dvm");
         final long primaryTerm = randomLongBetween(1, 100);
@@ -261,7 +239,7 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
             between(0, 50),
             between(100, 1000)
         );
-        assertTrue(contextWithFile(shardId, file, sameBlob, true).isCopiedFileReusable(earlierFileInfo));
+        assertFalse(contextWithFile(shardId, file, sameBlob, true).isCopiedFileReusable(earlierFileInfo));
         // a newer commit blob of the same primary term, and a commit blob of a newer primary term
         assertFalse(
             contextWithFile(shardId, file, commitBlobLocation(primaryTerm, generation + 1), true).isCopiedFileReusable(earlierFileInfo)
@@ -272,36 +250,43 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
     }
 
     /**
-     * A file that is not a generational file stays in the commit blob that it was written to, so its earlier file info stays reusable. The
-     * context keeps the reuse that the snapshot did before, whatever commit blob holds the file.
+     * A file that is not a generational file stays in the commit blob that it was written to, so its earlier file info stays reusable,
+     * whatever commit blob holds the file.
      */
-    public void testFileThatIsNotGenerationalIsReusableInAnotherCommitBlob() throws IOException {
+    public void testFileThatIsNotGenerationalIsReusableInAnyCommitBlob() throws IOException {
         final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
         final String file = randomFrom("_0.cfs", "_3.fdt", "_12_Lucene90_0.dvd", "_7_Lucene90_0.dvm");
         final long primaryTerm = randomLongBetween(1, 100);
         final long generation = randomLongBetween(2, 1000);
         final var earlierFileInfo = copiedFileInfo(shardId, file, commitBlobLocation(primaryTerm, generation));
 
+        assertTrue(contextWithFile(shardId, file, commitBlobLocation(primaryTerm, generation), true).isCopiedFileReusable(earlierFileInfo));
         assertTrue(
             contextWithFile(shardId, file, commitBlobLocation(primaryTerm, generation + 1), true).isCopiedFileReusable(earlierFileInfo)
         );
     }
 
     /**
-     * With server-side copy off, the context offers no copy source. A snapshot that refused to reuse a copied generational file would
-     * then upload the file again, so the context keeps reusing the earlier file info. Turning copies off must not upload files again that
-     * are in the repository as copies.
+     * With server-side copy off, the context offers no copy source, and a snapshot uploads a file that it handles as new. The rule for a
+     * copied generational file is the same as with copies on: the context never reuses the earlier file info. A file that is not
+     * generational is reused as before.
      */
-    public void testCopiedGenerationalFileIsReusableWhenCopiesAreOff() throws IOException {
+    public void testReuseRuleIsTheSameWhenCopiesAreOff() throws IOException {
         final var shardId = new ShardId(new Index(randomIdentifier(), randomUUID()), between(0, 5));
-        final String file = randomFrom("_0_1.liv", "_3_2.fnm", "_12_1_Lucene90_0.dvd", "_7_4_Lucene90_0.dvm");
         final long primaryTerm = randomLongBetween(1, 100);
         final long generation = randomLongBetween(2, 1000);
-        final var earlierFileInfo = copiedFileInfo(shardId, file, commitBlobLocation(primaryTerm, generation));
 
-        final var context = contextWithFile(shardId, file, commitBlobLocation(primaryTerm, generation + 1), false);
-        assertThat(context.copySource(file), nullValue());
-        assertTrue(context.isCopiedFileReusable(earlierFileInfo));
+        final String generational = randomFrom("_0_1.liv", "_3_2.fnm", "_12_1_Lucene90_0.dvd", "_7_4_Lucene90_0.dvm");
+        final var generationalContext = contextWithFile(shardId, generational, commitBlobLocation(primaryTerm, generation + 1), false);
+        assertThat(generationalContext.copySource(generational), nullValue());
+        assertFalse(
+            generationalContext.isCopiedFileReusable(copiedFileInfo(shardId, generational, commitBlobLocation(primaryTerm, generation)))
+        );
+
+        final String immutable = randomFrom("_0.cfs", "_3.fdt");
+        final var immutableContext = contextWithFile(shardId, immutable, commitBlobLocation(primaryTerm, generation + 1), false);
+        assertThat(immutableContext.copySource(immutable), nullValue());
+        assertTrue(immutableContext.isCopiedFileReusable(copiedFileInfo(shardId, immutable, commitBlobLocation(primaryTerm, generation))));
     }
 
     /**
@@ -889,7 +874,7 @@ public class StatelessSnapshotShardContextTests extends ESTestCase {
     private static FileInfo copiedFileInfo(ShardId shardId, String file, BlobLocation blobLocation) throws IOException {
         final var source = copySource(shardId, blobLocation);
         final var metadata = new StoreFileMetadata(file, blobLocation.fileLength(), "checksum", Version.LATEST.toString());
-        return new FileInfo("__" + randomUUID(), metadata, "c__" + randomUUID(), source.offset(), source.source());
+        return new FileInfo("__" + randomUUID(), metadata, source.offset());
     }
 
     private static StatelessSnapshotShardContext contextWithFile(

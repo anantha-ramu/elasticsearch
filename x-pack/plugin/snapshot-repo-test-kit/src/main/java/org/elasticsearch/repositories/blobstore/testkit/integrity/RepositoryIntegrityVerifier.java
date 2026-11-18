@@ -429,9 +429,10 @@ class RepositoryIntegrityVerifier {
          * @param shardGeneration the current {@link ShardGeneration} for this shard, identifying the current {@code index-${UUID}} blob.
          * @param filesByPhysicalNameBySnapshotName a {@link BlobStoreIndexShardSnapshot.FileInfo} for every tracked file, keyed by snapshot
          *                                          name and then by the file's physical name.
-         * @param blobContentsListeners a threadsafe mutable map, keyed by file name, for every tracked file that the verification process
-         *                              encounters. Used to avoid double-counting the size of any files, and also to deduplicate work to
-         *                              verify their contents if {@code ?verify_blob_contents} is set.
+         * @param blobContentsListeners a threadsafe mutable map, keyed by file name and offset, for every tracked file that the
+         *                              verification process encounters. A copied blob is shared by many files, so the name alone is not
+         *                              enough to tell them apart. Used to avoid double-counting the size of any files, and also to
+         *                              deduplicate work to verify their contents if {@code ?verify_blob_contents} is set.
          */
         private record ShardContainerContents(
             int shardId,
@@ -440,8 +441,18 @@ class RepositoryIntegrityVerifier {
             ShardGeneration shardGeneration,
             @Nullable /* if shard gen blob could not be read */
             Map<String, Map<String, BlobStoreIndexShardSnapshot.FileInfo>> filesByPhysicalNameBySnapshotName,
-            Map<String, SubscribableListener<Void>> blobContentsListeners
+            Map<BlobContentsKey, SubscribableListener<Void>> blobContentsListeners
         ) {}
+
+        /**
+         * Identifies the bytes that a file info refers to: the name of the blob, and the offset in the blob if the file is a byte range of
+         * a copied blob. The files of one copied blob share its name, so only the offset tells them apart.
+         */
+        private record BlobContentsKey(String name, @Nullable Long offset) {
+            static BlobContentsKey of(BlobStoreIndexShardSnapshot.FileInfo fileInfo) {
+                return new BlobContentsKey(fileInfo.name(), fileInfo.isCopied() ? fileInfo.offset() : null);
+            }
+        }
 
         /**
          * Verifies the integrity of the shard snapshots of a specific index snapshot
@@ -551,13 +562,14 @@ class RepositoryIntegrityVerifier {
 
                     if (fileInfo.isCopied()) {
                         // The file is a byte range of a copied blob that other files share. The copied blob also holds bytes that
-                        // belong to no file, so its exact length is not known here: it only has to be long enough to hold the range.
-                        final var blobInfo = shardContainerContents.blobsByName().get(fileInfo.blob());
+                        // belong to no file, so its exact length is not known here: it only has to be long enough to hold the range,
+                        // which is to say that offset + length must not go past the end of the blob.
+                        final var blobInfo = shardContainerContents.blobsByName().get(fileInfo.name());
                         if (blobInfo == null || blobInfo.length() - fileInfo.length() < fileInfo.offset()) {
                             isRestorable = false;
                             final var anomaly = anomaly(blobInfo == null ? "missing blob" : "mismatched blob length").snapshotId(snapshotId)
                                 .shardDescription(indexDescription, shardContainerContents.shardId())
-                                .blobName(fileInfo.blob(), fileInfo.physicalName())
+                                .blobName(fileInfo.name(), fileInfo.physicalName())
                                 .fileLength(ByteSizeValue.ofBytes(fileInfo.length()));
                             if (blobInfo != null) {
                                 anomaly.blobLength(ByteSizeValue.ofBytes(blobInfo.length()));
@@ -602,10 +614,10 @@ class RepositoryIntegrityVerifier {
                         listener.delegateResponse((l, e) -> {
                             isRestorable = false;
                             String physicalFileName = fileInfo.physicalName();
-                            // a copied file has no blob of its own, so report the copied blob that holds it, which has no parts
+                            // a copied file is a range of a blob that has no parts, so the anomaly has no part number for it
                             final var anomaly = anomaly("corrupt data blob").snapshotId(snapshotId)
                                 .shardDescription(indexDescription, shardContainerContents.shardId())
-                                .blobName(fileInfo.isCopied() ? fileInfo.blob() : fileInfo.name(), physicalFileName);
+                                .blobName(fileInfo.name(), physicalFileName);
                             if (fileInfo.isCopied() == false) {
                                 anomaly.part(-1, fileInfo.numberOfParts());
                             }
@@ -802,7 +814,7 @@ class RepositoryIntegrityVerifier {
             ShardContainerContents shardContainerContents,
             BlobStoreIndexShardSnapshot.FileInfo fileInfo
         ) {
-            return shardContainerContents.blobContentsListeners().computeIfAbsent(fileInfo.name(), ignored -> {
+            return shardContainerContents.blobContentsListeners().computeIfAbsent(BlobContentsKey.of(fileInfo), ignored -> {
                 if (requestParams.verifyBlobContents()) {
                     return SubscribableListener.newForked(listener -> snapshotTaskRunner.run(ActionRunnable.run(listener, () -> {
                         final var shardContainer = blobStoreRepository.shardContainer(
@@ -814,7 +826,7 @@ class RepositoryIntegrityVerifier {
                                 ? Streams.limitStream(
                                     shardContainer.readBlob(
                                         OperationPurpose.REPOSITORY_ANALYSIS,
-                                        fileInfo.blob(),
+                                        fileInfo.name(),
                                         fileInfo.offset(),
                                         fileInfo.length()
                                     ),
@@ -845,7 +857,7 @@ class RepositoryIntegrityVerifier {
                                         + "] has checksum ["
                                         + fileInfo.checksum()
                                         + "]",
-                                    fileInfo.blob()
+                                    fileInfo.name()
                                 );
                             }
                         }

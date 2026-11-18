@@ -113,7 +113,7 @@ public class StatelessSnapshotSettings {
      * setting.
      * <p>
      * A shard snapshot copies only when this setting is on and every node in the cluster has the cluster feature
-     * {@link org.elasticsearch.snapshots.SnapshotCopiedBlobFeatures#COPIED_BLOB_RANGES}, which says that the node can read copied files.
+     * {@link org.elasticsearch.snapshots.SnapshotCopiedBlobFeatures#COPIED_FILE_OFFSETS}, which says that the node can read copied files.
      * Until every node has the feature, the shard snapshot uploads its new files and logs that it does. A shard snapshot also needs
      * {@link #STATELESS_SNAPSHOT_ENABLED_SETTING} to be {@code read_from_object_store} or {@code enabled}, because only then do shard
      * snapshots read from the object store.

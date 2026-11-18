@@ -814,7 +814,7 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
         // the first copy request worked, and at least one more copy request was answered with an error
         assertThat(copyRequests.get(), greaterThanOrEqualTo(2));
         // the failure cleanup deleted the copy that worked, and the shard snapshot blob was never written
-        assertThat(copiedBlobPathsInFakeStorage(), empty());
+        assertThat(dataBlobPathsInFakeStorage(), empty());
         assertThat(
             blobPathsInFakeStorage().stream()
                 .filter(path -> path.contains("/indices/") && path.contains("/" + BlobStoreRepository.SNAPSHOT_PREFIX))
@@ -827,19 +827,10 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
     }
 
     /**
-     * The paths of the copied blobs in the fake S3 service.
-     */
-    private Set<String> copiedBlobPathsInFakeStorage() {
-        return blobPathsInFakeStorage().stream()
-            .filter(path -> path.contains("/" + BlobStoreRepository.COPIED_DATA_BLOB_PREFIX))
-            .collect(Collectors.toUnmodifiableSet());
-    }
-
-    /**
      * Checks the copied files of the shard snapshots in the repository against the blobs that the fake S3 service holds, which are what a
-     * restore reads. A shard snapshot lists a copied file with the copied blob that holds it and the byte range of the file inside that
-     * blob. That blob must exist and be long enough to hold the range. Every copied blob in the repository must also be named by at least
-     * one copied file. The files come from the blob of each shard snapshot and from the shard generation that the next snapshot of the
+     * restore reads. A shard snapshot lists a copied file with the name of the copied blob that holds it and the offset of the file inside
+     * that blob. That blob must exist and be long enough to hold the range. Every data blob in the repository must also be named by at
+     * least one file. The files come from the blob of each shard snapshot and from the shard generation that the next snapshot of the
      * shard starts from.
      *
      * @param copiedFileCount a matcher for how many copied files were checked, so that the assertion fails when no file was checked but
@@ -867,7 +858,7 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
                 for (FileInfo file : files) {
                     if (file.isCopied()) {
                         // the fake S3 service keys a blob by its path, which starts with the name of the bucket
-                        final String blobPath = "/bucket/" + shardContainer.path().buildAsString() + file.blob();
+                        final String blobPath = "/bucket/" + shardContainer.path().buildAsString() + file.name();
                         pointedAtBlobPaths.add(blobPath);
                         final BlobEntry blob = s3HttpHandler.blobs().get(blobPath);
                         assertNotNull("blob [" + blobPath + "] of the copied file " + file + " is missing", blob);
@@ -877,11 +868,16 @@ public class S3ObjectStoreTests extends AbstractMockObjectStoreIntegTestCase {
                             greaterThanOrEqualTo(file.offset() + file.length())
                         );
                         checkedFiles++;
+                    } else if (file.metadata().hashEqualsContents() == false) {
+                        // a file that was uploaded has a blob for each of its parts
+                        for (int part = 0; part < file.numberOfParts(); part++) {
+                            pointedAtBlobPaths.add("/bucket/" + shardContainer.path().buildAsString() + file.partName(part));
+                        }
                     }
                 }
             }
         }
-        assertThat(copiedBlobPathsInFakeStorage(), equalTo(pointedAtBlobPaths));
+        assertThat(dataBlobPathsInFakeStorage(), equalTo(pointedAtBlobPaths));
         assertThat(checkedFiles, copiedFileCount);
     }
 

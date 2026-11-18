@@ -212,12 +212,12 @@ public class BlobStoreRepositoryRestoreTests extends IndexShardTestCase {
                 final BlobStoreIndexShardSnapshot.FileInfo victim = randomFrom(moved);
                 final BlobContainer shardContainer = repository.shardContainer(indexId, shardId.id());
                 final byte[] copiedBytes;
-                try (InputStream in = shardContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, victim.blob())) {
+                try (InputStream in = shardContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, victim.name())) {
                     copiedBytes = in.readAllBytes();
                 }
                 final int position = Math.toIntExact(victim.offset() + randomLongBetween(0, victim.length() - 1));
                 copiedBytes[position] = (byte) (copiedBytes[position] ^ (1 << between(0, 7)));
-                shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, victim.blob(), new BytesArray(copiedBytes), false);
+                shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, victim.name(), new BytesArray(copiedBytes), false);
             }
 
             // restore into an empty store, so that every file comes from the repository

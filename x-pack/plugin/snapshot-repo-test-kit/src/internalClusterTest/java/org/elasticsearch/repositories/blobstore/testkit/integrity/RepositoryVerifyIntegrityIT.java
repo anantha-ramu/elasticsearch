@@ -794,7 +794,7 @@ public class RepositoryVerifyIntegrityIT extends AbstractSnapshotIntegTestCase {
 
         // break the copied blob in one way and expect the matching anomaly
         final BlobContainer shardContainer = repository.shardContainer(indexId, 0);
-        final String copiedBlob = moved.get(0).blob();
+        final String copiedBlob = moved.get(0).name();
         final byte[] copiedBytes;
         try (InputStream in = shardContainer.readBlob(OperationPurpose.SNAPSHOT_DATA, copiedBlob)) {
             copiedBytes = in.readAllBytes();
@@ -831,12 +831,13 @@ public class RepositoryVerifyIntegrityIT extends AbstractSnapshotIntegTestCase {
         assertThat("need two files in the copied blob", moved.size(), greaterThanOrEqualTo(2));
 
         // Point one file's range at another whole file in the same copied blob. That range holds a valid Lucene file, so its footer
-        // checks out, and only the comparison with the checksum recorded for the expected file can catch it.
+        // checks out, and only the comparison with the checksum recorded for the expected file can catch it. A range has one file info,
+        // because files are told apart by name and offset, so the other file leaves the snapshot and its range goes to the expected file.
         final BlobStoreIndexShardSnapshot.FileInfo expected = moved.get(0);
         final BlobStoreIndexShardSnapshot.FileInfo other = moved.get(1);
         final StoreFileMetadata expectedMetadata = expected.metadata();
         final var wrongRange = new BlobStoreIndexShardSnapshot.FileInfo(
-            expected.name(),
+            other.name(),
             new StoreFileMetadata(
                 expectedMetadata.name(),
                 other.length(),
@@ -845,9 +846,7 @@ public class RepositoryVerifyIntegrityIT extends AbstractSnapshotIntegTestCase {
                 expectedMetadata.hash(),
                 expectedMetadata.writerUuid()
             ),
-            other.blob(),
-            other.offset(),
-            other.source()
+            other.offset()
         );
         BlobStoreTestUtil.rewriteShardSnapshotFiles(
             copied.repository(),
@@ -855,16 +854,24 @@ public class RepositoryVerifyIntegrityIT extends AbstractSnapshotIntegTestCase {
             0,
             copied.shardGeneration(),
             copied.snapshotId(),
-            fileInfo -> fileInfo.name().equals(expected.name()) ? wrongRange : fileInfo
+            fileInfo -> {
+                if (fileInfo.physicalName().equals(expected.physicalName())) {
+                    return wrongRange;
+                } else if (fileInfo.physicalName().equals(other.physicalName())) {
+                    return null;
+                } else {
+                    return fileInfo;
+                }
+            }
         );
 
         final ObjectPath response = verifyIntegrityWithBlobContents(copied.repositoryName());
         assertThat(getAnomalies(response), equalTo(Set.of("corrupt data blob")));
-        // the anomaly names the copied blob, which has no parts, rather than the file's name in the metadata, which has no blob
+        // the anomaly names the copied blob, which has no parts, rather than a blob of the file's own
         boolean found = false;
         for (int i = 0; i < response.evaluateArraySize("log"); i++) {
             if ("corrupt data blob".equals(response.evaluate("log." + i + ".anomaly"))) {
-                assertEquals(other.blob(), response.evaluate("log." + i + ".blob_name"));
+                assertEquals(other.name(), response.evaluate("log." + i + ".blob_name"));
                 assertNull(response.evaluate("log." + i + ".part_count"));
                 found = true;
             }

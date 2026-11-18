@@ -12,6 +12,7 @@ package org.elasticsearch.indices.recovery;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.blobstore.OperationPurpose;
+import org.elasticsearch.common.io.Streams;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.elasticsearch.index.snapshots.blobstore.SlicedInputStream;
@@ -51,6 +52,15 @@ public class SnapshotFilesProvider {
             inputStream = new SlicedInputStream(fileInfo.numberOfParts()) {
                 @Override
                 protected InputStream openSlice(int slice) throws IOException {
+                    if (fileInfo.isCopied()) {
+                        // The file is a byte range of a copied blob that other files share, so read only that range. A copied file is a
+                        // single slice. Limiting the stream to the file's length guards against a blob store that returns more than was
+                        // asked for.
+                        return Streams.limitStream(
+                            container.readBlob(OperationPurpose.SNAPSHOT_DATA, fileInfo.name(), fileInfo.offset(), fileInfo.length()),
+                            fileInfo.length()
+                        );
+                    }
                     return container.readBlob(OperationPurpose.SNAPSHOT_DATA, fileInfo.partName(slice));
                 }
 

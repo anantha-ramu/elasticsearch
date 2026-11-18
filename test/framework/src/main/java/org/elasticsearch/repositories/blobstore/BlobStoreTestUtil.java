@@ -542,9 +542,8 @@ public final class BlobStoreTestUtil {
         }
         Collections.shuffle(toMove, random());
 
-        final String copiedBlob = BlobStoreRepository.COPIED_DATA_BLOB_PREFIX + UUIDs.randomBase64UUID(random());
-        // stands in for the path of the commit blob in the stateless object store
-        final String source = "indices/" + indexId.getId() + "/" + shardId + "/1/stateless_commit_" + randomIntBetween(1, 1000);
+        // a copied blob is named like an uploaded blob, and only the offset of a file info says that the file is a range of it
+        final String copiedBlob = BlobStoreRepository.UPLOADED_DATA_BLOB_PREFIX + UUIDs.randomBase64UUID(random());
         final Map<String, BlobStoreIndexShardSnapshot.FileInfo> moved = new HashMap<>();
         try (BytesStreamOutput copiedBytes = new BytesStreamOutput()) {
             for (BlobStoreIndexShardSnapshot.FileInfo fileInfo : toMove) {
@@ -555,10 +554,7 @@ public final class BlobStoreTestUtil {
                         partStream.transferTo(copiedBytes);
                     }
                 }
-                moved.put(
-                    fileInfo.name(),
-                    new BlobStoreIndexShardSnapshot.FileInfo(fileInfo.name(), fileInfo.metadata(), copiedBlob, offset, source)
-                );
+                moved.put(fileInfo.name(), new BlobStoreIndexShardSnapshot.FileInfo(copiedBlob, fileInfo.metadata(), offset));
             }
             maybeWriteFiller(copiedBytes, withFiller);
             shardContainer.writeBlob(OperationPurpose.SNAPSHOT_DATA, copiedBlob, copiedBytes.bytes(), true);

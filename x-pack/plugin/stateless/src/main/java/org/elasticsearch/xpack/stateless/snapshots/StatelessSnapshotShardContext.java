@@ -77,8 +77,8 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     // metadataSnapshot and copySource fill in the next fields, see their Javadoc. The first generational file that one of them looks at
     // sets segmentsFileName and segmentsFile, the name and the location of the segments_N file of the snapshotted commit. The first
     // carried generational file sets firstCommit, the header of the first commit of the commit blob that holds the snapshotted commit.
-    // The repository calls metadataSnapshot, and then copySource and isCopiedFileReusable for one file at a time, all on one thread, so
-    // the fields need no synchronization.
+    // The repository calls metadataSnapshot, and then copySource for one file at a time, all on one thread, so the fields need no
+    // synchronization.
     @Nullable
     private String segmentsFileName;
     @Nullable
@@ -254,8 +254,9 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
      * no other file needs that copy.
      * <p>
      * The newest copy takes effect only when the repository makes a new file info for the file. That is the case for a file that no
-     * earlier snapshot lists, and for a file for which {@link #isCopiedFileReusable} answers {@code false}. If the repository reuses the
-     * earlier file info by name instead, the file stays in the older commit blob.
+     * earlier snapshot lists, and for a copied generational file, because {@link #isCopiedFileReusable} answers {@code false} for it.
+     * If the repository reuses an earlier file info by name instead, which it can do for a file that an earlier snapshot uploaded, the
+     * file stays where that snapshot put it.
      * <p>
      * When the first carried file asks for its copy source, the context reads the header of the first commit of the commit blob with
      * one GET. The header lists the copy of each carried file, and it is the only header whose position is known without reading
@@ -277,9 +278,9 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
             return null;
         }
         final BlobLocation blobLocation = getLocationToCopy(file);
-        // The commit blob's path under the object store's base path, used to find an existing copy. The snapshot repository keeps one
-        // folder per index name, so an index that is deleted and created again with the same name shares that folder, and the index UUID
-        // keeps the two indices' paths apart.
+        // The commit blob's path under the object store's base path. The repository uses it to see which files of one shard snapshot come
+        // from the same commit blob, so that it copies that blob once. The index UUID is part of the path, so an index that is deleted and
+        // created again with the same name has other paths, although the snapshot repository keeps both under one folder.
         final String source = "indices/"
             + shardId.getIndex().getUUID()
             + "/"
@@ -288,12 +289,8 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
             + blobLocation.primaryTerm()
             + "/"
             + blobLocation.blobName();
-        // The primary term and the blob name identify a commit blob within its shard. That is all the copy name needs, because the
-        // sources of one shard snapshot all belong to the same shard.
-        final String copyName = blobLocation.primaryTerm() + "_" + blobLocation.blobName();
         return new CopySource(
             source,
-            copyName,
             blobContainerFunc.apply(shardId, blobLocation.primaryTerm()),
             blobLocation.blobName(),
             blobLocation.offset()
@@ -426,30 +423,23 @@ public class StatelessSnapshotShardContext extends SnapshotShardContext {
     }
 
     /**
-     * Says whether the snapshot may reuse the earlier file info of a file. The answer is {@code false} for a generational file that must
-     * now be copied from another commit blob than the earlier file info points at, see {@link #copySource}. That file then gets a new
-     * file info, so that the repository can delete the copy of the old commit blob once no other file needs that copy.
+     * Says whether the snapshot may reuse the earlier file info of a file, for a file info that is a byte range of a copied commit blob.
+     * The answer is {@code false} for a generational file. That file then gets a new file info that points into the commit blob of the
+     * snapshotted commit, see {@link #copySource}, so that the repository can delete the copy of an older commit blob once no other
+     * file needs that copy. The answer is {@code true}, so that the snapshot reuses the earlier file info, for every other file.
      * <p>
-     * The method answers {@code true}, so that the snapshot reuses the earlier file info, for a file that is not a generational file,
-     * for a generational file whose copy is in the commit blob that the earlier file info points at, and when server-side copy is off,
-     * which is when {@link #copySource} returns {@code null}.
+     * The method does not look at where the earlier file info points. It answers {@code false} for every copied generational file, also
+     * when the earlier file info points at the commit blob that holds the commit now. That costs a copy of that commit blob that an
+     * earlier snapshot made already, but it needs no record of which commit blob an earlier copy came from. A generational file that an
+     * earlier snapshot uploaded has an uploaded file info, which the repository does not ask about, and the snapshot reuses that file
+     * info. This can happen after a repository switches between copying and uploading from one snapshot to the next.
      * <p>
-     * Known limits:
-     * <ul>
-     * <li>The repository finds one of the file infos of a generational file in the shard's file list, and which one is not defined. If
-     * the repository finds a file info for an older commit blob while another already points at the current copy, the snapshot adds a
-     * second file info for that copy.</li>
-     * <li>The statistics of the shard snapshot count the file as new, also when its copy exists already.</li>
-     * </ul>
+     * Known limit: the statistics of the shard snapshot count the file as new, also when an earlier snapshot copied the same bytes.
      */
     @Override
     public boolean isCopiedFileReusable(BlobStoreIndexShardSnapshot.FileInfo existingFileInfo) {
         assert existingFileInfo.isCopied() : "the repository asks only for copied file infos, got " + existingFileInfo.name();
-        if (StatelessCompoundCommit.isGenerationalFile(existingFileInfo.physicalName()) == false) {
-            return true;
-        }
-        final CopySource currentSource = copySource(existingFileInfo.physicalName());
-        return currentSource == null || currentSource.source().equals(existingFileInfo.source());
+        return StatelessCompoundCommit.isGenerationalFile(existingFileInfo.physicalName()) == false;
     }
 
     private Releasable maybeWithSnapshotIndexCommitRef() {
