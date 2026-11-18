@@ -183,7 +183,10 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
      * hide one that it can.
      * <p>
      * If more than one file info matches and is accepted, the method returns the one that comes first when the snapshots are read in
-     * order, each snapshot's list of files in order. That order does not change between calls or between runs.
+     * order, each snapshot's list of files in order. The choice is the same on every call for a given {@code index-<uuid>} blob. If the
+     * repository rebuilds the shard generation from a listing of the {@code snap-<uuid>.dat} blobs, the order of the listing is arbitrary,
+     * so the rebuilt shard generation may choose another file info. That is safe, because the snapshot that makes a choice records the
+     * file info that it chose.
      *
      * @param storeFileMetadata store file metadata to find file info for
      * @param isCandidate       says whether the caller can use a file info that is the same file
@@ -451,6 +454,8 @@ public class BlobStoreIndexShardSnapshots implements Iterable<SnapshotFiles>, To
             throw new ElasticsearchParseException(
                 "a reference to a copied file needs both a name and an offset, got name [" + name + "] and offset [" + offset + "]"
             );
+        } else if (offset < 0) {
+            throw new ElasticsearchParseException("invalid offset [" + offset + "] for file [" + name + "]");
         }
         return new FileKey(name, offset);
     }

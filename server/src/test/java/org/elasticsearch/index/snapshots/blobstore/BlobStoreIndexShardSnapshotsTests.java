@@ -440,6 +440,29 @@ public class BlobStoreIndexShardSnapshotsTests extends ESTestCase {
         assertThat(e.getMessage(), containsString("needs both a name and an offset"));
     }
 
+    public void testRejectsANegativeOffsetInAReferenceToACopiedFile() throws IOException {
+        final String json = """
+            {
+              "files": [
+                {"name": "__7", "physical_name": "_1.cfs", "length": 200, "checksum": "def", "written_by": "%1$s", "offset": 900}
+              ],
+              "snapshots": {
+                "snap-1": {"files": [{"name": "__7", "offset": %2$d}]}
+              }
+            }
+            """;
+        // a file info that has a negative offset is rejected when the file infos are read, and so is a reference to one
+        final long negativeOffset = -randomLongBetween(1, Long.MAX_VALUE);
+        final String text = Strings.format(json, Version.LATEST, negativeOffset);
+        final ElasticsearchParseException e = expectThrows(ElasticsearchParseException.class, () -> parse(text));
+        assertThat(e.getMessage(), containsString("invalid offset [" + negativeOffset + "] for file [__7]"));
+
+        // an offset of 0 and a positive offset are not negative, so the same reference is read when the offset is the file's offset
+        final BlobStoreIndexShardSnapshots parsed = parse(Strings.format(json, Version.LATEST, 900));
+        assertThat(parsed.snapshots().get(0).indexFiles().size(), equalTo(1));
+        assertThat(parsed.snapshots().get(0).indexFiles().get(0).offset(), equalTo(900L));
+    }
+
     private static List<FileInfo> findFilesOfSameShardState(BlobStoreIndexShardSnapshots generation, String shardStateId) {
         for (SnapshotFiles snapshotFiles : generation.snapshots()) {
             if (shardStateId.equals(snapshotFiles.shardStateIdentifier())) {
